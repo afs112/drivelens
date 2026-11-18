@@ -35,6 +35,10 @@ function getInitial(name) {
 
 let lastInspectorKey = '';
 
+function buildMobileDrawerHeaderHtml() {
+  return `<div class="mobile-drawer-header"><span>${escapeHtml(t('mobile.inspectorTitle'))}</span><button type="button" class="btn btn-ghost btn-icon btn-sm" data-insp="close-inspector" aria-label="${escapeAttr(t('mobile.closeDrawer'))}">${icon('x', 16)}</button></div>`;
+}
+
 export function renderInspector(container, store) {
   if (!container) return;
   const state = store.state;
@@ -58,6 +62,7 @@ export function renderInspector(container, store) {
   if (selectedCount > 1) {
     lastInspectorKey = `multi:${selectedCount}`;
     container.innerHTML = `
+      ${buildMobileDrawerHeaderHtml()}
       <div class="inspector-scroll">
         <div class="inspector-card">
           <div class="inspector-card-title">
@@ -93,6 +98,7 @@ export function renderInspector(container, store) {
   if (!file) {
     lastInspectorKey = 'empty';
     container.innerHTML = `
+      ${buildMobileDrawerHeaderHtml()}
       <div class="inspector-empty">
         ${icon('info', 30)}
         <div style="font-size:13.5px;color:var(--text-primary)">${escapeHtml(t('inspector.emptyTitle'))}</div>
@@ -188,6 +194,7 @@ export function renderInspector(container, store) {
     : null;
 
   container.innerHTML = `
+    ${buildMobileDrawerHeaderHtml()}
     <div class="inspector-scroll">
       <div class="inspector-preview" data-insp="open-lightbox" data-photo-id="${escapeAttr(file.id)}" title="${escapeAttr(t('inspector.zoomPreview'))}">
         <img alt="${escapeAttr(file.name)}" />
@@ -317,7 +324,9 @@ export function bindInspectorEvents(container, store) {
     const action = el.dataset.insp;
     const pid = el.dataset.photoId;
 
-    if (action === 'open-lightbox') {
+    if (action === 'close-inspector') {
+      store.setState({ inspectorOpen: false });
+    } else if (action === 'open-lightbox') {
       store.openLightbox(pid);
     } else if (action === 'download') {
       const file = store.state.files.find((f) => f.id === pid);

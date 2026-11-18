@@ -1,4 +1,4 @@
-const CACHE_NAME = 'drivelens-shell-v1';
+const CACHE_NAME = 'drivelens-shell-v3';
 const PRECACHE_ASSETS = [
   './',
   './index.html',
@@ -13,6 +13,7 @@ const PRECACHE_ASSETS = [
   './src/main.js',
   './src/constants.js',
   './src/i18n.js',
+  './src/storage/albumCache.js',
 ];
 
 self.addEventListener('install', (event) => {

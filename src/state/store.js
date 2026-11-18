@@ -26,9 +26,19 @@ import {
   saveTagSchema,
 } from '../api/metaSync.js';
 
+import {
+  clearAllAlbumCaches,
+  getCachedAlbum,
+  setCachedAlbum,
+} from '../storage/albumCache.js';
+import { clearImageCache } from '../storage/imageLoader.js';
+
 const THEME_KEY = 'drivelens_theme';
 const RECENT_KEY = 'drivelens_recent_v1';
 const SETTINGS_KEY = 'drivelens_connect_prefs_v1';
+const UI_PREFS_KEY = 'drivelens_ui_prefs_v1';
+const VALID_LAYOUT_MODES = ['justified', 'waterfall', 'grid'];
+const VALID_SORT_MODES = ['dateDesc', 'dateAsc', 'ratingDesc', 'nameAsc', 'sizeDesc'];
 
 const MEMBER_COLORS = [
   '#38bdf8',
@@ -133,6 +143,40 @@ function saveConnectPrefs(patch) {
   }
 }
 
+function loadUiPrefs() {
+  try {
+    const raw = typeof localStorage !== 'undefined' ? localStorage.getItem(UI_PREFS_KEY) : null;
+    const parsed = raw ? JSON.parse(raw) : {};
+    const layoutMode = VALID_LAYOUT_MODES.includes(parsed?.layoutMode)
+      ? parsed.layoutMode
+      : 'justified';
+    const rawHeight = Number(parsed?.rowHeight || 210);
+    const rowHeight = Number.isFinite(rawHeight)
+      ? Math.max(130, Math.min(320, Math.round(rawHeight)))
+      : 210;
+    const sortBy = VALID_SORT_MODES.includes(parsed?.sortBy) ? parsed.sortBy : 'dateDesc';
+    const includeSubfolders = parsed?.includeSubfolders !== false;
+    return { layoutMode, rowHeight, sortBy, includeSubfolders };
+  } catch {
+    return {
+      layoutMode: 'justified',
+      rowHeight: 210,
+      sortBy: 'dateDesc',
+      includeSubfolders: true,
+    };
+  }
+}
+
+function saveUiPrefs(patch) {
+  try {
+    if (typeof localStorage === 'undefined') return;
+    const prev = loadUiPrefs();
+    localStorage.setItem(UI_PREFS_KEY, JSON.stringify({ ...prev, ...patch }));
+  } catch {
+    // Ignore
+  }
+}
+
 function getPhotoTimestamp(file) {
   const raw = file.imageMediaMetadata?.time || file.createdTime || file.modifiedTime || '';
   if (!raw) return 0;
@@ -149,11 +193,14 @@ export class Store {
     this.listeners = new Set();
     this.memberSyncTimer = null;
     this.schemaSyncTimer = null;
+    this.cacheSnapshotTimer = null;
+    this.connectSeq = 0;
     this.toastCounter = 0;
     this.deferredInstallPrompt = null;
 
     const initialLang = setLangCode(getLang());
     const prefs = loadConnectPrefs();
+    const uiPrefs = loadUiPrefs();
     const initialPersonas = getDemoPersonas(initialLang);
 
     this.state = {
@@ -162,6 +209,8 @@ export class Store {
       authType: prefs.authType,
       loading: false,
       loadingText: '',
+      backgroundRefreshing: false,
+      cacheRestoredAt: 0,
       syncStatus: 'idle',
       syncMessageKey: 'store.syncDemo',
       syncMessage: t('store.syncDemo'),
@@ -187,7 +236,7 @@ export class Store {
 
       // Navigation & Filters
       activeFolderId: null,
-      includeSubfolders: true,
+      includeSubfolders: uiPrefs.includeSubfolders,
       searchQuery: '',
       quickView: 'all',
       ratingScope: 'avg',
@@ -195,11 +244,11 @@ export class Store {
       memberFilterId: null,
       selectedTagIds: new Set(),
       tagMatchMode: 'OR',
-      sortBy: 'dateDesc',
+      sortBy: uiPrefs.sortBy,
 
       // UI State
-      layoutMode: 'justified',
-      rowHeight: 210,
+      layoutMode: uiPrefs.layoutMode,
+      rowHeight: uiPrefs.rowHeight,
       selectedPhotoIds: new Set(),
       lastClickedPhotoId: null,
       focusedPhotoId: null,
@@ -348,8 +397,14 @@ export class Store {
   }
 
   loadDemoMode(showNotice = true, disableAutoConnect = false) {
+    const wasGdrive = this.state?.mode === 'gdrive';
+    this.connectSeq += 1;
+    clearTimeout(this.cacheSnapshotTimer);
     if (disableAutoConnect) {
       saveConnectPrefs({ autoConnect: false });
+    }
+    if (wasGdrive) {
+      this._clearUrlHash();
     }
     const lang = this.state?.lang || getLang();
     const demo = createDemoDataset(lang);
@@ -363,6 +418,8 @@ export class Store {
       localMetaSupported: false,
       loading: false,
       loadingText: '',
+      backgroundRefreshing: false,
+      cacheRestoredAt: 0,
       syncStatus: 'idle',
       syncMessageKey: 'store.syncDemo',
       syncMessage: t('store.syncDemo'),
@@ -419,6 +476,156 @@ export class Store {
     this.toast(t('store.switchedPersonaToast', { name: persona.name }), 'info');
   }
 
+  _mergeMemberItems(localItems = {}, cloudItems = {}) {
+    const merged = { ...cloudItems };
+    for (const [fid, localItem] of Object.entries(localItems || {})) {
+      const cloudItem = merged[fid];
+      if (!cloudItem || Number(localItem?.updatedAt || 0) > Number(cloudItem?.updatedAt || 0)) {
+        merged[fid] = localItem;
+      }
+    }
+    return merged;
+  }
+
+  _mergeFreshWithLocalEdits(localMembers, cloudMembers, localSchema, cloudSchema, myId) {
+    const mergedMembers = { ...(cloudMembers || {}) };
+    if (myId && localMembers?.[myId]) {
+      const localRecord = localMembers[myId];
+      const cloudRecord = mergedMembers[myId] || {
+        version: 1,
+        member: localRecord.member,
+        items: {},
+      };
+      mergedMembers[myId] = {
+        ...cloudRecord,
+        member: localRecord.member || cloudRecord.member,
+        items: this._mergeMemberItems(localRecord.items, cloudRecord.items),
+      };
+    }
+    const mergedSchema = mergeTagSchemas(localSchema || { version: 1, tags: {} }, cloudSchema || { version: 1, tags: {} });
+    return { mergedMembers, mergedSchema };
+  }
+
+  _hydrateFromAlbumCache(
+    cached,
+    {
+      authType,
+      folderId,
+      clientId = '',
+      apiKey = '',
+      user,
+      localMetaSupportedOverride = null,
+      syncStatus = 'syncing',
+      syncMessageKey = 'store.syncCachedRevalidating',
+    }
+  ) {
+    if (!cached?.rootFolder || !Array.isArray(cached.files)) return false;
+    const sameAlbum = this.state.mode === 'gdrive' && this.state.folderId === folderId;
+    const folderIds = new Set((cached.folders || []).map((f) => f.id));
+    const fileIds = new Set(cached.files.map((f) => f.id));
+
+    const membersData = { ...(cached.membersData || {}) };
+    if (user?.id) {
+      if (!membersData[user.id]) {
+        membersData[user.id] = {
+          version: 1,
+          member: { ...user, updatedAt: Date.now() },
+          items: {},
+        };
+      } else {
+        membersData[user.id] = {
+          ...membersData[user.id],
+          member: { ...user, updatedAt: Date.now() },
+        };
+      }
+    }
+
+    const nextActiveFolder =
+      sameAlbum && this.state.activeFolderId && folderIds.has(this.state.activeFolderId)
+        ? this.state.activeFolderId
+        : cached.rootFolder.id;
+    const nextFocused =
+      sameAlbum && this.state.focusedPhotoId && fileIds.has(this.state.focusedPhotoId)
+        ? this.state.focusedPhotoId
+        : cached.files[0]?.id || null;
+    const nextLightbox =
+      sameAlbum && this.state.lightboxPhotoId && fileIds.has(this.state.lightboxPhotoId)
+        ? this.state.lightboxPhotoId
+        : null;
+
+    this.setState({
+      mode: 'gdrive',
+      authType,
+      folderId,
+      ...(clientId ? { clientId } : {}),
+      ...(apiKey ? { apiKey } : {}),
+      ...(user ? { currentUser: user } : {}),
+      localMetaSupported:
+        localMetaSupportedOverride !== null
+          ? Boolean(localMetaSupportedOverride)
+          : Boolean(cached.localMetaSupported),
+      loading: false,
+      loadingText: '',
+      backgroundRefreshing: syncStatus === 'syncing',
+      cacheRestoredAt: Number(cached.savedAt || Date.now()),
+      syncStatus,
+      syncMessageKey,
+      syncMessage: t(syncMessageKey),
+      rootFolder: cached.rootFolder,
+      folders: cached.folders || [cached.rootFolder],
+      files: cached.files,
+      metaFolderId: cached.metaFolderId || null,
+      canWrite: Boolean(cached.canWrite),
+      tagSchemaFileId: cached.tagSchemaFileId || null,
+      tagSchema: cached.tagSchema || { version: 1, tags: {} },
+      memberFilesById: cached.memberFilesById || {},
+      membersData,
+      activeFolderId: nextActiveFolder,
+      focusedPhotoId: nextFocused,
+      lightboxPhotoId: nextLightbox,
+      ...(sameAlbum
+        ? {}
+        : {
+            selectedPhotoIds: new Set(),
+            lastClickedPhotoId: null,
+            quickView: 'all',
+            minRating: 0,
+            memberFilterId: null,
+            ratingScope: 'avg',
+            selectedTagIds: new Set(),
+            searchQuery: '',
+          }),
+      modal: null,
+    });
+    return true;
+  }
+
+  _scheduleAlbumCacheUpdate() {
+    if (this.state.mode !== 'gdrive' || !this.state.folderId || !this.state.rootFolder) {
+      return;
+    }
+    const authType = this.state.authType === 'oauth' ? 'oauth' : 'apikey';
+    const folderId = this.state.folderId;
+    clearTimeout(this.cacheSnapshotTimer);
+    this.cacheSnapshotTimer = setTimeout(() => {
+      if (this.state.mode !== 'gdrive' || this.state.folderId !== folderId || !this.state.rootFolder) {
+        return;
+      }
+      setCachedAlbum(authType, folderId, {
+        rootFolder: this.state.rootFolder,
+        folders: this.state.folders,
+        files: this.state.files,
+        metaFolderId: this.state.metaFolderId,
+        canWrite: this.state.canWrite,
+        tagSchemaFileId: this.state.tagSchemaFileId,
+        tagSchema: this.state.tagSchema,
+        memberFilesById: this.state.memberFilesById,
+        membersData: this.state.membersData,
+        localMetaSupported: this.state.localMetaSupported,
+      }).catch(() => {});
+    }, 300);
+  }
+
   async connectGoogleDrive({
     clientId,
     folderInput,
@@ -426,6 +633,7 @@ export class Store {
     rememberCredentials = this.state.rememberCredentials,
     prompt,
     loginHint,
+    forceRescan = false,
   }) {
     const cleanClientId = String(clientId || '').trim();
     const cleanFolderId = parseDriveFolderId(folderInput);
@@ -440,6 +648,7 @@ export class Store {
       return false;
     }
 
+    const reqSeq = ++this.connectSeq;
     const existingSavedUser = getSavedOAuthUser(cleanClientId);
     const savedHint = existingSavedUser?.email || '';
     const effectiveHint = loginHint !== undefined ? loginHint : savedHint;
@@ -465,16 +674,53 @@ export class Store {
       clearSession({ forgetUser: true });
     }
 
-    this.setState({
-      loading: true,
-      loadingText: t('store.connectingAccount'),
-      authType: 'oauth',
-      localMetaSupported: false,
-      clientId: cleanClientId,
-      folderId: cleanFolderId,
-      rememberCredentials: remember,
-      savedOAuthUser: remember ? existingSavedUser : null,
-    });
+    const cachedBeforeAuth = !forceRescan ? await getCachedAlbum('oauth', cleanFolderId) : null;
+    if (reqSeq !== this.connectSeq) return false;
+
+    let keepVisible =
+      Boolean(cachedBeforeAuth) ||
+      (this.state.mode === 'gdrive' &&
+        this.state.folderId === cleanFolderId &&
+        this.state.files.length > 0);
+
+    if (cachedBeforeAuth) {
+      this._hydrateFromAlbumCache(cachedBeforeAuth, {
+        authType: 'oauth',
+        folderId: cleanFolderId,
+        clientId: cleanClientId,
+        user: existingSavedUser || this.state.currentUser,
+        syncStatus: 'syncing',
+        syncMessageKey: 'store.syncCachedRevalidating',
+      });
+      this._updateUrlHash(cleanFolderId, cleanClientId);
+      this.toast(
+        t('store.loadedFromCacheToast', {
+          name: cachedBeforeAuth.rootFolder.name,
+          count: cachedBeforeAuth.files.length,
+        }),
+        'info',
+        2600
+      );
+    } else {
+      this.setState({
+        loading: !keepVisible,
+        loadingText: keepVisible ? '' : t('store.connectingAccount'),
+        backgroundRefreshing: keepVisible,
+        authType: 'oauth',
+        localMetaSupported: false,
+        clientId: cleanClientId,
+        folderId: cleanFolderId,
+        rememberCredentials: remember,
+        savedOAuthUser: remember ? existingSavedUser : null,
+        ...(keepVisible
+          ? {
+              syncStatus: 'syncing',
+              syncMessageKey: 'store.syncRefreshingAlbum',
+              syncMessage: t('store.syncRefreshingAlbum'),
+            }
+          : {}),
+      });
+    }
 
     try {
       let session = reuseSession ? getCachedSession(cleanClientId) : null;
@@ -485,6 +731,7 @@ export class Store {
           remember,
         });
       }
+      if (reqSeq !== this.connectSeq) return false;
 
       const nextSavedUser = remember
         ? getSavedOAuthUser(cleanClientId) || {
@@ -498,13 +745,14 @@ export class Store {
         : null;
 
       this.setState({
-        loadingText: t('store.scanningAlbum'),
+        ...(this.state.loading ? { loadingText: t('store.scanningAlbum') } : {}),
         accessToken: session.accessToken,
         currentUser: session.user,
         savedOAuthUser: nextSavedUser,
       });
 
       const album = await loadSharedAlbum(cleanFolderId, session.accessToken, (prog) => {
+        if (reqSeq !== this.connectSeq || !this.state.loading) return;
         this.setState({
           loadingText: t('store.scanningProgress', {
             folders: prog.folderCount,
@@ -512,13 +760,19 @@ export class Store {
           }),
         });
       });
+      if (reqSeq !== this.connectSeq) return false;
 
-      this.setState({
-        loadingText: t('store.syncingMetadata'),
-      });
+      if (this.state.loading) {
+        this.setState({
+          loadingText: t('store.syncingMetadata'),
+        });
+      }
 
       const meta = await loadAlbumMetadata(album.metaFolderId, session.accessToken);
-      const membersData = { ...meta.membersData };
+      if (reqSeq !== this.connectSeq) return false;
+
+      let membersData = { ...meta.membersData };
+      let tagSchema = meta.tagSchema || { version: 1, tags: {} };
       const myId = session.user.id;
 
       // Read-only fallback merge from localStorage if folder is read-only
@@ -529,15 +783,27 @@ export class Store {
             const parsed = JSON.parse(localRaw);
             if (parsed.memberData) membersData[myId] = parsed.memberData;
             if (parsed.tagSchema) {
-              meta.tagSchema = {
+              tagSchema = {
                 version: 1,
-                tags: { ...meta.tagSchema.tags, ...parsed.tagSchema.tags },
+                tags: { ...tagSchema.tags, ...parsed.tagSchema.tags },
               };
             }
           }
         } catch {
           // Ignore
         }
+      }
+
+      if (keepVisible && this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId) {
+        const merged = this._mergeFreshWithLocalEdits(
+          this.state.membersData,
+          membersData,
+          this.state.tagSchema,
+          tagSchema,
+          myId
+        );
+        membersData = merged.mergedMembers;
+        tagSchema = merged.mergedSchema;
       }
 
       if (!membersData[myId]) {
@@ -573,7 +839,29 @@ export class Store {
         }
       }
 
+      const savedSnapshot = {
+        rootFolder: album.rootFolder,
+        folders: album.folders,
+        files: album.files,
+        metaFolderId: album.metaFolderId,
+        canWrite: album.canWrite,
+        tagSchemaFileId: meta.tagSchemaFileId,
+        tagSchema,
+        memberFilesById: meta.memberFilesById,
+        membersData,
+        localMetaSupported: false,
+      };
+      await setCachedAlbum('oauth', cleanFolderId, savedSnapshot);
+      if (reqSeq !== this.connectSeq) return false;
+
       this._updateUrlHash(cleanFolderId, cleanClientId);
+
+      const sameActiveAlbum = this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId;
+      const folderIds = new Set(album.folders.map((f) => f.id));
+      const fileIds = new Set(album.files.map((f) => f.id));
+      const nextSelectedIds = sameActiveAlbum
+        ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => fileIds.has(id)))
+        : new Set();
 
       const msgKey = album.canWrite ? 'store.syncOAuthSynced' : 'store.syncReadonly';
 
@@ -583,6 +871,8 @@ export class Store {
         localMetaSupported: false,
         loading: false,
         loadingText: '',
+        backgroundRefreshing: false,
+        cacheRestoredAt: Date.now(),
         syncStatus: album.canWrite ? 'synced' : 'readonly',
         syncMessageKey: msgKey,
         syncMessage: t(msgKey),
@@ -592,31 +882,61 @@ export class Store {
         metaFolderId: album.metaFolderId,
         canWrite: album.canWrite,
         tagSchemaFileId: meta.tagSchemaFileId,
-        tagSchema: meta.tagSchema,
+        tagSchema,
         memberFilesById: meta.memberFilesById,
         membersData,
-        activeFolderId: album.rootFolder.id,
-        selectedPhotoIds: new Set(),
-        lastClickedPhotoId: null,
-        focusedPhotoId: album.files[0]?.id || null,
-        lightboxPhotoId: null,
-        quickView: 'all',
-        minRating: 0,
-        memberFilterId: null,
-        ratingScope: 'avg',
-        selectedTagIds: new Set(),
-        searchQuery: '',
+        activeFolderId:
+          sameActiveAlbum && folderIds.has(this.state.activeFolderId)
+            ? this.state.activeFolderId
+            : album.rootFolder.id,
+        selectedPhotoIds: nextSelectedIds,
+        lastClickedPhotoId:
+          sameActiveAlbum && fileIds.has(this.state.lastClickedPhotoId)
+            ? this.state.lastClickedPhotoId
+            : null,
+        focusedPhotoId:
+          sameActiveAlbum && fileIds.has(this.state.focusedPhotoId)
+            ? this.state.focusedPhotoId
+            : album.files[0]?.id || null,
+        lightboxPhotoId:
+          sameActiveAlbum && fileIds.has(this.state.lightboxPhotoId)
+            ? this.state.lightboxPhotoId
+            : null,
+        ...(sameActiveAlbum
+          ? {}
+          : {
+              quickView: 'all',
+              minRating: 0,
+              memberFilterId: null,
+              ratingScope: 'avg',
+              selectedTagIds: new Set(),
+              searchQuery: '',
+            }),
         recentAlbums: recent,
         modal: null,
       });
 
-      this.toast(
-        t('store.loadedAlbumToast', { name: album.rootFolder.name, count: album.files.length }),
-        'success'
-      );
+      if (!cachedBeforeAuth || forceRescan) {
+        this.toast(
+          t('store.loadedAlbumToast', { name: album.rootFolder.name, count: album.files.length }),
+          'success'
+        );
+      }
       return true;
     } catch (err) {
-      this.setState({ loading: false, loadingText: '' });
+      if (reqSeq !== this.connectSeq) return false;
+      if (keepVisible && this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId) {
+        this.setState({
+          loading: false,
+          loadingText: '',
+          backgroundRefreshing: false,
+          syncStatus: 'readonly',
+          syncMessageKey: 'store.syncOfflineCached',
+          syncMessage: t('store.syncOfflineCached'),
+        });
+      } else {
+        this.setState({ loading: false, loadingText: '', backgroundRefreshing: false });
+      }
       this.toast(err?.message || t('store.connectFailed'), 'error', 5000);
       return false;
     }
@@ -627,6 +947,7 @@ export class Store {
     folderInput,
     nickname,
     rememberCredentials = this.state.rememberCredentials,
+    forceRescan = false,
   }) {
     const cleanApiKey = String(apiKey || '').trim();
     const cleanFolderId = parseDriveFolderId(folderInput);
@@ -641,6 +962,8 @@ export class Store {
       this.toast(t('store.invalidFolder'), 'error');
       return false;
     }
+
+    const reqSeq = ++this.connectSeq;
 
     if (remember) {
       saveConnectPrefs({
@@ -672,21 +995,65 @@ export class Store {
       color: pickMemberColor(userId),
     };
 
-    this.setState({
-      loading: true,
-      loadingText: t('store.connectingApiKey'),
-      authType: 'apikey',
-      apiKey: cleanApiKey,
-      folderId: cleanFolderId,
-      nickname: cleanNick,
-      rememberCredentials: remember,
-      ...(remember ? {} : { savedOAuthUser: null }),
-      accessToken: '',
-      currentUser: user,
-    });
+    const cached = !forceRescan ? await getCachedAlbum('apikey', cleanFolderId) : null;
+    if (reqSeq !== this.connectSeq) return false;
+
+    const keepVisible =
+      Boolean(cached) ||
+      (this.state.mode === 'gdrive' &&
+        this.state.folderId === cleanFolderId &&
+        this.state.files.length > 0);
+
+    if (cached) {
+      this._hydrateFromAlbumCache(cached, {
+        authType: 'apikey',
+        folderId: cleanFolderId,
+        apiKey: cleanApiKey,
+        user,
+        syncStatus: 'syncing',
+        syncMessageKey: 'store.syncCachedRevalidating',
+      });
+      this.setState({
+        nickname: cleanNick,
+        rememberCredentials: remember,
+        ...(remember ? {} : { savedOAuthUser: null }),
+        accessToken: '',
+      });
+      this._updateUrlHash(cleanFolderId, '');
+      this.toast(
+        t('store.loadedFromCacheToast', {
+          name: cached.rootFolder.name,
+          count: cached.files.length,
+        }),
+        'info',
+        2600
+      );
+    } else {
+      this.setState({
+        loading: !keepVisible,
+        loadingText: keepVisible ? '' : t('store.connectingApiKey'),
+        backgroundRefreshing: keepVisible,
+        authType: 'apikey',
+        apiKey: cleanApiKey,
+        folderId: cleanFolderId,
+        nickname: cleanNick,
+        rememberCredentials: remember,
+        ...(remember ? {} : { savedOAuthUser: null }),
+        accessToken: '',
+        currentUser: user,
+        ...(keepVisible
+          ? {
+              syncStatus: 'syncing',
+              syncMessageKey: 'store.syncRefreshingAlbum',
+              syncMessage: t('store.syncRefreshingAlbum'),
+            }
+          : {}),
+      });
+    }
 
     try {
       const album = await loadSharedAlbumWithApiKey(cleanFolderId, cleanApiKey, (prog) => {
+        if (reqSeq !== this.connectSeq || !this.state.loading) return;
         this.setState({
           loadingText: t('store.scanningProgress', {
             folders: prog.folderCount,
@@ -694,10 +1061,15 @@ export class Store {
           }),
         });
       });
+      if (reqSeq !== this.connectSeq) return false;
 
-      this.setState({ loadingText: t('store.syncingMetadata') });
+      if (this.state.loading) {
+        this.setState({ loadingText: t('store.syncingMetadata') });
+      }
 
       const serverMeta = await loadLocalServerMeta(cleanFolderId);
+      if (reqSeq !== this.connectSeq) return false;
+
       const localStorageKey = `drivelens_apikey_meta_${cleanFolderId}`;
       let tagSchema = { version: 1, tags: {} };
       let membersData = {};
@@ -724,6 +1096,18 @@ export class Store {
         } catch {
           // Ignore
         }
+      }
+
+      if (keepVisible && this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId) {
+        const merged = this._mergeFreshWithLocalEdits(
+          this.state.membersData,
+          membersData,
+          this.state.tagSchema,
+          tagSchema,
+          user.id
+        );
+        membersData = merged.mergedMembers;
+        tagSchema = merged.mergedSchema;
       }
 
       if (!membersData[user.id]) {
@@ -765,9 +1149,30 @@ export class Store {
         // Ignore
       }
 
+      const localMetaSupported = Boolean(serverMeta);
+      await setCachedAlbum('apikey', cleanFolderId, {
+        rootFolder: album.rootFolder,
+        folders: album.folders,
+        files: album.files,
+        metaFolderId: null,
+        canWrite: true,
+        tagSchemaFileId: null,
+        tagSchema,
+        memberFilesById: {},
+        membersData,
+        localMetaSupported,
+      });
+      if (reqSeq !== this.connectSeq) return false;
+
       this._updateUrlHash(cleanFolderId, '');
 
-      const localMetaSupported = Boolean(serverMeta);
+      const sameActiveAlbum = this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId;
+      const folderIds = new Set(album.folders.map((f) => f.id));
+      const fileIds = new Set(album.files.map((f) => f.id));
+      const nextSelectedIds = sameActiveAlbum
+        ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => fileIds.has(id)))
+        : new Set();
+
       const msgKey = localMetaSupported ? 'store.syncApiKeySynced' : 'store.syncApiKeyLocal';
 
       this.setState({
@@ -776,6 +1181,8 @@ export class Store {
         localMetaSupported,
         loading: false,
         loadingText: '',
+        backgroundRefreshing: false,
+        cacheRestoredAt: Date.now(),
         syncStatus: localMetaSupported ? 'synced' : 'readonly',
         syncMessageKey: msgKey,
         syncMessage: t(msgKey),
@@ -788,28 +1195,58 @@ export class Store {
         tagSchema,
         memberFilesById: {},
         membersData,
-        activeFolderId: album.rootFolder.id,
-        selectedPhotoIds: new Set(),
-        lastClickedPhotoId: null,
-        focusedPhotoId: album.files[0]?.id || null,
-        lightboxPhotoId: null,
-        quickView: 'all',
-        minRating: 0,
-        memberFilterId: null,
-        ratingScope: 'avg',
-        selectedTagIds: new Set(),
-        searchQuery: '',
+        activeFolderId:
+          sameActiveAlbum && folderIds.has(this.state.activeFolderId)
+            ? this.state.activeFolderId
+            : album.rootFolder.id,
+        selectedPhotoIds: nextSelectedIds,
+        lastClickedPhotoId:
+          sameActiveAlbum && fileIds.has(this.state.lastClickedPhotoId)
+            ? this.state.lastClickedPhotoId
+            : null,
+        focusedPhotoId:
+          sameActiveAlbum && fileIds.has(this.state.focusedPhotoId)
+            ? this.state.focusedPhotoId
+            : album.files[0]?.id || null,
+        lightboxPhotoId:
+          sameActiveAlbum && fileIds.has(this.state.lightboxPhotoId)
+            ? this.state.lightboxPhotoId
+            : null,
+        ...(sameActiveAlbum
+          ? {}
+          : {
+              quickView: 'all',
+              minRating: 0,
+              memberFilterId: null,
+              ratingScope: 'avg',
+              selectedTagIds: new Set(),
+              searchQuery: '',
+            }),
         recentAlbums: recent,
         modal: null,
       });
 
-      this.toast(
-        t('store.loadedAlbumToast', { name: album.rootFolder.name, count: album.files.length }),
-        'success'
-      );
+      if (!cached || forceRescan) {
+        this.toast(
+          t('store.loadedAlbumToast', { name: album.rootFolder.name, count: album.files.length }),
+          'success'
+        );
+      }
       return true;
     } catch (err) {
-      this.setState({ loading: false, loadingText: '' });
+      if (reqSeq !== this.connectSeq) return false;
+      if (keepVisible && this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId) {
+        this.setState({
+          loading: false,
+          loadingText: '',
+          backgroundRefreshing: false,
+          syncStatus: 'readonly',
+          syncMessageKey: 'store.syncOfflineCached',
+          syncMessage: t('store.syncOfflineCached'),
+        });
+      } else {
+        this.setState({ loading: false, loadingText: '', backgroundRefreshing: false });
+      }
       this.toast(err?.message || t('store.connectApiKeyFailed'), 'error', 5000);
       return false;
     }
@@ -841,6 +1278,35 @@ export class Store {
       }
 
       const savedUser = getSavedOAuthUser(prefs.clientId);
+      const cleanFolderId = parseDriveFolderId(prefs.folderId);
+      const cached = cleanFolderId ? await getCachedAlbum('oauth', cleanFolderId) : null;
+
+      if (cached) {
+        this._hydrateFromAlbumCache(cached, {
+          authType: 'oauth',
+          folderId: cleanFolderId,
+          clientId: prefs.clientId,
+          user: savedUser || {
+            id: 'saved-oauth',
+            name: 'Google',
+            email: '',
+            picture: '',
+            color: '#38bdf8',
+          },
+          syncStatus: 'readonly',
+          syncMessageKey: 'store.syncCachedSessionExpired',
+        });
+        this.setState({ savedOAuthUser: savedUser });
+        this._updateUrlHash(cleanFolderId, prefs.clientId);
+        this.toast(
+          t('store.cachedSessionReconnectHint', {
+            email: savedUser?.email || savedUser?.name || 'Google',
+          }),
+          'info'
+        );
+        return true;
+      }
+
       this.setState({
         authType: 'oauth',
         clientId: prefs.clientId,
@@ -860,8 +1326,17 @@ export class Store {
     return false;
   }
 
+  async clearLocalCache() {
+    clearTimeout(this.cacheSnapshotTimer);
+    await Promise.all([clearAllAlbumCaches(), clearImageCache()]);
+    this.toast(t('store.cacheClearedToast'), 'info');
+  }
+
   forgetSavedCredentials() {
+    this.connectSeq += 1;
     clearSession({ forgetUser: true });
+    clearAllAlbumCaches().catch(() => {});
+    clearImageCache().catch(() => {});
     try {
       if (typeof localStorage !== 'undefined') {
         localStorage.removeItem(SETTINGS_KEY);
@@ -884,10 +1359,14 @@ export class Store {
       rememberCredentials: true,
       accessToken: '',
       localMetaSupported: false,
+      backgroundRefreshing: false,
+      cacheRestoredAt: 0,
     });
 
     if (wasGdrive) {
       this.loadDemoMode(false);
+    } else {
+      this._clearUrlHash();
     }
 
     this.toast(t('store.credsClearedToast'), 'info');
@@ -904,6 +1383,7 @@ export class Store {
         folderInput: this.state.folderId,
         nickname: this.state.nickname || this.state.currentUser?.name,
         rememberCredentials: this.state.rememberCredentials,
+        forceRescan: true,
       });
       return;
     }
@@ -912,13 +1392,32 @@ export class Store {
       folderInput: this.state.folderId,
       reuseSession: true,
       rememberCredentials: this.state.rememberCredentials,
+      forceRescan: true,
     });
   }
 
   disconnectGoogleDrive() {
+    this.connectSeq += 1;
     clearSession();
-    this.setState({ accessToken: '', localMetaSupported: false });
+    this.setState({ accessToken: '', localMetaSupported: false, backgroundRefreshing: false });
     this.loadDemoMode(true, true);
+  }
+
+  _clearUrlHash() {
+    try {
+      const rawHash = window.location.hash || '';
+      if (!rawHash) return;
+      const body = rawHash.startsWith('#') ? rawHash.slice(1) : rawHash;
+      const params = new URLSearchParams(body);
+      params.delete('folder');
+      params.delete('client_id');
+      params.delete('key');
+      const rest = params.toString();
+      const nextUrl = `${window.location.pathname}${window.location.search}${rest ? `#${rest}` : ''}`;
+      window.history.replaceState(null, '', nextUrl);
+    } catch {
+      // Ignore
+    }
   }
 
   _updateUrlHash(folderId, clientId) {
@@ -1235,6 +1734,8 @@ export class Store {
       });
       return;
     }
+
+    this._scheduleAlbumCacheUpdate();
 
     if (this.state.mode === 'gdrive' && this.state.authType === 'apikey') {
       try {
@@ -1746,6 +2247,46 @@ export class Store {
       // Ignore
     }
     this.setState({ theme: next });
+  }
+
+  setLayoutMode(mode) {
+    const next = VALID_LAYOUT_MODES.includes(mode) ? mode : 'justified';
+    saveUiPrefs({ layoutMode: next });
+    if (this.state.layoutMode !== next) {
+      this.setState({ layoutMode: next });
+    }
+  }
+
+  cycleLayoutMode() {
+    const idx = VALID_LAYOUT_MODES.indexOf(this.state.layoutMode);
+    const next = VALID_LAYOUT_MODES[(idx + 1) % VALID_LAYOUT_MODES.length];
+    this.setLayoutMode(next);
+    return next;
+  }
+
+  setRowHeight(px) {
+    const val = Number(px);
+    const clamped = Number.isFinite(val) ? Math.max(130, Math.min(320, Math.round(val))) : 210;
+    saveUiPrefs({ rowHeight: clamped });
+    if (this.state.rowHeight !== clamped) {
+      this.setState({ rowHeight: clamped });
+    }
+  }
+
+  setSortBy(sortBy) {
+    const next = VALID_SORT_MODES.includes(sortBy) ? sortBy : 'dateDesc';
+    saveUiPrefs({ sortBy: next });
+    if (this.state.sortBy !== next) {
+      this.setState({ sortBy: next });
+    }
+  }
+
+  setIncludeSubfolders(includeSubfolders) {
+    const next = Boolean(includeSubfolders);
+    saveUiPrefs({ includeSubfolders: next });
+    if (this.state.includeSubfolders !== next) {
+      this.setState({ includeSubfolders: next });
+    }
   }
 
   openModal(type, payload = null) {

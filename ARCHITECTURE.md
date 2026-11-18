@@ -23,9 +23,9 @@
   - Uses relative `"start_url": "./"` and `"scope": "./"` so the PWA installs cleanly at both root origins (`http://localhost:5173/`) and repository subpaths.
   - References three dedicated icons in `icons/`: `./icons/icon-192.png` (`192x192` RGBA PNG), `./icons/icon-512.png` (`512x512` RGBA PNG), and `./icons/icon.svg` (scalable `any maskable` vector icon).
 - **Document Shell Meta Tags ([`index.html`](index.html))**:
-  - Includes `<meta name="theme-color" content="#0b0e14" />`, `<meta name="apple-mobile-web-app-capable" content="yes" />`, `<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />`, `<meta name="apple-mobile-web-app-title" content="DriveLens" />`, `<link rel="manifest" href="./manifest.webmanifest" />`, and `<link rel="apple-touch-icon" href="./icons/icon-192.png" />`.
+  - Includes `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />`, `<meta name="theme-color" content="#0b0e14" />`, `<meta name="apple-mobile-web-app-capable" content="yes" />`, `<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />`, `<meta name="apple-mobile-web-app-title" content="DriveLens" />`, `<link rel="manifest" href="./manifest.webmanifest" />`, and `<link rel="apple-touch-icon" href="./icons/icon-192.png" />`.
 - **Service Worker ([`sw.js`](sw.js))**:
-  - Maintains `CACHE_NAME = 'drivelens-shell-v1'` and precaches `PRECACHE_ASSETS` (13 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, and `src/i18n.js`) during `install`, calling `self.skipWaiting()`.
+  - Maintains `CACHE_NAME = 'drivelens-shell-v3'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
   - Deletes older `drivelens-*` cache buckets during `activate` and calls `self.clients.claim()`.
   - Intercepts only same-origin `GET` requests excluding `/api/` paths (so `serve.py` `/api/meta`, Google Drive API calls, GIS scripts, and `googleusercontent.com` thumbnails always bypass the Service Worker cache). Uses a **Network-First** strategy that refreshes cached `response.type === 'basic'` assets online and falls back to `caches.match()` or `./index.html` (for navigations) when offline.
 - **Install Prompt Lifecycle (`src/main.js`, `src/state/store.js`, `src/ui/renderHeader.js`)**:
@@ -66,9 +66,9 @@ Browser / Installed PWA Startup (src/main.js)
 
 ```text
 drivelens/
-├── index.html                   # Single-page shell (<html lang="en">), PWA meta/manifest links, 13 mount IDs
+├── index.html                   # Single-page shell (<html lang="en">, viewport-fit=cover), PWA meta links, 14 mount IDs
 ├── manifest.webmanifest         # Web App Manifest (relative ./ scope, standalone display, icon references)
-├── sw.js                        # Service Worker (drivelens-shell-v1 precache, Network-First same-origin shell cache)
+├── sw.js                        # Service Worker (drivelens-shell-v3 precache, Network-First same-origin shell cache)
 ├── icons/
 │   ├── icon.svg                 # Scalable vector app icon (any maskable)
 │   ├── icon-192.png             # 192x192 RGBA PNG app icon & apple-touch-icon
@@ -78,35 +78,36 @@ drivelens/
 ├── .gitignore                   # Ignores __pycache__/, .local-meta/, config.js, .env*, *credentials*, *secret*, keys
 ├── .nojekyll                    # Disables Jekyll processing on GitHub Pages
 ├── .local-meta/                 # Runtime-only directory created by serve.py for API Key /api/meta JSON files
-├── README.md                    # English user, PWA install, persistent credential, and deployment guide (0 CJK chars)
+├── README.md                    # English user, PWA install, mobile touch, credential, and deployment guide (0 CJK)
 ├── ARCHITECTURE.md              # System architecture documentation (this file, 0 CJK chars)
-├── verify_project.py            # Stdlib verification suite (HTTP, ES modules, DOM, docs, bat, api/meta, secrets, i18n)
+├── verify_project.py            # Stdlib verification suite ([a]–[j]: HTTP, ES modules, DOM, PWA, Mobile UX, i18n)
 ├── styles/
-│   ├── tokens.css               # Dark/light theme CSS variables, 8 tag palette colors, layout dimensions
-│   ├── layout.css               # Top header, demo banner, 3-column workspace, drawer backdrop, breakpoints
-│   ├── components.css           # Buttons, sync pills, sidebar nav, photo cards, inspector, lightbox, modals
-│   └── compare.css              # Fullscreen 2–4 photo side-by-side comparison overlay & grid rules
+│   ├── tokens.css               # Dark/light theme variables, safe-area inset tokens, touch-action manipulation
+│   ├── layout.css               # Header, workspace, mobile nav bar, drawer headers/backdrop, mobile breakpoints
+│   ├── components.css           # Cards, touch select targets, 16px mobile inputs, mobile Lightbox, bottom-sheet modals
+│   └── compare.css              # Fullscreen 2–4 photo compare overlay, touch-action: none, stacked/2x2 phone grid
 └── src/
-    ├── main.js                  # Entry point, Store init, SW registration, beforeinstallprompt, auto-reconnect, shortcuts
+    ├── main.js                  # Entry point, SW registration, beforeinstallprompt, mobile nav/drawer, shortcuts
     ├── constants.js             # Empty runtime defaults (DEFAULT_API_KEY/CLIENT_ID/FOLDER_ID), concurrency/debounce
-    ├── i18n.js                  # Bilingual EN/ZH dictionary (405 mirrored keys); sole repository home for CJK strings
+    ├── i18n.js                  # Bilingual EN/ZH dictionary (416 mirrored keys); sole repository home for CJK strings
     ├── api/
     │   ├── gdrive.js            # GIS OAuth + hint/remember persistence, API Key & OAuth BFS crawlers, original download
     │   └── metaSync.js          # Cloud .drivelens/ LWW+isolated member sync & non-throwing ./api/meta helpers
     ├── storage/
-    │   └── imageLoader.js       # 6-concurrency queue, IntersectionObserver, multi-tier fallback & IndexedDB cache
+    │   ├── albumCache.js        # IndexedDB + localStorage SWR cache (up to 12 albums; zero credentials stored)
+    │   └── imageLoader.js       # 6-concurrency queue, IntersectionObserver, thumbnail fallback & 400-blob IDB cache
     ├── state/
-    │   └── store.js             # Pub/sub Store, language switch, session restore/forget, PWA prompt, aggregation, sync
+    │   └── store.js             # Pub/sub Store, SWR cache hydration/revalidation, UI prefs, language, sync
     ├── demo/
     │   └── demoAlbum.js         # Zero-CJK bilingual demo builder reading MESSAGES[code] from src/i18n.js
     └── ui/
-        ├── icons.js             # Inline SVG icons (incl. globe & appWindow) & escapeHtml/escapeAttr XSS helpers
-        ├── renderHeader.js      # Header skeleton, #langSelect, Install App button, search IME guard, demo banner, toasts
-        ├── renderSidebar.js     # Quick views, locale-sorted folder tree, 3-scope star filter, collaborators, tags
-        ├── renderGallery.js     # Subbar, batch bar, computeJustifiedRows, signature-patched photo grid
-        ├── renderInspector.js   # Single/batch inspector, collaborator scores, note auto-save, localized EXIF
-        ├── renderLightbox.js    # Fullscreen lightbox (2048px / video stream / Drive iframe), zoom/pan, filmstrip
-        ├── renderCompare.js     # 2–4 pane side-by-side compare with sync zoom/pan & inline HUD patching
+        ├── icons.js             # Inline SVG icons (incl. waterfall, globe & appWindow) & XSS escaping helpers
+        ├── renderHeader.js      # Header skeleton, 3-view switcher, #langSelect, #mobileNavBar tabs, search popover
+        ├── renderSidebar.js     # Mobile drawer header, gallery views switcher, folders, filters, tags
+        ├── renderGallery.js     # Justified/Waterfall (computeWaterfallColumns)/Grid, subbar, batch bar, touch UX
+        ├── renderInspector.js   # Mobile drawer header across all states, preview reuse, note guard, localized EXIF
+        ├── renderLightbox.js    # Fullscreen lightbox (2048px / video stream / iframe), touch pinch/pan/swipe, filmstrip
+        ├── renderCompare.js     # 2–4 pane compare with mouse + touch pinch/double-tap/synced drag-pan & inline HUD
         └── renderModals.js      # 2-tab Connect (remember checkbox, saved account hint, forget btn), Tag, Export, Help
 ```
 
@@ -131,11 +132,13 @@ flowchart TD
     STORE --> DEMO["src/demo/demoAlbum.js"]
     STORE --> API_GD
     STORE --> API_SYNC["src/api/metaSync.js"]
+    STORE --> ACACHE["src/storage/albumCache.js"]
+    STORE --> IMG["src/storage/imageLoader.js"]
 
     DEMO --> I18N
     API_GD --> I18N
     API_SYNC --> I18N
-    IMG["src/storage/imageLoader.js"] --> CFG
+    IMG --> CFG
 
     UI_GAL --> IMG
     UI_INSP --> IMG
@@ -169,20 +172,21 @@ flowchart TD
 | Module | Key Exports | Responsibility |
 | --- | --- | --- |
 | `src/constants.js` | `APP_CONFIG` | Empty credential placeholders (`DEFAULT_API_KEY`, `DEFAULT_CLIENT_ID`, `DEFAULT_FOLDER_ID`), `APP_TITLE`, `THUMBNAIL_CONCURRENCY` (`6`), `SYNC_DEBOUNCE_MS` (`800`) |
-| `src/i18n.js` | `SUPPORTED_LANGS`, `MESSAGES`, `getLang`, `setLangCode`, `getLocaleTag`, `t` | Strict `'en'`-default localization runtime, 405-key EN/ZH parity, `{param}` interpolation, sole CJK string store |
+| `src/i18n.js` | `SUPPORTED_LANGS`, `MESSAGES`, `getLang`, `setLangCode`, `getLocaleTag`, `t` | Strict `'en'`-default localization runtime, 416-key EN/ZH parity, `{param}` interpolation, sole CJK string store |
 | `serve.py` | `create_server`, `NoCacheStaticHandler`, `ReusableThreadingHTTPServer` | Static serving with strict MIME types (`.js`/`.mjs`, `.css`, `.webmanifest`, `.png`), `--open`/`--dry-run`, thread-safe `GET/POST /api/meta` |
-| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 13 core shell files (`drivelens-shell-v1`), Network-First same-origin cache, excludes cross-origin & `/api/` |
+| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 14 core shell files (`drivelens-shell-v3`), Network-First same-origin cache, excludes cross-origin & `/api/` |
 | `src/api/gdrive.js` | `parseDriveFolderId`, `ensureGoogleIdentityLoaded`, `getCachedSession`, `getSavedOAuthUser`, `clearSession`, `authenticateGoogle`, `loadSharedAlbum`, `loadSharedAlbumWithApiKey`, `downloadOriginalFile` | OAuth 2.0 GIS token & hint flow, dual-storage session cache, API Key album loader, shared BFS media crawler, file download |
 | `src/api/metaSync.js` | `META_FOLDER_NAME`, `TAGS_SCHEMA_FILENAME`, `sanitizeMemberKey`, `ensureMetaFolder`, `mergeTagSchemas`, `loadAlbumMetadata`, `saveMemberMetadata`, `saveTagSchema`, `loadLocalServerMeta`, `saveLocalServerMeta` | `.drivelens/` cloud JSON persistence, LWW tag schema merge, non-throwing `./api/meta` client |
-| `src/storage/imageLoader.js` | `buildDriveThumbUrl`, `loadPhotoIntoElement`, `fetchAuthorizedMediaBlobUrl` | 6-concurrency image queue, `IntersectionObserver` lazy loading, `lh3` & IndexedDB `alt=media` fallback |
-| `src/state/store.js` | `Store`, `getTagColors`, `TAG_COLORS`, `loadConnectPrefs` | Pub/sub store, `setLanguage`, `restoreSavedSession`, `forgetSavedCredentials`, PWA prompt handlers, dual Drive connectors, deterministic aggregation, debounced sync |
+| `src/storage/albumCache.js` | `buildAlbumCacheKey`, `getCachedAlbum`, `setCachedAlbum`, `removeCachedAlbum`, `clearAllAlbumCaches` | IndexedDB + `localStorage` fallback SWR directory/metadata cache (max 12 albums; excludes secrets) |
+| `src/storage/imageLoader.js` | `buildDriveThumbUrl`, `loadPhotoIntoElement`, `fetchAuthorizedMediaBlobUrl`, `clearImageCache` | 6-concurrency image queue, `IntersectionObserver` lazy loading, expired-thumb recovery & 400-blob IDB cache |
+| `src/state/store.js` | `Store`, `getTagColors`, `TAG_COLORS`, `loadConnectPrefs` | Pub/sub store, SWR cache hydration/background sync, UI prefs (`drivelens_ui_prefs_v1`), `setLanguage`, `clearLocalCache` |
 | `src/demo/demoAlbum.js` | `DEMO_STORAGE_KEY`, `DEMO_PERSONAS`, `DEFAULT_TAG_SCHEMA`, `getDemoPersonas`, `localizeDemoState`, `createDemoDataset`, `saveDemoState`, `resetDemoState` | Zero-CJK offline demo album builder (`5` folders, `16` items, `3` personas, `8` default tags) reading `MESSAGES[code]` |
-| `src/ui/renderHeader.js` | `renderHeader`, `bindHeaderEvents` | Header skeleton, `#langSelect`, conditional `[data-header="install-app"]` button, search IME/cursor preservation, demo banner, toasts |
-| `src/ui/renderSidebar.js` | `renderSidebar`, `bindSidebarEvents` | Quick views, locale-aware folder tree, 3-scope star filter, collaborators, grouped tag manager |
-| `src/ui/renderGallery.js` | `computeJustifiedRows`, `renderGallerySubbar`, `renderBatchBar`, `renderGalleryGrid`, `resetGallerySignature`, `bindGalleryEvents` | Justified layout algorithm & language-aware signature patching |
-| `src/ui/renderInspector.js` | `renderInspector`, `bindInspectorEvents` | Preview preservation, active note focus guard, collaborator scores, localized EXIF |
-| `src/ui/renderLightbox.js` | `renderLightbox`, `bindLightboxEvents` | 2048px image / Drive video stream or API Key iframe preview, zoom/pan, filmstrip |
-| `src/ui/renderCompare.js` | `openCompare`, `closeCompare`, `isCompareOpen`, `renderCompare`, `bindCompareEvents` | 2–4 pane side-by-side view with sync zoom/pan & inline HUD patching |
+| `src/ui/renderHeader.js` | `renderHeader`, `bindHeaderEvents`, `renderMobileNav`, `bindMobileNavEvents` | Header skeleton, 3-view layout switcher, `#langSelect`, `[data-header="install-app"]`, `#mobileNavBar`, search popover |
+| `src/ui/renderSidebar.js` | `renderSidebar`, `bindSidebarEvents` | Mobile drawer header, gallery views (`Justified`/`Waterfall`/`Grid`), folder tree, star filter, collaborators, tags |
+| `src/ui/renderGallery.js` | `computeJustifiedRows`, `computeWaterfallColumns`, `renderGallerySubbar`, `renderBatchBar`, `renderGalleryGrid`, `resetGallerySignature`, `bindGalleryEvents` | Justified/Waterfall masonry/Square Grid layouts, `Select` subbar button, long-press & single-tap Lightbox UX |
+| `src/ui/renderInspector.js` | `renderInspector`, `bindInspectorEvents` | Mobile drawer header across all render states, preview preservation, note focus guard, collaborator scores, EXIF |
+| `src/ui/renderLightbox.js` | `renderLightbox`, `bindLightboxEvents` | 2048px image / video stream / iframe preview, mouse + touch pinch/double-tap/pan/swipe gestures, filmstrip |
+| `src/ui/renderCompare.js` | `openCompare`, `closeCompare`, `isCompareOpen`, `renderCompare`, `bindCompareEvents` | 2–4 pane side-by-side view with mouse + touch pinch/double-tap/synced drag-pan & inline HUD patching |
 | `src/ui/renderModals.js` | `renderModals`, `bindModalEvents` | 2-tab Connect (`#rememberApiKeyCheck`, `#rememberOAuthCheck`, saved OAuth account badge, `[data-action="forget-creds"]`), Tag, Export, Shortcuts modals |
 | `src/ui/icons.js` | `icon`, `escapeHtml`, `escapeAttr` | Inline SVG icon registry (`globe`, `appWindow`, etc.) & XSS-safe HTML/attribute escaping |
 
@@ -197,7 +201,7 @@ flowchart TD
 - **Strict `'en'` Default**: `getLang()` reads `localStorage.getItem('drivelens_lang_v1')` and returns `'zh'` **only** when that exact key equals `'zh'`. It deliberately **never inspects `navigator.language`**, guaranteeing deterministic English startup on any OS locale unless explicitly toggled by the user or URL hash `#lang=zh`.
 - **DOM & Document Sync**: `setLangCode(lang)` normalizes input (`'zh'` or `'en'`), persists to `drivelens_lang_v1`, updates `document.documentElement.lang` (`'zh-CN'` vs `'en'`), and updates `document.title = t('app.title')`.
 - **Locale-Aware Formatting**: `getLocaleTag()` returns `'zh-CN'` or `'en-US'`, consumed by `Store.getActiveTagList()`, `Store.getVisiblePhotos()` (`nameAsc` sorting), `renderSidebar.js` folder sorting, and `renderInspector.js` `formatDate()`.
-- **Translation Helper**: `t(key, params = {})` resolves `MESSAGES[currentLang]?.[key] ?? MESSAGES.en[key] ?? key` and substitutes `{param}` placeholders across all 405 mirrored keys in `MESSAGES.en` and `MESSAGES.zh`.
+- **Translation Helper**: `t(key, params = {})` resolves `MESSAGES[currentLang]?.[key] ?? MESSAGES.en[key] ?? key` and substitutes `{param}` placeholders across all 416 mirrored keys in `MESSAGES.en` and `MESSAGES.zh`.
 
 ### 3.2 Language Switching & Non-Destructive Demo Localization
 
@@ -289,7 +293,7 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 | `localStorage` | `drivelens_apikey_meta_<folderId>` | Local mirror/fallback for API Key mode |
 | `localStorage` | `drivelens_readonly_<folderId>_<myId>` | Local fallback for OAuth Viewer-only folders |
 | `IndexedDB` | `drivelens-img-cache` (`blobs`) | Cached `alt=media` image/video Blobs (max 120 entries) |
-| `Cache Storage` | `drivelens-shell-v1` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
+| `Cache Storage` | `drivelens-shell-v2` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
 
 ---
 
@@ -301,18 +305,36 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 
 ### 6.2 Signature-Patched DOM & Justified Row Layout
 
-- **No-Flicker In-Place Patching**: `renderGalleryGrid` checks `sig = "${lang}|${layoutMode}|${rowHeight}|${Math.round(containerWidth)}|${visibleIds}"` to patch `.is-selected`, `.is-focused`, and `.photo-overlay` without recreating `<img>` nodes; `renderInspector` guards `#myNoteInput` focus and reuses `.inspector-preview img`; `renderLightbox` patches HUD/filmstrip when `activeLightboxPhotoId` and `activeLightboxLang` match; `renderCompare` patches `.compare-pane-hud` and zoom/pan transforms when `activeCompareKey` matches; `renderHeader` preserves `#searchInput` focus/cursor, `isSearchComposing` IME composition, `lang` dropdown rebuilds, and `[data-header="install-app"]` visibility.
+- **No-Flicker In-Place Patching**: `renderGalleryGrid` checks `sig = "${lang}|${isMobile ? 'm' : 'd'}|${layoutMode}|${rowHeight}|${Math.round(containerWidth)}|${visibleIds}"` to patch `.is-selected`, `.is-focused`, and `.photo-overlay` without recreating `<img>` nodes; `renderInspector` guards `#myNoteInput` focus and reuses `.inspector-preview img`; `renderLightbox` patches HUD/filmstrip when `activeLightboxPhotoId` and `activeLightboxLang` match; `renderCompare` patches `.compare-pane-hud` and zoom/pan transforms when `activeCompareKey` matches; `renderHeader` preserves `#searchInput` focus/cursor, `isSearchComposing` IME composition, `lang` dropdown rebuilds, `.mobile-search-open` state, and `[data-header="install-app"]` visibility.
 - **Justified Rows (`computeJustifiedRows`)**: Clamps aspect ratio to `[0.45, 2.6]` (fallback `1.5`), breaks rows once `sumRatios * targetHeight + gap * (n - 1) >= safeWidth`, solves exact row height `(safeWidth - gap * (n - 1)) / sumRatios`, and caps the final incomplete row height at `Math.min(naturalHeight, targetHeight * 1.15)`.
 
-### 6.3 Verification Suite (`verify_project.py`)
+### 6.3 Mobile Responsive & Touch UX Architecture
 
-Run `python verify_project.py` (Python 3 stdlib only) to run the automated project verification suite:
+- **Safe-Area Tokens & Touch Ergonomics (`styles/tokens.css`, `layout.css`, `components.css`)**:
+  - `:root` exposes `--safe-top`, `--safe-bottom`, `--safe-left`, and `--safe-right` (`env(safe-area-inset-*, 0px)`) plus `--mobile-nav-height: 56px`, paired with `-webkit-tap-highlight-color: transparent` and `touch-action: manipulation` on interactive controls and cards.
+  - Under `@media (max-width: 768px)`, inputs (`.search-box input`, `.form-input`, `.note-textarea`, `.select-sm`) enforce `font-size: 16px` to prevent automatic iOS Safari viewport zoom, while `@media (max-width: 640px)` anchors modals as bottom sheets (`max-height: 92dvh`, rounded top corners, bottom safe-area padding).
+  - Under `@media (hover: none), (pointer: coarse), (max-width: 860px)`, corner checkboxes (`.photo-select-btn`), tag action icons, and star buttons remain directly visible and finger-sized without hover states.
+- **Bottom Navigation Bar & Mutually Exclusive Drawers (`index.html`, `src/main.js`, `src/ui/renderHeader.js`, `renderSidebar.js`, `renderInspector.js`)**:
+  - `<nav id="mobileNavBar" class="mobile-nav-bar">` is rendered at viewports `<= 860px` by `renderMobileNav(navEl, store)` and bound by `bindMobileNavEvents(navEl, store)` with 5 tabs: **Folders** (with active filter count badge), **Search** (toggling `.mobile-search-open` popover on `#topHeader` and focusing `#searchInput`), **Compare** (with selected photo count badge), **Details**, and **Drive**.
+  - `src/main.js` collapses drawers cleanly at startup (`<= 860px`: sidebar collapsed + inspector closed; `<= 1120px`: inspector closed), coordinates `#drawerBackdrop` visibility across both `sidebarOpen` and `inspectorOpen` (`window.innerWidth <= 1120`), closes opposite drawers when opening one, and unwinds open drawers cleanly via `Escape` or `.mobile-drawer-header` close buttons.
+- **Compact Phone Grid, Single-Tap Open & Long-Press Selection (`src/ui/renderGallery.js`)**:
+  - Below `scrollContainer.clientWidth <= 600` (`isMobile`), `renderGalleryGrid` scales target row height (`max(105, rowHeight * 0.62)`), tightens gaps (`6px`), and sets Square Grid `minCard = max(96, round(rowHeight * 0.5))` for clean 3-column phone browsing.
+  - Exposes `[data-subbar="toggle-select-mode"]` (`mobile.selectMode` / `mobile.doneSelect`) on compact screens alongside `420ms` long-press detection (`touchstart`/`touchmove` `>10px` cancel/`touchend`/`touchcancel` + `navigator.vibrate?.(12)`). On touch viewports (`isTouchViewport()`), single-tapping a card opens Lightbox directly unless `mobileSelectMode` or an active selection is present.
+- **Touch Gestures in Lightbox & Compare (`src/ui/renderLightbox.js`, `src/ui/renderCompare.js`)**:
+  - Both `.lightbox-stage` (and `.lightbox-media-wrap`) and `.compare-stage` set `touch-action: none` and attach `{ passive: false }` `touchmove` listeners for 2-finger pinch zoom (`1x–3x`), `< 280ms` double-tap zoom toggling (`1x <-> 2x`), and 1-finger panning when zoomed (`> 1`).
+  - At `1x` zoom in Lightbox, horizontal swipes (`|dx| > 48 && |dx| > |dy| * 1.3`) step between photos and downward swipes (`dy > 85 && dy > |dx| * 1.4`) dismiss Lightbox. On phones (`<= 640px`), Compare stacks 2 panes vertically (`.compare-grid-2`) and lays out 3–4 panes in a scrollable 2-column grid (`.compare-grid-3`, `.compare-grid-4`) with synchronized touch zoom/pan.
+
+### 6.4 Verification Suite (`verify_project.py`)
+
+Run `python verify_project.py` (Python 3 stdlib only) to execute all 10 automated checks:
 
 - **`[a]` HTTP Server Crawl (`verify_http_server`)**: Binds `serve.create_server('127.0.0.1', 0)` (with in-process `NoCacheStaticHandler` fallback if loopback TCP is sandbox-blocked) and fetches `/index.html`, stylesheets, and all transitive ES module imports from `/src/main.js`, asserting HTTP `200`, `no-cache`, and strict MIME types.
 - **`[b]` Static ES Module Graph (`verify_static_modules`)**: Tokenizes all JS files, validates balanced `{}/()/[]`, resolves relative import paths case-sensitively, and verifies every imported symbol exists in the target module's exports.
-- **`[c]` HTML / CSS / DOM IDs (`verify_html_css_and_dom_ids`)**: Validates balanced HTML tags, CSS braces, and that every `#id` queried in `src/main.js` exists in `index.html`.
+- **`[c]` HTML / CSS / DOM IDs (`verify_html_css_and_dom_ids`)**: Validates balanced HTML tags, CSS braces, and that every `#id` queried in `src/main.js` (including `#mobileNavBar`) exists in `index.html`.
 - **`[d]` Documentation Presence (`verify_docs`)**: Confirms `README.md` and `ARCHITECTURE.md` exist and are non-empty.
 - **`[e]` `start.bat` Hygiene (`verify_start_bat`)**: Verifies 100% pure ASCII bytes and strict CRLF (`\r\n`) line endings.
 - **`[f]` `/api/meta` In-Process Sync (`verify_api_meta`)**: Exercises `GET`/`POST /api/meta`, LWW tag merging, tombstone retention, `400` validation, and `.local-meta/` cleanup.
 - **`[g]` Credential & Secret Hygiene (`verify_no_credentials_or_secrets`)**: Ensures zero credential config files (`config.js`, `.env*`, etc.) and zero API keys, Client IDs, personal emails, or local user paths appear anywhere in the repository.
-- **`[h]` i18n Integrity (`verify_i18n`)**: Validates `<html lang="en">`, strict `'en'` default, 100% key parity between `MESSAGES.en` and `MESSAGES.zh`, existence of all literal `t(...)` keys, and zero CJK characters in non-`i18n.js` repository files (including documentation and source modules).
+- **`[h]` i18n Integrity (`verify_i18n`)**: Validates `<html lang="en">`, strict `'en'` default, 100% key parity between `MESSAGES.en` and `MESSAGES.zh`, existence of all literal `t(...)` keys, and zero CJK characters in non-`i18n.js` repository files (including documentation, CSS, HTML, and source modules).
+- **`[i]` PWA Integrity (`verify_pwa`)**: Validates `manifest.webmanifest` (`display: 'standalone'`, `start_url: './'`), binary PNG dimensions (`192x192` and `512x512`) + SVG icon existence, `sw.js` syntax + `PRECACHE_ASSETS` disk resolution, and live `serve.py` MIME headers for `.webmanifest`, `sw.js`, and `.png`.
+- **`[j]` Mobile & Touch UX (`verify_mobile_ux`)**: Verifies `viewport-fit=cover` and `<nav id="mobileNavBar"` in `index.html`, safe-area CSS tokens and mobile/input rules across all 4 stylesheets, `touchstart`/`touchmove`/`touchend` handlers in `renderGallery.js`/`renderLightbox.js`/`renderCompare.js`, `'drivelens-shell-v2'` in `sw.js`, and preservation of the `README.md` `## Design Inspiration & Independence` section.

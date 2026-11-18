@@ -8,10 +8,16 @@ let compareZoom = 1;
 let panX = 0;
 let panY = 0;
 let isDragging = false;
+let isPinching = false;
+let isTouchPanning = false;
 let dragStartX = 0;
 let dragStartY = 0;
 let activeCompareKey = '';
 const boundContainers = new WeakSet();
+
+function getTouchDistance(t1, t2) {
+  return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
+}
 
 function formatShutter(sec) {
   const n = Number(sec || 0);
@@ -142,7 +148,7 @@ function applyCompareTransform(container) {
 
   const imgs = container.querySelectorAll('.compare-pane-img');
   for (const img of imgs) {
-    img.style.transition = isDragging ? 'none' : '';
+    img.style.transition = isDragging || isPinching || isTouchPanning ? 'none' : '';
     if (compareZoom <= 1) {
       img.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
     } else {
@@ -218,6 +224,8 @@ export function openCompare(photoIds, store) {
   panX = 0;
   panY = 0;
   isDragging = false;
+  isPinching = false;
+  isTouchPanning = false;
   activeCompareKey = '';
 
   store.emit();
@@ -231,6 +239,8 @@ export function closeCompare(store) {
   panX = 0;
   panY = 0;
   isDragging = false;
+  isPinching = false;
+  isTouchPanning = false;
   activeCompareKey = '';
   store?.emit();
 }
@@ -261,6 +271,8 @@ export function renderCompare(container, store) {
     panX = 0;
     panY = 0;
     isDragging = false;
+    isPinching = false;
+    isTouchPanning = false;
     container.classList.add('hidden');
     if (container.innerHTML !== '') {
       container.innerHTML = '';
@@ -385,6 +397,18 @@ export function bindCompareEvents(container, store) {
   if (!container || boundContainers.has(container)) return;
   boundContainers.add(container);
 
+  let pinchStartDist = 0;
+  let pinchStartZoom = 1;
+  let touchStartX = 0;
+  let touchStartY = 0;
+  let panStartX = 0;
+  let panStartY = 0;
+  let touchMoved = false;
+  let lastTapTime = 0;
+  let lastTapX = 0;
+  let lastTapY = 0;
+  let suppressNextDblClickUntil = 0;
+
   container.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-cmp]');
     if (!btn) return;
@@ -437,6 +461,7 @@ export function bindCompareEvents(container, store) {
   });
 
   container.addEventListener('dblclick', (e) => {
+    if (Date.now() < suppressNextDblClickUntil) return;
     if (!isCompareOpen()) return;
     if (!e.target.closest('.compare-stage')) return;
     compareZoom = compareZoom > 1 ? 1 : 2;
@@ -456,6 +481,137 @@ export function bindCompareEvents(container, store) {
     dragStartY = e.clientY - panY;
     applyCompareTransform(container);
   });
+
+  container.addEventListener(
+    'touchstart',
+    (e) => {
+      if (!isCompareOpen() || !e.target.closest('.compare-stage')) return;
+      if (e.touches.length === 2) {
+        isPinching = true;
+        isTouchPanning = false;
+        touchMoved = true;
+        pinchStartDist = getTouchDistance(e.touches[0], e.touches[1]);
+        pinchStartZoom = compareZoom;
+      } else if (e.touches.length === 1) {
+        isPinching = false;
+        isTouchPanning = false;
+        touchMoved = false;
+        touchStartX = e.touches[0].clientX;
+        touchStartY = e.touches[0].clientY;
+        panStartX = panX;
+        panStartY = panY;
+      }
+    },
+    { passive: true }
+  );
+
+  container.addEventListener(
+    'touchmove',
+    (e) => {
+      if (!isCompareOpen() || !e.target.closest('.compare-stage')) return;
+      if (e.touches.length === 2) {
+        if (!isPinching) {
+          isPinching = true;
+          pinchStartDist = getTouchDistance(e.touches[0], e.touches[1]);
+          pinchStartZoom = compareZoom;
+        }
+        e.preventDefault();
+        touchMoved = true;
+        if (pinchStartDist > 0) {
+          const dist = getTouchDistance(e.touches[0], e.touches[1]);
+          compareZoom = Math.max(
+            1,
+            Math.min(3, Number((pinchStartZoom * (dist / pinchStartDist)).toFixed(2)))
+          );
+          if (compareZoom <= 1) {
+            panX = 0;
+            panY = 0;
+          }
+          updateCompareZoomUI(container);
+          applyCompareTransform(container);
+        }
+      } else if (e.touches.length === 1 && !isPinching) {
+        const dx = e.touches[0].clientX - touchStartX;
+        const dy = e.touches[0].clientY - touchStartY;
+        if (Math.abs(dx) > 6 || Math.abs(dy) > 6) {
+          touchMoved = true;
+        }
+        if (compareZoom > 1) {
+          e.preventDefault();
+          isTouchPanning = true;
+          panX = panStartX + dx;
+          panY = panStartY + dy;
+          applyCompareTransform(container);
+        }
+      }
+    },
+    { passive: false }
+  );
+
+  container.addEventListener(
+    'touchend',
+    (e) => {
+      if (!isCompareOpen()) return;
+      if (isPinching) {
+        if (e.touches.length < 2) {
+          isPinching = false;
+          isTouchPanning = false;
+          if (e.touches.length === 1) {
+            touchStartX = e.touches[0].clientX;
+            touchStartY = e.touches[0].clientY;
+            panStartX = panX;
+            panStartY = panY;
+            touchMoved = true;
+          }
+          updateCompareZoomUI(container);
+          applyCompareTransform(container);
+          lastTapTime = 0;
+        }
+        return;
+      }
+
+      isTouchPanning = false;
+      applyCompareTransform(container);
+
+      if (!e.target.closest('.compare-stage') || e.changedTouches.length === 0) return;
+      const touch = e.changedTouches[0];
+      const now = Date.now();
+
+      if (
+        !touchMoved &&
+        now - lastTapTime < 280 &&
+        Math.hypot(touch.clientX - lastTapX, touch.clientY - lastTapY) < 24
+      ) {
+        lastTapTime = 0;
+        suppressNextDblClickUntil = now + 400;
+        compareZoom = compareZoom > 1 ? 1 : 2;
+        panX = 0;
+        panY = 0;
+        updateCompareZoomUI(container);
+        applyCompareTransform(container);
+        return;
+      }
+
+      if (!touchMoved) {
+        lastTapTime = now;
+        lastTapX = touch.clientX;
+        lastTapY = touch.clientY;
+      } else {
+        lastTapTime = 0;
+      }
+    },
+    { passive: true }
+  );
+
+  container.addEventListener(
+    'touchcancel',
+    () => {
+      isPinching = false;
+      isTouchPanning = false;
+      applyCompareTransform(container);
+    },
+    { passive: true }
+  );
 
   container.addEventListener(
     'wheel',

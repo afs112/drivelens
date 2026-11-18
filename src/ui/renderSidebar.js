@@ -139,6 +139,15 @@ export function renderSidebar(container, store) {
   container.classList.toggle('collapsed', Boolean(state.sidebarCollapsed) && !state.sidebarOpen);
 
   container.innerHTML = `
+    <div class="mobile-drawer-header">
+      <span>${escapeHtml(t('mobile.sidebarTitle'))}</span>
+      <button
+        type="button"
+        class="btn btn-ghost btn-icon btn-sm"
+        data-action="close-sidebar"
+        aria-label="${escapeAttr(t('mobile.closeDrawer'))}"
+      >${icon('x', 16)}</button>
+    </div>
     <div class="sidebar-scroll">
       <!-- Quick Views -->
       <div class="sidebar-section">
@@ -157,6 +166,24 @@ export function renderSidebar(container, store) {
           <span class="nav-item-main">${icon('star', 15)}<span class="nav-item-label">${escapeHtml(t('sidebar.unrated'))}</span></span>
           <span class="nav-count">${unratedTotal}</span>
         </button>
+      </div>
+
+      <!-- Gallery Views -->
+      <div class="sidebar-section">
+        <div class="sidebar-section-header">
+          <span>${escapeHtml(t('sidebar.viewLayout'))}</span>
+        </div>
+        <div class="segmented" style="margin:0 4px">
+          <button type="button" class="seg-btn ${state.layoutMode === 'justified' ? 'active' : ''}" data-action="set-layout" data-layout="justified">
+            ${icon('rows', 12)} <span>${escapeHtml(t('sidebar.viewJustified'))}</span>
+          </button>
+          <button type="button" class="seg-btn ${state.layoutMode === 'waterfall' ? 'active' : ''}" data-action="set-layout" data-layout="waterfall">
+            ${icon('waterfall', 12)} <span>${escapeHtml(t('sidebar.viewWaterfall'))}</span>
+          </button>
+          <button type="button" class="seg-btn ${state.layoutMode === 'grid' ? 'active' : ''}" data-action="set-layout" data-layout="grid">
+            ${icon('grid', 12)} <span>${escapeHtml(t('sidebar.viewGrid'))}</span>
+          </button>
+        </div>
       </div>
 
       <!-- Folder Tree -->
@@ -268,7 +295,7 @@ export function bindSidebarEvents(container, store) {
 
   container.addEventListener('change', (e) => {
     if (e.target.id === 'toggleSubfoldersCheck') {
-      store.setState({ includeSubfolders: e.target.checked });
+      store.setIncludeSubfolders(e.target.checked);
     }
   });
 
@@ -277,6 +304,17 @@ export function bindSidebarEvents(container, store) {
     if (!target) return;
     const action = target.dataset.action;
 
+    if (action === 'close-sidebar') {
+      store.setState({ sidebarOpen: false });
+      return;
+    }
+    if (action === 'set-layout') {
+      store.setLayoutMode(target.dataset.layout);
+      if (window.innerWidth <= 860 && store.state.sidebarOpen) {
+        store.setState({ sidebarOpen: false });
+      }
+      return;
+    }
     if (action === 'select-folder') {
       store.setState({ activeFolderId: target.dataset.folderId, sidebarOpen: false });
       return;

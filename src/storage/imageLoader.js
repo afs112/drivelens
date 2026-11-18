@@ -2,7 +2,7 @@ import { APP_CONFIG } from '../constants.js';
 
 const DB_NAME = 'drivelens-img-cache';
 const STORE_NAME = 'blobs';
-const MAX_CACHE_ENTRIES = 120;
+const MAX_CACHE_ENTRIES = 400;
 
 let dbPromise = null;
 const objectUrlCache = new Map();
@@ -161,19 +161,27 @@ async function resolveImageSrc(item, size, getAccessToken, getApiKey) {
   if (thumbUrl) {
     try {
       await loadViaImgTag(thumbUrl);
+      objectUrlCache.set(memKey, thumbUrl);
       return thumbUrl;
     } catch {
-      // Fall through to lh3 or alt=media fallback
+      // Fall through to fresh Drive / lh3 / alt=media fallbacks (handles expired thumbnailLink tokens)
     }
   }
 
-  if (!item.thumbnailLink && item.id) {
-    const lh3Url = `https://lh3.googleusercontent.com/d/${encodeURIComponent(item.id)}=s${size}`;
-    try {
-      await loadViaImgTag(lh3Url);
-      return lh3Url;
-    } catch {
-      // Fall through to IndexedDB / alt=media fallback
+  if (item.id) {
+    const candidates = [
+      `https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w${size}`,
+      `https://lh3.googleusercontent.com/d/${encodeURIComponent(item.id)}=s${size}`,
+    ];
+    for (const candidateUrl of candidates) {
+      if (candidateUrl === thumbUrl) continue;
+      try {
+        await loadViaImgTag(candidateUrl);
+        objectUrlCache.set(memKey, candidateUrl);
+        return candidateUrl;
+      } catch {
+        // Try next lightweight endpoint
+      }
     }
   }
 
@@ -283,4 +291,31 @@ export async function fetchAuthorizedMediaBlobUrl(fileId, accessToken, apiKey = 
   const objUrl = URL.createObjectURL(blob);
   objectUrlCache.set(cacheKey, objUrl);
   return objUrl;
+}
+
+export async function clearImageCache() {
+  for (const url of objectUrlCache.values()) {
+    if (typeof url === 'string' && url.startsWith('blob:')) {
+      try {
+        URL.revokeObjectURL(url);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+  objectUrlCache.clear();
+
+  const db = await openCacheDb();
+  if (!db) return;
+  await new Promise((resolve) => {
+    try {
+      const tx = db.transaction(STORE_NAME, 'readwrite');
+      tx.objectStore(STORE_NAME).clear();
+      tx.oncomplete = () => resolve();
+      tx.onerror = () => resolve();
+      tx.onabort = () => resolve();
+    } catch {
+      resolve();
+    }
+  });
 }

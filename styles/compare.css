@@ -23,9 +23,9 @@
 
 /* Top Toolbar */
 .compare-topbar {
-  height: 52px;
+  height: calc(52px + var(--safe-top));
   flex-shrink: 0;
-  padding: 0 14px;
+  padding: var(--safe-top) 14px 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -225,6 +225,7 @@
   overflow: hidden;
   background: #07090d;
   user-select: none;
+  touch-action: none;
   padding: 8px;
 }
 
@@ -391,8 +392,26 @@
 
 @media (max-width: 640px) {
   .compare-topbar {
-    padding: 0 10px;
+    height: calc(48px + var(--safe-top));
+    padding: var(--safe-top) 10px 0;
     gap: 8px;
+  }
+
+  .compare-topbar-left {
+    flex: 1;
+    min-width: 0;
+  }
+
+  .compare-title {
+    font-size: 12.5px;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .compare-topbar-right {
+    flex-shrink: 0;
+    gap: 6px;
   }
 
   .compare-sync-pill {
@@ -400,16 +419,32 @@
   }
 
   .compare-grid {
-    padding: 8px;
-    gap: 8px;
-    grid-auto-rows: minmax(340px, auto);
+    padding: 6px 6px calc(6px + var(--safe-bottom));
+    gap: 6px;
   }
 
-  .compare-grid-2,
+  .compare-grid-2 {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: repeat(2, minmax(0, 1fr));
+    overflow: hidden;
+  }
+
   .compare-grid-3,
   .compare-grid-4 {
-    grid-template-columns: minmax(0, 1fr);
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    grid-auto-rows: minmax(210px, 1fr);
     grid-template-rows: auto;
+    overflow-y: auto;
+  }
+
+  .compare-pane-header {
+    height: 30px;
+    padding: 0 6px 0 8px;
+  }
+
+  .compare-pane-hud {
+    padding: 5px 8px;
+    gap: 4px;
   }
 
   .compare-btn-label,

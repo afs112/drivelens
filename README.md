@@ -19,7 +19,8 @@
   - **API Key Direct** reconnects silently using your saved API Key, folder ID, and nickname.
   - **OAuth 2.0** silently reuses an active cached token while valid (`drivelens_session_v1`), and once Google's 1-hour access token expires, keeps your account hint (`drivelens_oauth_user_v1`) and opens the Connect modal with one-click re-consent prefilled.
   - Click **Forget Saved Credentials** inside the Connect modal at any time to wipe saved keys, tokens, recent albums, and OAuth account hints.
-- **Fast Browsing & Adaptive Layouts**: Switch between **Justified Rows** and **Square Grid** layouts with a live thumbnail size slider (`130px–320px`) and recursive folder tree navigation (with an **Include subfolders** toggle).
+- **Fast Browsing, Waterfall Masonry & Adaptive Layouts**: Switch between **Justified Rows**, **Waterfall Masonry** (`V` shortcut or `#layout=waterfall`), and **Square Grid** layouts—plus a sidebar **Gallery Views** switcher—with persisted preferences, live thumbnail size slider (`130px–320px`), and recursive folder tree navigation.
+- **Instant Local Album Cache (Stale-While-Revalidate)**: Caches scanned Google Drive folder trees, file metadata, and collaboration state locally in IndexedDB ([`src/storage/albumCache.js`](src/storage/albumCache.js), up to 12 albums with `localStorage` fallback) alongside a `400`-entry image blob cache ([`src/storage/imageLoader.js`](src/storage/imageLoader.js)). Reopening or reloading renders cached photos instantaneously while silently checking Google Drive in the background; click **Clear Cache** in the Connect modal anytime to reset local caches.
 - **Bilingual Interface (`English` / `Chinese (zh)`)**: Starts strictly in **English** by default (`<html lang="en">`) and switches live to **Chinese (`zh`)** via the top-right language selector (`#langSelect`) or `#lang=zh` URL hash, with localized dates, sorting, tags, and demo datasets. All Chinese translations live exclusively inside [`src/i18n.js`](src/i18n.js); every other file in the repository contains zero CJK characters.
 - **Dual Google Drive Connection Modes**:
   - **API Key Direct (Recommended for public/link-shared albums)**: Connect with a Google Drive API Key (`AIzaSy...`) and any nickname—no OAuth consent review or test-user allowlist required. Syncs ratings/tags via `serve.py` `/api/meta` when self-hosted, or saves locally in `localStorage` on static hosts.
@@ -28,6 +29,7 @@
 - **2–4 Photo Side-by-Side Compare (`C`)**: Select 2–4 similar shots and press `C` to compare sharpness, framing, and EXIF side by side with **synchronized zoom (`1x–3x`) and drag-pan** plus inline rating, favoriting, and tagging.
 - **Multiplayer Ratings, Grouped Color Tags & Notes**: Per-member ratings (`1–5★`), favorites, and notes aggregate deterministically into average scores and collaborator filters (`Average` / `Mine` / `Member`), paired with 8-color grouped tags and `OR` / `AND` multi-tag filtering.
 - **Camera EXIF & Export**: Reads Google Drive `imageMediaMetadata` (capture time, resolution, camera, focal length, aperture, shutter, ISO) and exports filtered picks (`Avg ≥ 4★ or favorited`, optional extension stripping) to clipboard filename lists, UTF-8 BOM CSV (`drivelens-shared-picks.csv`), or JSON (`drivelens-shared-picks.json`).
+- **Mobile & Touch Experience**: Dedicated bottom navigation bar (`Folders`, `Search`, `Compare`, `Details`, `Drive`), safe-area PWA support (`viewport-fit=cover` + notch insets), responsive 3-column phone grid / edge-to-edge Lightbox, single-tap Lightbox open, long-press (`Select` mode) or corner checkbox multi-select, and touch pinch-to-zoom (`1x–3x`) plus swipe gestures in Lightbox and Compare.
 
 ---
 
@@ -81,7 +83,7 @@ DriveLens ships with [`manifest.webmanifest`](manifest.webmanifest), [`sw.js`](s
 - **Requirements**: Service Worker registration and PWA installation activate automatically on HTTPS deployments (`GitHub Pages`, `Cloudflare Pages`, `Netlify Drop`) and on local `http://localhost:<port>` / `http://127.0.0.1:<port>` (treated as secure contexts by browsers; remote plain HTTP LAN IPs do not allow Service Workers).
 - **Desktop Chrome / Edge**: Look for the **Install App** button (`[data-header="install-app"]`) in the DriveLens top header—shown automatically when the browser fires `beforeinstallprompt`—or click the install icon in the browser address bar to launch DriveLens in its own standalone window.
 - **iOS / iPadOS Safari**: Open your HTTPS-hosted DriveLens URL in Safari and choose **Share → Add to Home Screen** (`apple-mobile-web-app-capable` and `apple-touch-icon` are preconfigured in [`index.html`](index.html)).
-- **Offline App Shell Caching**: `sw.js` (`drivelens-shell-v1`) precaches the core HTML, CSS, SVG/PNG icons, and entry ES modules using a **Network-First** strategy with navigation fallback to `./index.html`. Cross-origin Google Drive API calls and local `/api/` metadata calls always bypass the Service Worker cache.
+- **Offline App Shell Caching**: `sw.js` (`drivelens-shell-v3`) precaches the core HTML, CSS, SVG/PNG icons, and entry ES modules using a **Network-First** strategy with navigation fallback to `./index.html`. Cross-origin Google Drive API calls and local `/api/` metadata calls always bypass the Service Worker cache.
 
 ---
 
@@ -198,6 +200,7 @@ DriveLens requires **no build command**—upload the repository directory direct
 - **Multi-Select**: Use `Ctrl/Cmd + Click` to toggle items, `Shift + Click` for range selection, or click card corner checkboxes to trigger the floating batch rating/favoriting/tagging bar.
 - **Side-by-Side Compare (`C`)**: Displays 2 panes side by side, 3 panes in columns, or 4 panes in a 2×2 grid. Zoom via top controls, mouse wheel (`0.25x` steps), or double-click (`100% / 200%`, up to `300%`), then drag any pane to pan all panes in sync.
 - **Export Picks**: Click **Export** in the header, optionally check **Only export picks (Avg ≥ 4★ or favorited)** and **Strip file extensions** (for quick filename matching in external raw editors), then copy the filename list or download `drivelens-shared-picks.csv` (UTF-8 BOM) or `drivelens-shared-picks.json`.
+- **Mobile Touch Gestures**: Tap any photo once on touch screens to open Lightbox, or long-press a photo (or tap **Select** in the gallery subbar) to multi-select; in Lightbox, swipe left/right to navigate, swipe down to close, double-tap (`1x ↔ 2x`) or pinch (`1x–3x`) to zoom, and drag to pan; in Compare (`C`), view 2 stacked panes or a 2×2 grid for 3–4 photos with synchronized pinch-to-zoom, double-tap zoom, and 1-finger drag-pan.
 
 ---
 

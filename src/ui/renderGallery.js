@@ -53,6 +53,45 @@ export function computeJustifiedRows(items, containerWidth, targetHeight = 210, 
   return rows;
 }
 
+export function computeWaterfallColumns(
+  items,
+  containerWidth,
+  targetSize = 210,
+  gap = 10,
+  isMobile = false
+) {
+  if (!items || items.length === 0) return [];
+  const safeWidth = Math.max(220, containerWidth);
+  const colCount = isMobile
+    ? safeWidth < 260
+      ? 1
+      : targetSize <= 155
+        ? 3
+        : 2
+    : Math.max(
+        2,
+        Math.min(7, Math.round((safeWidth + gap) / (Math.max(150, Math.round(targetSize * 0.85)) + gap)))
+      );
+  const colWidth = Math.max(96, Math.floor((safeWidth - gap * (colCount - 1)) / colCount));
+  const columns = Array.from({ length: colCount }, () => []);
+  const colHeights = new Array(colCount).fill(0);
+
+  for (const item of items) {
+    let minIdx = 0;
+    for (let i = 1; i < colCount; i += 1) {
+      if (colHeights[i] < colHeights[minIdx]) {
+        minIdx = i;
+      }
+    }
+    const ratio = getItemAspectRatio(item);
+    const height = Math.max(88, Math.round(colWidth / ratio));
+    columns[minIdx].push({ item, width: colWidth, height });
+    colHeights[minIdx] += height + gap;
+  }
+
+  return columns;
+}
+
 function formatDuration(ms) {
   if (!ms) return '';
   const totalSec = Math.round(Number(ms) / 1000);
@@ -184,6 +223,11 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
       }
     </div>
     <div class="gallery-subbar-right">
+      <button
+        type="button"
+        class="btn btn-sm mobile-only-inline ${mobileSelectMode || state.selectedPhotoIds.size > 0 ? 'is-active' : ''}"
+        data-subbar="toggle-select-mode"
+      >${icon('check', 12)} <span>${escapeHtml(mobileSelectMode || state.selectedPhotoIds.size > 0 ? t('mobile.doneSelect') : t('mobile.selectMode'))}</span></button>
       <select class="select-sm" id="sortBySelect" title="${escapeAttr(t('gallery.sortTitle'))}">
         <option value="dateDesc" ${state.sortBy === 'dateDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateDesc'))}</option>
         <option value="dateAsc" ${state.sortBy === 'dateAsc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateAsc'))}</option>
@@ -227,6 +271,11 @@ export function renderBatchBar(batchBarEl, store, visiblePhotos) {
 }
 
 let lastGridSignature = '';
+let mobileSelectMode = false;
+
+function isTouchViewport() {
+  return window.innerWidth <= 860 || Boolean(window.matchMedia?.('(pointer: coarse)').matches);
+}
 
 export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos) {
   if (!gridEl || !scrollContainer) return;
@@ -256,8 +305,10 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
   }
 
   const { layoutMode, rowHeight, lang } = store.state;
-  const containerWidth = Math.max(300, scrollContainer.clientWidth - 36);
-  const sig = `${lang}|${layoutMode}|${rowHeight}|${Math.round(containerWidth)}|${visiblePhotos.map((p) => p.id).join(',')}`;
+  const isMobile = scrollContainer.clientWidth <= 600;
+  const containerWidth = Math.max(240, scrollContainer.clientWidth - (isMobile ? 16 : 36));
+  const effectiveRowHeight = isMobile ? Math.round(Math.max(105, rowHeight * 0.62)) : rowHeight;
+  const sig = `${lang}|${isMobile ? 'm' : 'd'}|${layoutMode}|${rowHeight}|${Math.round(containerWidth)}|${visiblePhotos.map((p) => p.id).join(',')}`;
 
   // Fast path: patch selection, focus & overlays in-place without flashing thumbnails
   if (sig === lastGridSignature) {
@@ -280,10 +331,33 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
   lastGridSignature = sig;
   gridEl.innerHTML = '';
 
+  if (layoutMode === 'waterfall') {
+    const gap = isMobile ? 6 : 10;
+    const columns = computeWaterfallColumns(visiblePhotos, containerWidth, rowHeight, gap, isMobile);
+    const wrapper = document.createElement('div');
+    wrapper.className = 'waterfall-gallery';
+    const frag = document.createDocumentFragment();
+
+    for (const colItems of columns) {
+      const colEl = document.createElement('div');
+      colEl.className = 'waterfall-column';
+      for (const cell of colItems) {
+        const card = createPhotoCardElement(cell.item, store, `width:100%;height:${cell.height}px;`);
+        card.classList.add('waterfall-card');
+        colEl.appendChild(card);
+      }
+      frag.appendChild(colEl);
+    }
+
+    wrapper.appendChild(frag);
+    gridEl.appendChild(wrapper);
+    return;
+  }
+
   if (layoutMode === 'grid') {
     const grid = document.createElement('div');
     grid.className = 'square-gallery';
-    const minCard = Math.max(130, rowHeight - 20);
+    const minCard = isMobile ? Math.max(96, Math.round(rowHeight * 0.5)) : Math.max(130, rowHeight - 20);
     grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${minCard}px, 1fr))`;
 
     const frag = document.createDocumentFragment();
@@ -296,7 +370,7 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
   }
 
   // Justified row layout
-  const rows = computeJustifiedRows(visiblePhotos, containerWidth, rowHeight, 8);
+  const rows = computeJustifiedRows(visiblePhotos, containerWidth, effectiveRowHeight, isMobile ? 6 : 8);
   const wrapper = document.createElement('div');
   wrapper.className = 'justified-gallery';
   const frag = document.createDocumentFragment();
@@ -329,11 +403,27 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
   if (subbarEl) {
     subbarEl.addEventListener('change', (e) => {
       if (e.target.id === 'sortBySelect') {
-        store.setState({ sortBy: e.target.value });
+        store.setSortBy(e.target.value);
       }
     });
 
     subbarEl.addEventListener('click', (e) => {
+      const selectModeBtn = e.target.closest('[data-subbar="toggle-select-mode"]');
+      if (selectModeBtn) {
+        if (mobileSelectMode || store.state.selectedPhotoIds.size > 0) {
+          mobileSelectMode = false;
+          if (store.state.selectedPhotoIds.size > 0) {
+            store.clearSelection();
+          } else {
+            store.emit();
+          }
+        } else {
+          mobileSelectMode = true;
+          store.emit();
+        }
+        return;
+      }
+
       const btn = e.target.closest('[data-clear-filter]');
       if (!btn) return;
       const key = btn.dataset.clearFilter;
@@ -363,6 +453,7 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
       if (act === 'select-all') {
         store.selectAllVisible();
       } else if (act === 'clear') {
+        mobileSelectMode = false;
         store.clearSelection();
       } else if (act === 'rate') {
         store.setRating(ids, Number(btn.dataset.rating || 0));
@@ -375,7 +466,64 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
   }
 
   if (gridEl) {
+    let longPressTimer = null;
+    let touchStartX = 0;
+    let touchStartY = 0;
+    let suppressNextClickUntil = 0;
+
+    function clearLongPress() {
+      if (longPressTimer) {
+        clearTimeout(longPressTimer);
+        longPressTimer = null;
+      }
+    }
+
+    gridEl.addEventListener(
+      'touchstart',
+      (e) => {
+        if (e.touches.length !== 1) {
+          clearLongPress();
+          return;
+        }
+        if (e.target.closest('[data-action="toggle-select"]')) return;
+        const card = e.target.closest('.photo-card[data-photo-id]');
+        if (!card) return;
+        const photoId = card.dataset.photoId;
+        const touch = e.touches[0];
+        touchStartX = touch.clientX;
+        touchStartY = touch.clientY;
+        clearLongPress();
+        longPressTimer = setTimeout(() => {
+          longPressTimer = null;
+          mobileSelectMode = true;
+          suppressNextClickUntil = Date.now() + 450;
+          store.toggleSelectCheckbox(photoId);
+          navigator.vibrate?.(12);
+        }, 420);
+      },
+      { passive: true }
+    );
+
+    gridEl.addEventListener(
+      'touchmove',
+      (e) => {
+        if (!longPressTimer || e.touches.length !== 1) return;
+        const touch = e.touches[0];
+        if (
+          Math.abs(touch.clientX - touchStartX) > 10 ||
+          Math.abs(touch.clientY - touchStartY) > 10
+        ) {
+          clearLongPress();
+        }
+      },
+      { passive: true }
+    );
+
+    gridEl.addEventListener('touchend', clearLongPress, { passive: true });
+    gridEl.addEventListener('touchcancel', clearLongPress, { passive: true });
+
     gridEl.addEventListener('click', (e) => {
+      if (Date.now() < suppressNextClickUntil) return;
       if (e.target.closest('[data-clear-empty]')) {
         store.clearAllFilters();
         return;
@@ -388,6 +536,15 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
       if (selectBtn) {
         e.stopPropagation();
         store.toggleSelectCheckbox(photoId);
+        return;
+      }
+
+      if (isTouchViewport()) {
+        if (mobileSelectMode || store.state.selectedPhotoIds.size > 0) {
+          store.toggleSelectCheckbox(photoId);
+        } else {
+          store.openLightbox(photoId);
+        }
         return;
       }
 

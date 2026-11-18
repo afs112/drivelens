@@ -37,6 +37,7 @@ export const MESSAGES = {
     'header.clearSearch': 'Clear search',
     'header.layoutGroup': 'Gallery view layout',
     'header.layoutJustified': 'Justified Rows',
+    'header.layoutWaterfall': 'Waterfall Masonry (V)',
     'header.layoutGrid': 'Square Grid',
     'header.thumbSize': 'Adjust thumbnail size',
     'header.thumbSizePx': 'Adjust thumbnail size ({px}px)',
@@ -74,6 +75,10 @@ export const MESSAGES = {
     'banner.connectRealDrive': 'Connect Google Drive',
 
     // Sidebar
+    'sidebar.viewLayout': 'Gallery Views',
+    'sidebar.viewJustified': 'Justified',
+    'sidebar.viewWaterfall': 'Waterfall',
+    'sidebar.viewGrid': 'Grid',
     'sidebar.quickViews': 'Quick Views',
     'sidebar.allMedia': 'All Photos & Videos',
     'sidebar.favorites': 'Favorites',
@@ -115,6 +120,7 @@ export const MESSAGES = {
     'modal.backToDemo': 'Back to Demo Album',
     'modal.rememberCreds': 'Remember login credentials & auto-reconnect on this device',
     'modal.forgetCredsBtn': 'Forget Saved Credentials',
+    'modal.clearCacheBtn': 'Clear Cache',
     'modal.savedAccountBadge': 'Saved Google account: {email}',
     'modal.apiKeyLabel': 'Google Drive API Key',
     'modal.apiKeyPlaceholder': 'e.g. AIzaSy...',
@@ -175,6 +181,7 @@ export const MESSAGES = {
     'modal.scQuickTag': 'Open Quick Tag modal',
     'modal.scCompare': 'Compare 2–4 photos side by side',
     'modal.scInspector': 'Toggle inspector panel',
+    'modal.scSwitchLayout': 'Switch gallery view (Justified / Waterfall / Grid)',
     'modal.scSelectAll': 'Select all visible photos',
     'modal.scHelp': 'Show shortcuts guide',
 
@@ -345,7 +352,12 @@ export const MESSAGES = {
     'store.syncingMetadata': 'Syncing collaborator ratings and tags...',
     'store.syncOAuthSynced': 'Connected to Google Drive · Live cloud sync',
     'store.syncReadonly': 'Read-only · changes saved locally in browser',
+    'store.syncCachedRevalidating': 'Cached view · syncing Drive changes...',
+    'store.syncRefreshingAlbum': 'Refreshing album in background...',
+    'store.syncOfflineCached': 'Offline / cached view',
+    'store.syncCachedSessionExpired': 'Cached album · reconnect Drive to sync edits',
     'store.loadedAlbumToast': 'Loaded "{name}" ({count} media items)',
+    'store.loadedFromCacheToast': 'Instant load from cache: "{name}" ({count} items) · checking updates...',
     'store.connectFailed': 'Failed to connect to Google Drive',
     'store.missingApiKey': 'Please enter a Google Drive API Key (AIzaSy...)',
     'store.connectingApiKey': 'Connecting to shared album via API Key...',
@@ -369,8 +381,10 @@ export const MESSAGES = {
     'store.tagCreatedToast': 'Created tag "{name}"',
     'store.tagDeletedToast': 'Deleted tag "{name}"',
     'store.appInstalledToast': 'DriveLens installed as a local app',
+    'store.cacheClearedToast': 'Local album and thumbnail caches cleared',
     'store.credsClearedToast': 'Saved login credentials cleared from this browser',
     'store.sessionExpiredReconnect': 'Saved session for {email} expired — click Authorize to reconnect',
+    'store.cachedSessionReconnectHint': 'Restored cached album for {email} — click Connect Drive to re-authorize cloud sync',
 
     // Demo album localization
     'demo.persona.me.name': 'Me (Alex)',
@@ -445,6 +459,19 @@ export const MESSAGES = {
     'demo.note.jie.demo-p14': 'Flying at 4,500m elevation totally paid off!',
     'demo.note.jie.demo-p15': 'Epic cloud waterfall — suggest boosting contrast slightly.',
     'demo.note.jie.demo-v01': 'Perfect closing clip for our trip reel.',
+
+    // Mobile & touch UI
+    'mobile.navFolders': 'Folders',
+    'mobile.navSearch': 'Search',
+    'mobile.navCompare': 'Compare',
+    'mobile.navDetails': 'Details',
+    'mobile.navDrive': 'Drive',
+    'mobile.navAria': 'Mobile navigation',
+    'mobile.closeDrawer': 'Close panel',
+    'mobile.selectMode': 'Select',
+    'mobile.doneSelect': 'Done',
+    'mobile.inspectorTitle': 'Photo Details',
+    'mobile.sidebarTitle': 'Browse & Filter',
   },
   zh: {
     // Core & tag colors
@@ -470,7 +497,8 @@ export const MESSAGES = {
     'header.searchPlaceholder': '搜索文件名、相机、标签或好友留言...',
     'header.clearSearch': '清空搜索',
     'header.layoutGroup': '画廊视图布局',
-    'header.layoutJustified': '自适应瀑布流 (Justified)',
+    'header.layoutJustified': '等高对齐 (Justified)',
+    'header.layoutWaterfall': '瀑布流视图 (V)',
     'header.layoutGrid': '等比方格 (Square Grid)',
     'header.thumbSize': '调整缩略图尺寸',
     'header.thumbSizePx': '调整缩略图尺寸 ({px}px)',
@@ -508,6 +536,10 @@ export const MESSAGES = {
     'banner.connectRealDrive': '连接真实 Google Drive',
 
     // Sidebar
+    'sidebar.viewLayout': '视图与页面',
+    'sidebar.viewJustified': '等高行',
+    'sidebar.viewWaterfall': '瀑布流',
+    'sidebar.viewGrid': '方格',
     'sidebar.quickViews': '快速视图',
     'sidebar.allMedia': '全部照片与视频',
     'sidebar.favorites': '精选收藏',
@@ -549,6 +581,7 @@ export const MESSAGES = {
     'modal.backToDemo': '切回演示相册',
     'modal.rememberCreds': '在此设备记住登录凭据并在下次打开时自动重连',
     'modal.forgetCredsBtn': '清除已存凭据',
+    'modal.clearCacheBtn': '清空缓存',
     'modal.savedAccountBadge': '已保存登录账号：{email}',
     'modal.apiKeyLabel': 'Google Drive API Key',
     'modal.apiKeyPlaceholder': '例如：AIzaSy...',
@@ -609,6 +642,7 @@ export const MESSAGES = {
     'modal.scQuickTag': '打开快速贴标签弹窗',
     'modal.scCompare': '同屏对比选中的 2–4 张照片',
     'modal.scInspector': '显示 / 隐藏右侧详情栏',
+    'modal.scSwitchLayout': '切换画廊视图（等高 / 瀑布流 / 方格）',
     'modal.scSelectAll': '全选当前视图照片',
     'modal.scHelp': '弹出快捷键指南',
 
@@ -779,7 +813,12 @@ export const MESSAGES = {
     'store.syncingMetadata': '正在同步好友评分与标签数据...',
     'store.syncOAuthSynced': '已连接 Google Drive · 云端实时同步',
     'store.syncReadonly': '只读权限 · 改动暂存本地浏览器',
+    'store.syncCachedRevalidating': '本地缓存秒开 · 正在后台同步变更...',
+    'store.syncRefreshingAlbum': '正在后台刷新相册...',
+    'store.syncOfflineCached': '当前浏览本地缓存',
+    'store.syncCachedSessionExpired': '已恢复缓存相册 · 重新授权可同步修改',
     'store.loadedAlbumToast': '成功载入「{name}」，共 {count} 个媒体文件',
+    'store.loadedFromCacheToast': '已从本地缓存秒开「{name}」({count} 项) · 后台检查更新中...',
     'store.connectFailed': '连接 Google Drive 失败',
     'store.missingApiKey': '请先填写 Google Drive API Key (AIzaSy...)',
     'store.connectingApiKey': '正在通过 API Key 连接共享相册...',
@@ -803,8 +842,10 @@ export const MESSAGES = {
     'store.tagCreatedToast': '已创建标签「{name}」',
     'store.tagDeletedToast': '已删除标签「{name}」',
     'store.appInstalledToast': '已安装为本地应用',
+    'store.cacheClearedToast': '已清空本地相册目录与缩略图缓存',
     'store.credsClearedToast': '已清除保存在当前浏览器的登录凭据',
     'store.sessionExpiredReconnect': '账号 {email} 的登录会话已过期，请点击授权一键重连',
+    'store.cachedSessionReconnectHint': '已秒开 {email} 的本地缓存相册，点击连接网盘即可重新授权同步',
 
     // Demo album localization
     'demo.persona.me.name': '我 (阿泽)',
@@ -879,6 +920,19 @@ export const MESSAGES = {
     'demo.note.jie.demo-p14': '海拔 4500 起飞值了！',
     'demo.note.jie.demo-p15': '云瀑壮观，建议调高一点对比度',
     'demo.note.jie.demo-v01': '视频片段放相册片尾刚好',
+
+    // Mobile & touch UI
+    'mobile.navFolders': '目录筛选',
+    'mobile.navSearch': '搜索',
+    'mobile.navCompare': '对比',
+    'mobile.navDetails': '详情',
+    'mobile.navDrive': '网盘',
+    'mobile.navAria': '移动端导航栏',
+    'mobile.closeDrawer': '关闭面板',
+    'mobile.selectMode': '多选',
+    'mobile.doneSelect': '完成',
+    'mobile.inspectorTitle': '照片详情',
+    'mobile.sidebarTitle': '浏览与筛选',
   },
 };
 

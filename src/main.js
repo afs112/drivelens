@@ -15,7 +15,12 @@ import {
   renderGallerySubbar,
   resetGallerySignature,
 } from './ui/renderGallery.js';
-import { bindHeaderEvents, renderHeader } from './ui/renderHeader.js';
+import {
+  bindHeaderEvents,
+  bindMobileNavEvents,
+  renderHeader,
+  renderMobileNav,
+} from './ui/renderHeader.js';
 import { bindInspectorEvents, renderInspector } from './ui/renderInspector.js';
 import { bindLightboxEvents, renderLightbox } from './ui/renderLightbox.js';
 import { bindModalEvents, renderModals } from './ui/renderModals.js';
@@ -34,6 +39,7 @@ const lightboxRoot = document.getElementById('lightboxRoot');
 const compareRoot = document.getElementById('compareRoot');
 const modalRoot = document.getElementById('modalRoot');
 const toastContainer = document.getElementById('toastContainer');
+const mobileNavBar = document.getElementById('mobileNavBar');
 
 const store = new Store();
 
@@ -62,13 +68,18 @@ function renderAll() {
   renderLightbox(lightboxRoot, store, visiblePhotos);
   renderCompare(compareRoot, store);
   renderModals(modalRoot, store);
+  renderMobileNav(mobileNavBar, store);
 
   if (drawerBackdrop) {
-    drawerBackdrop.classList.toggle('visible', Boolean(store.state.sidebarOpen));
+    const showBackdrop =
+      Boolean(store.state.sidebarOpen) ||
+      (window.innerWidth <= 1120 && Boolean(store.state.inspectorOpen));
+    drawerBackdrop.classList.toggle('visible', showBackdrop);
   }
 }
 
 bindHeaderEvents(topHeader, demoBanner, store);
+bindMobileNavEvents(mobileNavBar, store);
 bindSidebarEvents(sidebarPanel, store);
 bindGalleryEvents(gallerySubbar, batchBar, galleryGrid, store);
 bindInspectorEvents(inspectorPanel, store);
@@ -78,7 +89,10 @@ bindModalEvents(modalRoot, store);
 
 if (drawerBackdrop) {
   drawerBackdrop.addEventListener('click', () => {
-    store.setState({ sidebarOpen: false });
+    store.setState({
+      sidebarOpen: false,
+      ...(window.innerWidth <= 1120 ? { inspectorOpen: false } : {}),
+    });
   });
 }
 
@@ -116,6 +130,11 @@ function handleInitialUrlHash() {
   const langParam = (params.get('lang') || '').trim().toLowerCase();
   if (langParam === 'en' || langParam === 'zh') {
     store.setLanguage(langParam);
+  }
+
+  const layoutParam = (params.get('layout') || '').trim().toLowerCase();
+  if (layoutParam === 'justified' || layoutParam === 'waterfall' || layoutParam === 'grid') {
+    store.setLayoutMode(layoutParam);
   }
 
   const folderInput = (params.get('folder') || '').trim();
@@ -232,6 +251,11 @@ window.addEventListener('keydown', (event) => {
       store.setState({ sidebarOpen: false });
       return;
     }
+    if (window.innerWidth <= 1120 && store.state.inspectorOpen) {
+      event.preventDefault();
+      store.setState({ inspectorOpen: false });
+      return;
+    }
     store.clearSelection();
     return;
   }
@@ -292,6 +316,12 @@ window.addEventListener('keydown', (event) => {
   if (lower === 'i') {
     event.preventDefault();
     store.setState({ inspectorOpen: !store.state.inspectorOpen });
+    return;
+  }
+
+  if (lower === 'v') {
+    event.preventDefault();
+    store.cycleLayoutMode();
     return;
   }
 

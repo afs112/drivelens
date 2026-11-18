@@ -1,7 +1,7 @@
 import { getDemoPersonas } from '../demo/demoAlbum.js';
 import { SUPPORTED_LANGS, t } from '../i18n.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
-import { isCompareOpen, openCompare } from './renderCompare.js';
+import { isCompareOpen, openCompare, closeCompare } from './renderCompare.js';
 
 const SIDEBAR_ICON_SVG =
   '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>';
@@ -9,9 +9,13 @@ const SIDEBAR_ICON_SVG =
 const COMPARE_ICON_SVG =
   '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/></svg>';
 
+const COMPARE_ICON_LG_SVG =
+  '<svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M12 3v18"/></svg>';
+
 let lastBannerSignature = '';
 let lastToastSignature = '';
 let isSearchComposing = false;
+let mobileSearchOpen = false;
 
 function buildHeaderSkeleton(headerEl, state) {
   const currentLang = state.lang || 'en';
@@ -22,7 +26,7 @@ function buildHeaderSkeleton(headerEl, state) {
 
   headerEl.innerHTML = `
     <div class="header-left">
-      <button type="button" class="btn btn-ghost btn-icon" data-header="toggle-sidebar" title="${escapeAttr(t('header.toggleSidebar'))}">
+      <button type="button" class="btn btn-ghost btn-icon hide-xs" data-header="toggle-sidebar" title="${escapeAttr(t('header.toggleSidebar'))}">
         ${SIDEBAR_ICON_SVG}
       </button>
       <div class="brand-badge">
@@ -56,9 +60,12 @@ function buildHeaderSkeleton(headerEl, state) {
     </div>
 
     <div class="header-right">
-      <div class="segmented segmented-2" role="group" aria-label="${escapeAttr(t('header.layoutGroup'))}">
+      <div class="segmented" role="group" aria-label="${escapeAttr(t('header.layoutGroup'))}">
         <button type="button" class="seg-btn" data-header="layout" data-layout="justified" title="${escapeAttr(t('header.layoutJustified'))}">
           ${icon('rows', 14)}
+        </button>
+        <button type="button" class="seg-btn" data-header="layout" data-layout="waterfall" title="${escapeAttr(t('header.layoutWaterfall'))}">
+          ${icon('waterfall', 14)}
         </button>
         <button type="button" class="seg-btn" data-header="layout" data-layout="grid" title="${escapeAttr(t('header.layoutGrid'))}">
           ${icon('grid', 14)}
@@ -77,9 +84,9 @@ function buildHeaderSkeleton(headerEl, state) {
         aria-label="${escapeAttr(t('header.thumbSize'))}"
       />
 
-      <button type="button" class="btn btn-sm" data-header="compare" title="${escapeAttr(t('header.compareTooltip'))}">
+      <button type="button" class="btn btn-sm hide-xs" data-header="compare" title="${escapeAttr(t('header.compareTooltip'))}">
         ${COMPARE_ICON_SVG}
-        <span>${escapeHtml(t('header.compareBtn'))}</span>
+        <span class="hide-sm">${escapeHtml(t('header.compareBtn'))}</span>
       </button>
 
       <button type="button" class="btn btn-ghost btn-icon" data-header="refresh" title="${escapeAttr(t('header.refresh'))}">
@@ -98,12 +105,12 @@ function buildHeaderSkeleton(headerEl, state) {
         <span class="hide-sm">${escapeHtml(t('header.installApp'))}</span>
       </button>
 
-      <button type="button" class="btn btn-sm btn-primary" data-header="connect" title="${escapeAttr(t('header.connectTooltip'))}">
+      <button type="button" class="btn btn-sm btn-primary hide-xs" data-header="connect" title="${escapeAttr(t('header.connectTooltip'))}">
         ${icon('cloud', 14)}
         <span data-header-connect-label>${escapeHtml(t('header.connectDrive'))}</span>
       </button>
 
-      <button type="button" class="btn btn-ghost btn-icon" data-header="toggle-inspector" title="${escapeAttr(t('header.toggleInspector'))}">
+      <button type="button" class="btn btn-ghost btn-icon hide-xs" data-header="toggle-inspector" title="${escapeAttr(t('header.toggleInspector'))}">
         ${icon('info', 15)}
       </button>
 
@@ -115,7 +122,7 @@ function buildHeaderSkeleton(headerEl, state) {
         ${icon('sun', 15)}
       </button>
 
-      <button type="button" class="btn btn-ghost btn-icon" data-header="shortcuts" title="${escapeAttr(t('header.shortcuts'))}">
+      <button type="button" class="btn btn-ghost btn-icon hide-xs" data-header="shortcuts" title="${escapeAttr(t('header.shortcuts'))}">
         ${icon('keyboard', 15)}
       </button>
     </div>
@@ -193,9 +200,10 @@ function updateHeaderElements(headerEl, state) {
 
   const refreshBtn = headerEl.querySelector('[data-header="refresh"]');
   if (refreshBtn) {
-    refreshBtn.disabled = Boolean(state.loading);
+    const busy = Boolean(state.loading || state.backgroundRefreshing);
+    refreshBtn.disabled = busy;
     const svg = refreshBtn.querySelector('svg');
-    if (svg) svg.classList.toggle('spin', Boolean(state.loading));
+    if (svg) svg.classList.toggle('spin', busy);
   }
 
   const syncEl = headerEl.querySelector('[data-header-sync]');
@@ -258,6 +266,8 @@ function updateHeaderElements(headerEl, state) {
     themeBtn.title =
       currentTheme === 'dark' ? t('header.themeToLight') : t('header.themeToDark');
   }
+
+  headerEl.classList.toggle('mobile-search-open', mobileSearchOpen);
 }
 
 function renderDemoBanner(bannerEl, state) {
@@ -404,7 +414,7 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
       if (e.target.id === 'searchInput') {
         store.setState({ searchQuery: e.target.value });
       } else if (e.target.id === 'rowHeightRange') {
-        store.setState({ rowHeight: Number(e.target.value) });
+        store.setRowHeight(Number(e.target.value));
       }
     });
 
@@ -422,7 +432,11 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
       if (action === 'toggle-sidebar') {
         if (window.innerWidth <= 860) {
           const nextOpen = !store.state.sidebarOpen;
-          store.setState({ sidebarOpen: nextOpen, sidebarCollapsed: true });
+          store.setState({
+            sidebarOpen: nextOpen,
+            sidebarCollapsed: true,
+            ...(nextOpen ? { inspectorOpen: false } : {}),
+          });
         } else {
           store.setState({
             sidebarCollapsed: !store.state.sidebarCollapsed,
@@ -438,8 +452,8 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
         store.setState({ searchQuery: '' });
       } else if (action === 'layout') {
         const layoutMode = btn.dataset.layout;
-        if (layoutMode === 'justified' || layoutMode === 'grid') {
-          store.setState({ layoutMode });
+        if (layoutMode === 'justified' || layoutMode === 'waterfall' || layoutMode === 'grid') {
+          store.setLayoutMode(layoutMode);
         }
       } else if (action === 'compare') {
         openCompare(Array.from(store.state.selectedPhotoIds), store);
@@ -452,7 +466,11 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
       } else if (action === 'install-app') {
         store.promptInstallPwa();
       } else if (action === 'toggle-inspector') {
-        store.setState({ inspectorOpen: !store.state.inspectorOpen });
+        const nextInspector = !store.state.inspectorOpen;
+        store.setState({
+          inspectorOpen: nextInspector,
+          ...(window.innerWidth <= 1120 && nextInspector ? { sidebarOpen: false } : {}),
+        });
       } else if (action === 'toggle-theme') {
         store.toggleTheme();
       } else if (action === 'shortcuts') {
@@ -476,4 +494,107 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
       }
     });
   }
+}
+
+export function renderMobileNav(navEl, store) {
+  if (!navEl) return;
+  const state = store.state;
+  navEl.setAttribute('aria-label', t('mobile.navAria'));
+
+  const filterBadgeCount =
+    (state.quickView !== 'all' ? 1 : 0) +
+    (state.minRating > 0 ? 1 : 0) +
+    (state.selectedTagIds?.size || 0);
+  const selectedCount = state.selectedPhotoIds?.size || 0;
+  const compareOpen = isCompareOpen();
+
+  navEl.innerHTML = `
+    <button type="button" class="mobile-nav-btn ${state.sidebarOpen ? 'is-active' : ''}" data-mnav="folders">
+      ${icon('folder', 17)}
+      <span>${escapeHtml(t('mobile.navFolders'))}</span>
+      ${filterBadgeCount > 0 ? `<span class="mobile-nav-badge">${filterBadgeCount}</span>` : ''}
+    </button>
+    <button type="button" class="mobile-nav-btn ${mobileSearchOpen || Boolean(state.searchQuery) ? 'is-active' : ''}" data-mnav="search">
+      ${icon('search', 17)}
+      <span>${escapeHtml(t('mobile.navSearch'))}</span>
+    </button>
+    <button type="button" class="mobile-nav-btn ${compareOpen ? 'is-active' : ''}" data-mnav="compare">
+      ${COMPARE_ICON_LG_SVG}
+      <span>${escapeHtml(t('mobile.navCompare'))}</span>
+      ${selectedCount > 0 ? `<span class="mobile-nav-badge">${selectedCount}</span>` : ''}
+    </button>
+    <button type="button" class="mobile-nav-btn ${state.inspectorOpen ? 'is-active' : ''}" data-mnav="details">
+      ${icon('info', 17)}
+      <span>${escapeHtml(t('mobile.navDetails'))}</span>
+    </button>
+    <button type="button" class="mobile-nav-btn ${state.mode === 'gdrive' ? 'is-active' : ''}" data-mnav="connect">
+      ${icon('cloud', 17)}
+      <span>${escapeHtml(t('mobile.navDrive'))}</span>
+    </button>
+  `;
+}
+
+export function bindMobileNavEvents(navEl, store) {
+  if (!navEl) return;
+
+  navEl.addEventListener('click', (e) => {
+    const btn = e.target.closest('[data-mnav]');
+    if (!btn) return;
+    const action = btn.dataset.mnav;
+
+    if (action === 'folders') {
+      mobileSearchOpen = false;
+      const topHeader = document.getElementById('topHeader');
+      if (topHeader) topHeader.classList.remove('mobile-search-open');
+      const nextOpen = !store.state.sidebarOpen;
+      store.setState({
+        sidebarOpen: nextOpen,
+        sidebarCollapsed: true,
+        inspectorOpen: false,
+      });
+    } else if (action === 'search') {
+      mobileSearchOpen = !mobileSearchOpen;
+      const topHeader = document.getElementById('topHeader');
+      if (topHeader) {
+        topHeader.classList.toggle('mobile-search-open', mobileSearchOpen);
+      }
+      if (mobileSearchOpen && (store.state.sidebarOpen || store.state.inspectorOpen)) {
+        store.setState({ sidebarOpen: false, inspectorOpen: false });
+      } else {
+        renderMobileNav(navEl, store);
+      }
+      if (mobileSearchOpen) {
+        const input = document.getElementById('searchInput');
+        if (input) input.focus();
+      }
+    } else if (action === 'compare') {
+      mobileSearchOpen = false;
+      const topHeader = document.getElementById('topHeader');
+      if (topHeader) topHeader.classList.remove('mobile-search-open');
+      if (store.state.sidebarOpen || store.state.inspectorOpen) {
+        store.setState({ sidebarOpen: false, inspectorOpen: false });
+      }
+      if (isCompareOpen()) {
+        closeCompare(store);
+      } else {
+        openCompare(Array.from(store.state.selectedPhotoIds), store);
+      }
+    } else if (action === 'details') {
+      mobileSearchOpen = false;
+      const topHeader = document.getElementById('topHeader');
+      if (topHeader) topHeader.classList.remove('mobile-search-open');
+      store.setState({
+        inspectorOpen: !store.state.inspectorOpen,
+        sidebarOpen: false,
+      });
+    } else if (action === 'connect') {
+      mobileSearchOpen = false;
+      const topHeader = document.getElementById('topHeader');
+      if (topHeader) topHeader.classList.remove('mobile-search-open');
+      if (store.state.sidebarOpen || store.state.inspectorOpen) {
+        store.setState({ sidebarOpen: false, inspectorOpen: false });
+      }
+      store.openModal('connect');
+    }
+  });
 }

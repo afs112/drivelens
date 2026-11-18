@@ -1833,6 +1833,122 @@ def verify_pwa():
     return {"checks": checks, "precache_assets": precache_count}, errors
 
 
+def verify_mobile_ux(parsed_js):
+    """Part (j): Verify mobile/touch responsive markup, CSS safe-area rules, touch handlers, sw v2, and README preservation."""
+    errors = []
+    checks = 0
+
+    # 1. index.html viewport-fit=cover and <nav id="mobileNavBar"
+    checks += 1
+    index_path = ROOT_DIR / "index.html"
+    if not index_path.is_file():
+        errors.append("Missing index.html")
+    else:
+        html_text = index_path.read_text(encoding="utf-8")
+        if not re.search(
+            r'<meta\b[^>]*name\s*=\s*["\']viewport["\'][^>]*content\s*=\s*["\'][^"\']*viewport-fit=cover',
+            html_text,
+            re.IGNORECASE,
+        ):
+            errors.append("index.html viewport <meta> missing viewport-fit=cover")
+        if not re.search(r'<nav\b[^>]*\bid\s*=\s*["\']mobileNavBar["\']', html_text, re.IGNORECASE):
+            errors.append('index.html missing <nav id="mobileNavBar">')
+
+    # 2. CSS safe-area variables, mobile nav bar, drawer header, and 16px mobile input font-size
+    checks += 1
+    css_expectations = {
+        "styles/tokens.css": ["--safe-top", "--safe-bottom", "--mobile-nav-height", "touch-action: manipulation"],
+        "styles/layout.css": ["--safe-top", "--safe-bottom", ".mobile-nav-bar", ".mobile-drawer-header"],
+        "styles/components.css": ["--safe-top", "--safe-bottom", "font-size: 16px"],
+        "styles/compare.css": ["--safe-top", "--safe-bottom", "touch-action: none"],
+    }
+    for rel_css, required_tokens in css_expectations.items():
+        p = ROOT_DIR / rel_css
+        if not p.is_file():
+            errors.append(f"Missing CSS file: {rel_css}")
+            continue
+        css_text = p.read_text(encoding="utf-8")
+        for needle in required_tokens:
+            if needle not in css_text:
+                errors.append(f"{rel_css} missing expected mobile rule/token: {needle!r}")
+
+    # 3. Touch event handlers in renderGallery.js, renderLightbox.js, and renderCompare.js
+    checks += 1
+    touch_modules = [
+        "src/ui/renderGallery.js",
+        "src/ui/renderLightbox.js",
+        "src/ui/renderCompare.js",
+    ]
+    for rel_js in touch_modules:
+        p_res = (ROOT_DIR / rel_js).resolve()
+        if p_res not in parsed_js:
+            errors.append(f"{rel_js} missing or failed JS parsing")
+            continue
+        toks = parsed_js[p_res]["tokens"]
+        found_events = {
+            unquote_string(tok.value)
+            for tok in toks
+            if tok.kind == "STRING" and unquote_string(tok.value) in ("touchstart", "touchmove", "touchend")
+        }
+        missing = [ev for ev in ("touchstart", "touchmove", "touchend") if ev not in found_events]
+        if missing:
+            errors.append(f"{rel_js} missing touch handler(s): {missing}")
+
+    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v3'
+    checks += 1
+    sw_path = ROOT_DIR / "sw.js"
+    if not sw_path.is_file():
+        errors.append("Missing sw.js")
+    else:
+        sw_toks = tokenize_js(sw_path.read_text(encoding="utf-8"), filename="sw.js")
+        has_v3 = any(
+            sw_toks[i].kind == "IDENT"
+            and sw_toks[i].value == "CACHE_NAME"
+            and sw_toks[i + 1].kind == "PUNCT"
+            and sw_toks[i + 1].value == "="
+            and sw_toks[i + 2].kind == "STRING"
+            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v3"
+            for i in range(len(sw_toks) - 2)
+        )
+        if not has_v3:
+            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v3'")
+
+    # 5. albumCache.js and renderGallery.js waterfall exports
+    checks += 1
+    album_cache_res = (ROOT_DIR / "src" / "storage" / "albumCache.js").resolve()
+    if album_cache_res not in parsed_js:
+        errors.append("src/storage/albumCache.js missing or failed JS parsing")
+    else:
+        ac_exports = parsed_js[album_cache_res]["exports"]
+        for sym in ("getCachedAlbum", "setCachedAlbum", "clearAllAlbumCaches"):
+            if sym not in ac_exports:
+                errors.append(f"src/storage/albumCache.js missing export {sym}")
+
+    gallery_res = (ROOT_DIR / "src" / "ui" / "renderGallery.js").resolve()
+    if gallery_res not in parsed_js:
+        errors.append("src/ui/renderGallery.js missing or failed JS parsing")
+    else:
+        if "computeWaterfallColumns" not in parsed_js[gallery_res]["exports"]:
+            errors.append("src/ui/renderGallery.js missing export computeWaterfallColumns")
+
+    # 5. README.md preserves exact user-edited ## Design Inspiration & Independence section
+    checks += 1
+    readme_path = ROOT_DIR / "README.md"
+    if not readme_path.is_file():
+        errors.append("Missing README.md")
+    else:
+        readme_text = readme_path.read_text(encoding="utf-8").replace("\r\n", "\n")
+        expected_inspiration = (
+            "## Design Inspiration & Independence\n\n"
+            "- **UX Inspiration**: DriveLens's darkroom-grade palette, rapid keyboard rating workflow (`1\u20135`, `0`, `F`, `T`), and side-by-side comparison mode draw UX inspiration from [julyx10/lap](https://github.com/julyx10/lap).\n"
+            "- **Independent Project**: DriveLens is designed and built from scratch as an independent pure-frontend web application. DriveLens is built specifically for zero-install browser/PWA viewing and conflict-free multiplayer culling directly on **Google Drive** shared folders."
+        )
+        if expected_inspiration not in readme_text:
+            errors.append("README.md modified or missing exact '## Design Inspiration & Independence' section")
+
+    return {"checks": checks}, errors
+
+
 def main():
     print(f"=== DriveLens Verification ({ROOT_DIR}) ===")
     all_errors = []
@@ -1941,6 +2057,17 @@ def main():
         all_errors.extend(pwa_errors)
     else:
         print("    PASS: manifest.webmanifest, 192/512 PNG IHDRs, sw.js precache assets, and PWA MIME headers verified.")
+
+    # (j) Mobile & touch responsive UX check
+    mob_info, mob_errors = verify_mobile_ux(parsed_js)
+    print(f"[j] Mobile/touch UX check: {mob_info['checks']} checks")
+    if mob_errors:
+        print(f"    FAIL ({len(mob_errors)} errors):")
+        for e in mob_errors:
+            print(f"      - {e}")
+        all_errors.extend(mob_errors)
+    else:
+        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v2, and README section preserved.")
 
     print("=" * 56)
     if all_errors:

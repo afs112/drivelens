@@ -107,6 +107,7 @@ export function renderModals(container, store) {
     const forgetCredsBtn = hasSavedCreds
       ? `<button type="button" class="btn btn-ghost btn-sm" data-action="forget-creds">${icon('trash', 13)} ${escapeHtml(t('modal.forgetCredsBtn'))}</button>`
       : '';
+    const clearCacheBtn = `<button type="button" class="btn btn-ghost btn-sm" data-action="clear-cache">${icon('refresh', 13)} ${escapeHtml(t('modal.clearCacheBtn'))}</button>`;
     const savedAccountHtml = store.state.savedOAuthUser?.email
       ? `<div class="form-help" style="color:var(--accent)">${escapeHtml(t('modal.savedAccountBadge', { email: store.state.savedOAuthUser.email }))}</div>`
       : '';
@@ -152,9 +153,10 @@ export function renderModals(container, store) {
             <div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap">
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 ${forgetCredsBtn}
+                ${clearCacheBtn}
                 ${backToDemoBtn}
               </div>
-              <div style="display:flex;align-items:center;gap:8px">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 <button type="button" class="btn btn-ghost" data-modal-close="true">${escapeHtml(t('modal.cancel'))}</button>
                 <button type="submit" class="btn btn-primary">${icon('cloud', 14)} ${escapeHtml(t('modal.connectApiKeySubmit'))}</button>
               </div>
@@ -196,9 +198,10 @@ export function renderModals(container, store) {
             <div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap">
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 ${forgetCredsBtn}
+                ${clearCacheBtn}
                 ${backToDemoBtn}
               </div>
-              <div style="display:flex;align-items:center;gap:8px">
+              <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 <button type="button" class="btn btn-ghost" data-modal-close="true">${escapeHtml(t('modal.cancel'))}</button>
                 <button type="submit" class="btn btn-primary">${icon('cloud', 14)} ${escapeHtml(t('modal.connectOAuthSubmit'))}</button>
               </div>
@@ -291,7 +294,7 @@ export function renderModals(container, store) {
                 </div>
               </div>
             </div>
-            <div class="modal-footer">
+            <div class="modal-footer" style="flex-wrap:wrap">
               <button type="button" class="btn btn-ghost" data-modal-close="true">${escapeHtml(t('modal.cancel'))}</button>
               <button type="submit" class="btn btn-primary">${escapeHtml(editing ? t('modal.saveTag') : t('modal.createTag'))}</button>
             </div>
@@ -346,7 +349,7 @@ export function renderModals(container, store) {
               }
             </div>
           </div>
-          <div class="modal-footer" style="justify-content:space-between">
+          <div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap">
             <button type="button" class="btn btn-sm" data-action="create-from-quick">${icon('plus', 13)} ${escapeHtml(t('sidebar.newTag'))}</button>
             <button type="button" class="btn btn-primary btn-sm" data-modal-close="true">${escapeHtml(t('modal.done'))}</button>
           </div>
@@ -385,11 +388,11 @@ export function renderModals(container, store) {
             </div>
           </div>
           <div class="modal-footer" style="justify-content:space-between;flex-wrap:wrap">
-            <div style="display:flex;gap:8px">
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button type="button" class="btn btn-sm" data-export-action="csv">${escapeHtml(t('modal.exportCsvBtn'))}</button>
               <button type="button" class="btn btn-sm" data-export-action="json">${escapeHtml(t('modal.exportJsonBtn'))}</button>
             </div>
-            <div style="display:flex;gap:8px">
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
               <button type="button" class="btn btn-ghost btn-sm" data-modal-close="true">${escapeHtml(t('modal.close'))}</button>
               <button type="button" class="btn btn-primary btn-sm" data-export-action="copy">${escapeHtml(t('modal.exportCopyBtn'))}</button>
             </div>
@@ -418,6 +421,7 @@ export function renderModals(container, store) {
               <span>${escapeHtml(t('modal.scQuickTag'))}</span><span><kbd>T</kbd></span>
               <span>${escapeHtml(t('modal.scCompare'))}</span><span><kbd>C</kbd></span>
               <span>${escapeHtml(t('modal.scInspector'))}</span><span><kbd>I</kbd></span>
+              <span>${escapeHtml(t('modal.scSwitchLayout'))}</span><span><kbd>V</kbd></span>
               <span>${escapeHtml(t('modal.scSelectAll'))}</span><span><kbd>Ctrl</kbd> + <kbd>A</kbd></span>
               <span>${escapeHtml(t('modal.scHelp'))}</span><span><kbd>?</kbd></span>
             </div>
@@ -543,6 +547,11 @@ export function bindModalEvents(container, store) {
 
     if (e.target.closest('[data-action="forget-creds"]')) {
       store.forgetSavedCredentials();
+      return;
+    }
+
+    if (e.target.closest('[data-action="clear-cache"]')) {
+      await store.clearLocalCache();
       return;
     }
 

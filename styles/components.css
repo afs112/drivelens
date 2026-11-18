@@ -227,6 +227,11 @@
   padding: 4px 6px;
   border-radius: 4px;
   cursor: pointer;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  white-space: nowrap;
   transition: all var(--transition-fast);
 }
 
@@ -433,6 +438,25 @@
 .square-gallery {
   display: grid;
   gap: 10px;
+}
+
+.waterfall-gallery {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  width: 100%;
+}
+
+.waterfall-column {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.waterfall-gallery .photo-card {
+  width: 100%;
 }
 
 .photo-card {
@@ -794,9 +818,9 @@
 }
 
 .lightbox-topbar {
-  height: 52px;
+  height: calc(52px + var(--safe-top));
   flex-shrink: 0;
-  padding: 0 16px;
+  padding: var(--safe-top) 16px 0;
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -878,7 +902,7 @@
   flex-shrink: 0;
   background: rgba(10, 12, 16, 0.88);
   border-top: 1px solid rgba(255, 255, 255, 0.08);
-  padding: 8px 16px 10px;
+  padding: 8px 16px calc(10px + var(--safe-bottom));
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -966,6 +990,13 @@
   max-width: 410px;
 }
 
+.modal-card > form {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
 .modal-header {
   padding: 14px 18px;
   border-bottom: 1px solid var(--border-subtle);
@@ -973,6 +1004,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 12px;
+  flex-shrink: 0;
 }
 
 .modal-title {
@@ -985,6 +1017,8 @@
 
 .modal-body {
   padding: 16px 18px;
+  flex: 1 1 auto;
+  min-height: 0;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
@@ -998,6 +1032,7 @@
   align-items: center;
   justify-content: flex-end;
   gap: 8px;
+  flex-shrink: 0;
 }
 
 .form-field {
@@ -1122,6 +1157,7 @@ kbd {
   flex-direction: column;
   gap: 8px;
   max-width: 340px;
+  pointer-events: none;
 }
 
 .toast {
@@ -1135,6 +1171,7 @@ kbd {
   display: flex;
   align-items: center;
   gap: 8px;
+  pointer-events: none;
   animation: toastIn 180ms ease-out;
 }
 
@@ -1154,4 +1191,138 @@ kbd {
 @keyframes spin {
   from { transform: rotate(0deg); }
   to { transform: rotate(360deg); }
+}
+
+/* Mobile & Touch Responsive Overrides */
+@media (hover: none), (pointer: coarse), (max-width: 860px) {
+  .photo-select-btn {
+    opacity: 1;
+    width: 28px;
+    height: 28px;
+    top: 6px;
+    left: 6px;
+  }
+
+  .tag-row-actions {
+    display: inline-flex;
+  }
+
+  .tag-row:hover .tag-row-count {
+    display: inline;
+  }
+
+  .tag-icon-btn {
+    width: 26px;
+    height: 26px;
+  }
+
+  .star-btn {
+    padding: 4px;
+  }
+}
+
+@media (max-width: 860px) {
+  .toast-container {
+    left: 12px;
+    right: 12px;
+    top: calc(var(--header-height) + var(--safe-top) + 10px);
+    bottom: auto;
+    max-width: none;
+  }
+
+  .justified-gallery,
+  .justified-row {
+    gap: 6px;
+  }
+
+  .square-gallery,
+  .waterfall-gallery,
+  .waterfall-column {
+    gap: 6px;
+  }
+}
+
+@media (max-width: 768px) {
+  .search-box input,
+  .form-input,
+  .note-textarea,
+  .select-sm {
+    font-size: 16px;
+  }
+
+  .lightbox-topbar {
+    height: calc(48px + var(--safe-top));
+    padding: var(--safe-top) 10px 0;
+    gap: 6px;
+  }
+
+  .lightbox-topbar > div:last-child {
+    flex-shrink: 0;
+  }
+
+  .lightbox-media-wrap {
+    padding: 6px 0;
+    touch-action: none;
+  }
+
+  .lightbox-nav {
+    width: 34px;
+    height: 44px;
+    background: rgba(15, 19, 26, 0.55);
+  }
+
+  .lightbox-nav.prev {
+    left: 6px;
+  }
+
+  .lightbox-nav.next {
+    right: 6px;
+  }
+
+  .lightbox-bottom {
+    padding: 8px 10px calc(10px + var(--safe-bottom));
+    gap: 6px;
+  }
+
+  .lightbox-hud {
+    gap: 8px;
+  }
+
+  .lightbox-filmstrip {
+    scrollbar-width: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
+  .lightbox-filmstrip::-webkit-scrollbar {
+    display: none;
+  }
+}
+
+@media (max-width: 640px) {
+  .modal-backdrop {
+    align-items: flex-end;
+    padding: 0;
+  }
+
+  .modal-card,
+  .modal-card.modal-sm {
+    max-width: 100%;
+    max-height: 92dvh;
+    border-radius: 18px 18px 0 0;
+    border-bottom: none;
+    padding-bottom: var(--safe-bottom);
+  }
+
+  .modal-header,
+  .modal-footer {
+    flex-shrink: 0;
+  }
+
+  .modal-footer {
+    flex-wrap: wrap;
+  }
+
+  .form-input {
+    height: 40px;
+  }
 }
