@@ -180,20 +180,65 @@ function saveUiPrefs(patch) {
 
 const photoTimestampCache = new WeakMap();
 
-function getPhotoTimestamp(file) {
-  if (!file || typeof file !== 'object') return 0;
-  const raw = file.imageMediaMetadata?.time || file.createdTime || file.modifiedTime || '';
+function parseDateString(raw) {
   if (!raw) return 0;
-  const cached = photoTimestampCache.get(file);
-  if (cached && cached.raw === raw) return cached.ts;
-  // Handle EXIF format "YYYY:MM:DD HH:MM:SS" if Google Drive returns it
   const normalized = /^\d{4}:\d{2}:\d{2}\s/.test(raw)
     ? raw.replace(/^(\d{4}):(\d{2}):(\d{2})\s/, '$1-$2-$3T')
     : raw;
   const parsed = Date.parse(normalized);
-  const ts = Number.isNaN(parsed) ? 0 : parsed;
-  photoTimestampCache.set(file, { raw, ts });
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function parseFilenameTimestamp(name) {
+  if (!name) return 0;
+  const s = String(name);
+  const sepMatch = s.match(
+    /(?:^|\D)(199\d|20[0-4]\d)[-_.](0[1-9]|1[0-2])[-_.](0[1-9]|[12]\d|3[01])(?:[T _-]+([01]\d|2[0-3])[-_.:]([0-5]\d)(?:[-_.:]([0-5]\d))?)?(?:\D|$)/
+  );
+  if (sepMatch) {
+    const [, y, mo, d, hh = '12', mm = '00', ss = '00'] = sepMatch;
+    const ts = Date.parse(`${y}-${mo}-${d}T${hh}:${mm}:${ss}`);
+    if (!Number.isNaN(ts)) return ts;
+  }
+  const compactMatch = s.match(
+    /(?:^|\D)(199\d|20[0-4]\d)(0[1-9]|1[0-2])(0[1-9]|[12]\d|3[01])(?:[_-]?([01]\d|2[0-3])([0-5]\d)([0-5]\d))?(?:\D|$)/
+  );
+  if (compactMatch) {
+    const [, y, mo, d, hh = '12', mm = '00', ss = '00'] = compactMatch;
+    const ts = Date.parse(`${y}-${mo}-${d}T${hh}:${mm}:${ss}`);
+    if (!Number.isNaN(ts)) return ts;
+  }
+  const msMatch = s.match(/(?:mmexport|wx_camera_|Screenshot_)(\d{13})(?:\D|$)/i);
+  if (msMatch) {
+    const ms = Number(msMatch[1]);
+    if (ms >= 1262304000000 && ms <= 2524608000000) return ms;
+  }
+  return 0;
+}
+
+export function resolvePhotoTimestamp(file) {
+  if (!file || typeof file !== 'object') return 0;
+  const key = `${file.imageMediaMetadata?.time || ''}|${file.name || ''}|${file.modifiedTime || ''}|${file.createdTime || ''}`;
+  const cached = photoTimestampCache.get(file);
+  if (cached && cached.key === key) return cached.ts;
+
+  let ts = parseDateString(file.imageMediaMetadata?.time);
+  if (!ts) {
+    ts = parseFilenameTimestamp(file.name);
+  }
+  if (!ts) {
+    const modTs = parseDateString(file.modifiedTime);
+    const creTs = parseDateString(file.createdTime);
+    if (modTs && creTs) ts = Math.min(modTs, creTs);
+    else ts = modTs || creTs;
+  }
+
+  photoTimestampCache.set(file, { key, ts });
   return ts;
+}
+
+function getPhotoTimestamp(file) {
+  return resolvePhotoTimestamp(file);
 }
 
 export class Store {

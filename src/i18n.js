@@ -285,6 +285,7 @@ export const MESSAGES = {
     'lightbox.favTitle': 'Favorite (Shortcut: F)',
     'lightbox.addTagBtn': 'Add tag',
     'lightbox.back': 'Back',
+    'lightbox.loadingHd': 'Loading full-resolution photo',
 
     // Compare
     'compare.noExif': 'No EXIF metadata',
@@ -759,6 +760,7 @@ export const MESSAGES = {
     'lightbox.favTitle': '收藏 (快捷键 F)',
     'lightbox.addTagBtn': '添加标签',
     'lightbox.back': '返回',
+    'lightbox.loadingHd': '正在加载高清原图',
 
     // Compare
     'compare.noExif': '暂无 EXIF 参数',

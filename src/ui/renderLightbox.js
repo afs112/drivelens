@@ -3,6 +3,8 @@ import { t } from '../i18n.js';
 import {
   fetchAuthorizedMediaBlobUrl,
   getInstantCachedSrc,
+  hasCachedHdSrc,
+  loadHdPhoto,
   loadPhotoIntoElement,
   preloadPhoto,
 } from '../storage/imageLoader.js';
@@ -24,6 +26,7 @@ let dragStartX = 0;
 let dragStartY = 0;
 
 const slideCache = new Map();
+let hdHideTimer = 0;
 
 function getTouchDistance(t1, t2) {
   return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
@@ -66,12 +69,32 @@ function computeFlipFromGridCard(container, fileId) {
 
 function trimSlideCache(keepIds) {
   if (slideCache.size <= 7) return;
-  for (const key of slideCache.keys()) {
+  for (const [key, slide] of slideCache.entries()) {
     if (!keepIds.has(key)) {
+      slide?._hdAbort?.abort();
       slideCache.delete(key);
       if (slideCache.size <= 7) break;
     }
   }
+}
+
+function clearAllSlideLoads() {
+  clearTimeout(hdHideTimer);
+  hdHideTimer = 0;
+  for (const slide of slideCache.values()) {
+    slide?._hdAbort?.abort();
+  }
+  slideCache.clear();
+}
+
+function updateHdFloatIndicator(container, visible, progress = 0) {
+  const floatEl = container?.querySelector('[data-lb-hd-float]');
+  if (!floatEl) return;
+  const clamped = Math.max(0, Math.min(1, Number(progress) || 0));
+  floatEl.style.setProperty('--hd-progress', clamped.toFixed(3));
+  floatEl.setAttribute('aria-valuenow', String(Math.round(clamped * 100)));
+  floatEl.classList.toggle('is-visible', Boolean(visible));
+  floatEl.setAttribute('aria-hidden', String(!visible));
 }
 
 function acquireSlideElement(item, role, state, store) {
@@ -121,7 +144,11 @@ function acquireSlideElement(item, role, state, store) {
       `;
     }
     slide._imgEl = slide.querySelector('img');
-    slide._loaded2048 = false;
+    slide._previewRequested = false;
+    slide._hdReady = false;
+    slide._hdLoading = false;
+    slide._hdProgress = 0;
+    slide._hdAbort = null;
     slideCache.set(item.id, slide);
   }
 
@@ -144,17 +171,148 @@ function acquireSlideElement(item, role, state, store) {
   return slide;
 }
 
-function ensureSlideLoaded(slide, store) {
+function ensureSlidePreview(slide, store) {
   const imgEl = slide?._imgEl;
   const item = slide?._itemRef;
-  if (!imgEl || !item || slide._loaded2048 || !imgEl.isConnected) return;
-  slide._loaded2048 = true;
-  loadPhotoIntoElement(imgEl, item, {
-    size: 2048,
-    eager: true,
+  if (!imgEl || !item || !imgEl.isConnected) return;
+
+  const memHd = hasCachedHdSrc(item);
+  if (memHd) {
+    if (imgEl.getAttribute('src') !== memHd) {
+      imgEl.referrerPolicy = 'no-referrer';
+      imgEl.src = memHd;
+    }
+    imgEl.dataset.hdLoaded = 'true';
+    imgEl.classList.add('is-loaded');
+    slide._hdReady = true;
+    slide._hdProgress = 1;
+    return;
+  }
+
+  if (!imgEl.getAttribute('src')) {
+    const instant = getInstantCachedSrc(item, [2048, 600, 480]);
+    if (instant) {
+      imgEl.referrerPolicy = 'no-referrer';
+      imgEl.src = instant;
+      imgEl.classList.add('is-loaded');
+      return;
+    }
+  }
+
+  if (!slide._previewRequested && !slide._hdReady) {
+    slide._previewRequested = true;
+    loadPhotoIntoElement(imgEl, item, {
+      size: 480,
+      eager: true,
+      getAccessToken: () => store.state.accessToken,
+      getApiKey: () => store.state.apiKey,
+    });
+  }
+}
+
+function ensureSlideHd(slide, container, store, onDone = null) {
+  const imgEl = slide?._imgEl;
+  const item = slide?._itemRef;
+  if (!imgEl || !item) {
+    if (onDone) onDone();
+    return;
+  }
+
+  const isVideo = Boolean(item.mimeType && item.mimeType.startsWith('video/'));
+  if (isVideo || item.isDemo) {
+    slide._hdReady = true;
+    slide._hdProgress = 1;
+    if (store.state.lightboxPhotoId === item.id) {
+      clearTimeout(hdHideTimer);
+      updateHdFloatIndicator(container, false, 1);
+    }
+    if (onDone) onDone();
+    return;
+  }
+
+  const memHd = hasCachedHdSrc(item);
+  if (slide._hdReady || memHd) {
+    if (memHd && imgEl.getAttribute('src') !== memHd) {
+      imgEl.referrerPolicy = 'no-referrer';
+      imgEl.src = memHd;
+    }
+    imgEl.dataset.hdLoaded = 'true';
+    imgEl.classList.add('is-loaded');
+    slide._hdReady = true;
+    slide._hdProgress = 1;
+    if (store.state.lightboxPhotoId === item.id) {
+      clearTimeout(hdHideTimer);
+      updateHdFloatIndicator(container, false, 1);
+    }
+    if (onDone) onDone();
+    return;
+  }
+
+  if (slide._hdLoading) {
+    if (store.state.lightboxPhotoId === item.id) {
+      clearTimeout(hdHideTimer);
+      updateHdFloatIndicator(container, true, Math.max(0.08, slide._hdProgress));
+    }
+    return;
+  }
+
+  slide._hdLoading = true;
+  slide._hdProgress = 0.08;
+  const abortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
+  slide._hdAbort = abortCtrl;
+
+  if (store.state.lightboxPhotoId === item.id) {
+    clearTimeout(hdHideTimer);
+    updateHdFloatIndicator(container, true, 0.08);
+  }
+
+  loadHdPhoto(item, {
     getAccessToken: () => store.state.accessToken,
     getApiKey: () => store.state.apiKey,
-  });
+    signal: abortCtrl?.signal || null,
+    onProgress: (p) => {
+      slide._hdProgress = p;
+      if (store.state.lightboxPhotoId === item.id) {
+        updateHdFloatIndicator(container, true, p);
+      }
+    },
+  })
+    .then(({ src, fromMemory }) => {
+      slide._hdLoading = false;
+      slide._hdAbort = null;
+      slide._hdReady = true;
+      slide._hdProgress = 1;
+      if (src && imgEl) {
+        imgEl.referrerPolicy = 'no-referrer';
+        imgEl.dataset.hdLoaded = 'true';
+        imgEl.src = src;
+        imgEl.classList.add('is-loaded');
+      }
+      if (store.state.lightboxPhotoId === item.id) {
+        clearTimeout(hdHideTimer);
+        if (fromMemory) {
+          updateHdFloatIndicator(container, false, 1);
+        } else {
+          updateHdFloatIndicator(container, true, 1);
+          hdHideTimer = setTimeout(() => {
+            hdHideTimer = 0;
+            if (store.state.lightboxPhotoId === item.id) {
+              updateHdFloatIndicator(container, false, 1);
+            }
+          }, 180);
+        }
+      }
+      if (onDone) onDone();
+    })
+    .catch(() => {
+      slide._hdLoading = false;
+      slide._hdAbort = null;
+      if (store.state.lightboxPhotoId === item.id) {
+        clearTimeout(hdHideTimer);
+        updateHdFloatIndicator(container, false, 0);
+      }
+      if (onDone) onDone();
+    });
 }
 
 function buildLightboxRatingOptions() {
@@ -200,6 +358,21 @@ function buildLightboxShell(container, store, zoom) {
   container.innerHTML = `
     <div class="lightbox chrome-hidden">
       <img class="lightbox-ambient-bg" alt="" aria-hidden="true" />
+      <div
+        class="lightbox-hd-float"
+        data-lb-hd-float
+        role="progressbar"
+        aria-label="${escapeAttr(t('lightbox.loadingHd'))}"
+        aria-valuemin="0"
+        aria-valuemax="100"
+        aria-valuenow="0"
+        aria-hidden="true"
+      >
+        <svg class="lightbox-hd-ring" width="22" height="22" viewBox="0 0 24 24" aria-hidden="true">
+          <circle class="lightbox-hd-ring-track" cx="12" cy="12" r="9" />
+          <circle class="lightbox-hd-ring-bar" cx="12" cy="12" r="9" />
+        </svg>
+      </div>
       <div class="lightbox-topbar">
         <div style="display:flex;align-items:center;gap:8px;min-width:0;">
           <button type="button" class="btn btn-sm btn-icon lightbox-glass-pill" data-lb="close" title="${escapeAttr(t('lightbox.close'))}" aria-label="${escapeAttr(t('lightbox.back'))}">
@@ -263,7 +436,7 @@ export function renderLightbox(container, store, visiblePhotos) {
     isDragging = false;
     isPinching = false;
     isTouchPanning = false;
-    slideCache.clear();
+    clearAllSlideLoads();
     container.classList.add('hidden');
     container.innerHTML = '';
     return;
@@ -382,17 +555,31 @@ export function renderLightbox(container, store, visiblePhotos) {
   const lookaheadNext = idx >= 0 && idx + 2 < total ? visiblePhotos[idx + 2] : null;
 
   if (trackEl) {
-    const slides = [];
-    if (prevItem) slides.push(acquireSlideElement(prevItem, 'prev', state, store));
-    slides.push(acquireSlideElement(file, 'current', state, store));
-    if (nextItem) slides.push(acquireSlideElement(nextItem, 'next', state, store));
+    const prevSlideEl = prevItem ? acquireSlideElement(prevItem, 'prev', state, store) : null;
+    const curSlideEl = acquireSlideElement(file, 'current', state, store);
+    const nextSlideEl = nextItem ? acquireSlideElement(nextItem, 'next', state, store) : null;
+    const slides = [prevSlideEl, curSlideEl, nextSlideEl].filter(Boolean);
 
     trackEl.style.transition = 'none';
     trackEl.style.transform = 'translate3d(0px, 0px, 0px)';
     trackEl.replaceChildren(...slides);
+
     for (const sl of slides) {
-      ensureSlideLoaded(sl, store);
+      ensureSlidePreview(sl, store);
     }
+
+    // Upgrade current slide to full HD first (driving top-down progress ring), then preload adjacent HD slides
+    ensureSlideHd(curSlideEl, container, store, () => {
+      if (nextSlideEl?.isConnected) ensureSlideHd(nextSlideEl, container, store);
+      if (prevSlideEl?.isConnected) ensureSlideHd(prevSlideEl, container, store);
+      if (lookaheadNext) {
+        preloadPhoto(lookaheadNext, {
+          size: 2048,
+          getAccessToken: () => store.state.accessToken,
+          getApiKey: () => store.state.apiKey,
+        });
+      }
+    });
 
     const keepIds = new Set(
       [prevItem?.id, file.id, nextItem?.id, lookaheadNext?.id].filter(Boolean)
@@ -432,15 +619,6 @@ export function renderLightbox(container, store, visiblePhotos) {
   }
 
   pendingSwipeOffsetPx = null;
-
-  // Automatically preload idx + 2 in background (idx - 1 and idx + 1 already loading in slides)
-  if (lookaheadNext) {
-    preloadPhoto(lookaheadNext, {
-      size: 2048,
-      getAccessToken: () => store.state.accessToken,
-      getApiKey: () => store.state.apiKey,
-    });
-  }
 
   const ambientEl = container.querySelector('.lightbox-ambient-bg');
   if (ambientEl) {

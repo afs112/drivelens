@@ -746,6 +746,16 @@ export function renderMobileNav(navEl, store) {
           ${icon('search', 20)}
           <span class="sr-only">${escapeHtml(t('mobile.navSearch'))}</span>
         </button>
+        <button
+          type="button"
+          class="mobile-nav-btn mobile-nav-top-orb"
+          data-mnav="back-top"
+          aria-label="${escapeAttr(t('gallery.backToTop'))}"
+          title="${escapeAttr(t('gallery.backToTop'))}"
+        >
+          ${icon('arrowUp', 20)}
+          <span class="sr-only">${escapeHtml(t('gallery.backToTop'))}</span>
+        </button>
       </div>
     `;
   }
@@ -802,7 +812,10 @@ export function bindMobileNavEvents(navEl, store) {
     const action = btn.dataset.mnav;
     const headerEl = document.getElementById('topHeader');
     headerEl.classList.remove('is-hidden-scroll');
-    navEl.classList.remove('is-condensed');
+    if (action === 'back-top') {
+      document.getElementById('galleryScroll')?.scrollTo({ top: 0, behavior: 'smooth' });
+      return;
+    }
     if (action === 'search') {
       toggleSearch(headerEl, store);
       return;

@@ -60,6 +60,7 @@
 
   /* Layout Dimensions */
   --header-height: 40px;
+  --header-icon-size: 17px;
   --sidebar-width: 264px;
   --inspector-width: 304px;
   --mobile-nav-height: 48px;
@@ -202,4 +203,25 @@ a:hover {
   height: 1px;
   overflow: hidden;
   clip: rect(0, 0, 0, 0);
+}
+
+/* High-Resolution Desktop Adaptive Scaling (2K / 4K Monitors) */
+@media (min-width: 1600px) and (pointer: fine) {
+  :root {
+    --header-height: 48px;
+    --header-icon-size: 20px;
+    --chrome-gap: 15px;
+    --sidebar-width: 294px;
+    --inspector-width: 336px;
+  }
+}
+
+@media (min-width: 2300px) and (pointer: fine) {
+  :root {
+    --header-height: 56px;
+    --header-icon-size: 23px;
+    --chrome-gap: 20px;
+    --sidebar-width: 332px;
+    --inspector-width: 380px;
+  }
 }

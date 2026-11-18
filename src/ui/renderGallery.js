@@ -1,27 +1,16 @@
 import { getLocaleTag, t } from '../i18n.js';
+import { resolvePhotoTimestamp } from '../state/store.js';
 import { loadPhotoIntoElement } from '../storage/imageLoader.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
 
 const GALLERY_THUMB_SIZE = 480;
 const PAGE_CHUNK = 80;
 
-const cardTimestampCache = new WeakMap();
 const visiblePhotosIdSigCache = new WeakMap();
 const monthFormatterCache = new Map();
 
 function getPhotoTimestampValue(file) {
-  if (!file || typeof file !== 'object') return 0;
-  const raw = file.imageMediaMetadata?.time || file.createdTime || file.modifiedTime || '';
-  if (!raw) return 0;
-  const cached = cardTimestampCache.get(file);
-  if (cached && cached.raw === raw) return cached.ts;
-  const normalized = /^\d{4}:\d{2}:\d{2}\s/.test(raw)
-    ? raw.replace(/^(\d{4}):(\d{2}):(\d{2})\s/, '$1-$2-$3T')
-    : raw;
-  const parsed = Date.parse(normalized);
-  const ts = Number.isNaN(parsed) ? 0 : parsed;
-  cardTimestampCache.set(file, { raw, ts });
-  return ts;
+  return resolvePhotoTimestamp(file);
 }
 
 function getPhotosIdSig(visiblePhotos) {
@@ -521,7 +510,34 @@ function buildGridSignature(state, isMobile, rowHeight, roundedWidth, visiblePho
   return `${state.lang}|${isMobile ? 'm' : 'd'}|${state.layoutMode}|${rowHeight}|${roundedWidth}|${limit}|${visiblePhotos.length}|${getPhotosIdSig(visiblePhotos)}`;
 }
 
-function updateFloatingScrollState(scrollContainer) {
+function findSampleCardTimestamp(scrollContainer) {
+  const rect = scrollContainer.getBoundingClientRect();
+  if (!rect.width || !rect.height) return 0;
+  const sampleY = rect.top + Math.min(130, Math.max(68, Math.round(rect.height * 0.24)));
+  const sampleXs = [
+    rect.left + Math.round(rect.width * 0.25),
+    rect.left + Math.round(rect.width * 0.5),
+    rect.left + Math.round(rect.width * 0.75),
+  ];
+  for (const sx of sampleXs) {
+    if (typeof document.elementsFromPoint === 'function') {
+      const stack = document.elementsFromPoint(sx, sampleY);
+      for (const el of stack) {
+        if (el.classList?.contains('photo-card') && el.dataset.ts) {
+          const v = Number(el.dataset.ts);
+          if (v > 0) return v;
+        }
+      }
+    } else {
+      const hit = document.elementFromPoint(sx, sampleY)?.closest('.photo-card[data-ts]');
+      const v = hit ? Number(hit.dataset.ts || 0) : 0;
+      if (v > 0) return v;
+    }
+  }
+  return 0;
+}
+
+function updateFloatingScrollState(scrollContainer, store, fromActiveScroll = false) {
   const pillEl = scrollContainer._dlMonthPill;
   const backBtn = scrollContainer._dlBackTopBtn;
   if (!pillEl || !backBtn) return;
@@ -532,32 +548,44 @@ function updateFloatingScrollState(scrollContainer) {
     backBtn.setAttribute('aria-label', backLabel);
   }
 
-  const show = scrollContainer.scrollTop > 320 && lastVisiblePhotos.length > 0;
-  backBtn.classList.toggle('visible', show);
-  if (!show) {
+  const showBackTop = scrollContainer.scrollTop > 320 && lastVisiblePhotos.length > 0;
+  backBtn.classList.toggle('visible', showBackTop);
+  document.getElementById('mobileNavBar')?.classList.toggle('has-back-top', showBackTop);
+
+  const sortBy = store?.state?.sortBy || 'dateDesc';
+  const isDateSort = sortBy === 'dateDesc' || sortBy === 'dateAsc';
+
+  if (!showBackTop || !isDateSort) {
+    clearTimeout(scrollContainer._dlPillHideTimer);
     pillEl.classList.remove('visible');
     return;
   }
 
-  const rect = scrollContainer.getBoundingClientRect();
-  const sampleX = rect.left + Math.max(40, Math.round(rect.width * 0.22));
-  const hitCard =
-    document.elementFromPoint(sampleX, rect.top + 48)?.closest('.photo-card[data-ts]') ||
-    document.elementFromPoint(sampleX, rect.top + 68)?.closest('.photo-card[data-ts]');
-  const ts = hitCard ? Number(hitCard.dataset.ts || 0) : 0;
+  if (!fromActiveScroll && !pillEl.classList.contains('visible')) {
+    return;
+  }
+
+  const ts = findSampleCardTimestamp(scrollContainer);
   if (ts > 0) {
     pillEl.textContent = formatMonthPillLabel(ts);
-    pillEl.classList.add('visible');
+    if (fromActiveScroll) {
+      pillEl.classList.add('visible');
+      clearTimeout(scrollContainer._dlPillHideTimer);
+      scrollContainer._dlPillHideTimer = setTimeout(() => {
+        pillEl.classList.remove('visible');
+      }, 950);
+    }
   } else {
     pillEl.classList.remove('visible');
   }
 }
 
-function ensureGalleryFloatingUi(scrollContainer) {
+function ensureGalleryFloatingUi(scrollContainer, store) {
   const host = scrollContainer.parentElement;
   if (!host) return;
+  scrollContainer._dlStoreRef = store;
   if (scrollContainer._dlFloatingAttached) {
-    updateFloatingScrollState(scrollContainer);
+    updateFloatingScrollState(scrollContainer, store, false);
     return;
   }
 
@@ -595,7 +623,6 @@ function ensureGalleryFloatingUi(scrollContainer) {
         lastScrollTop = curTop;
 
         const topHeaderEl = document.getElementById('topHeader');
-        const mobileNav = document.getElementById('mobileNavBar');
         const overlayOpen =
           Boolean(document.querySelector(
             '#headerMorePopover.is-open, #topHeader.mobile-search-open, #demoBanner:not(.hidden), #drawerBackdrop.visible'
@@ -603,25 +630,25 @@ function ensureGalleryFloatingUi(scrollContainer) {
 
         if (curTop <= 30 || delta < -5 || overlayOpen) {
           topHeaderEl?.classList.remove('is-hidden-scroll');
-          mobileNav?.classList.remove('is-condensed');
         } else if (curTop > 50 && delta > 4) {
           topHeaderEl?.classList.add('is-hidden-scroll');
-          mobileNav?.classList.add('is-condensed');
         }
 
-        updateFloatingScrollState(scrollContainer);
+        updateFloatingScrollState(scrollContainer, scrollContainer._dlStoreRef, true);
       });
     },
     { passive: true }
   );
 
-  updateFloatingScrollState(scrollContainer);
+  updateFloatingScrollState(scrollContainer, store, false);
 }
 
 function hideGalleryFloatingUi(scrollContainer) {
   if (!scrollContainer) return;
+  clearTimeout(scrollContainer._dlPillHideTimer);
   scrollContainer._dlMonthPill?.classList.remove('visible');
   scrollContainer._dlBackTopBtn?.classList.remove('visible');
+  document.getElementById('mobileNavBar')?.classList.remove('has-back-top');
 }
 
 function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, targetHeight, patchMeta) {
@@ -829,7 +856,7 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
     return;
   }
 
-  ensureGalleryFloatingUi(scrollContainer);
+  ensureGalleryFloatingUi(scrollContainer, store);
   lastVisiblePhotos = visiblePhotos;
 
   const filterKey = buildFilterKey(store.state);

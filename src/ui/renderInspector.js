@@ -1,5 +1,6 @@
 import { downloadOriginalFile } from '../api/gdrive.js';
 import { getLocaleTag, t } from '../i18n.js';
+import { resolvePhotoTimestamp } from '../state/store.js';
 import { loadPhotoIntoElement } from '../storage/imageLoader.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
 
@@ -11,14 +12,10 @@ function formatBytes(bytes) {
   return `${(n / (1024 * 1024)).toFixed(2)} MB`;
 }
 
-function formatDate(raw) {
-  if (!raw) return '—';
-  const normalized = /^\d{4}:\d{2}:\d{2}\s/.test(raw)
-    ? raw.replace(/^(\d{4}):(\d{2}):(\d{2})\s/, '$1-$2-$3T')
-    : raw;
-  const d = new Date(normalized);
-  if (Number.isNaN(d.getTime())) return raw;
-  return d.toLocaleString(getLocaleTag(), { hour12: false });
+function formatCaptureDate(file) {
+  const ts = resolvePhotoTimestamp(file);
+  if (!ts) return '—';
+  return new Date(ts).toLocaleString(getLocaleTag(), { hour12: false });
 }
 
 function formatShutter(sec) {
@@ -311,7 +308,7 @@ export function renderInspector(container, store) {
         <div class="inspector-card-title"><span>${escapeHtml(t('inspector.exifSection'))}</span></div>
         <div class="exif-grid">
           <span class="exif-label">${escapeHtml(t('inspector.exifTime'))}</span>
-          <span class="exif-value">${escapeHtml(formatDate(exif.time || file.createdTime))}</span>
+          <span class="exif-value">${escapeHtml(formatCaptureDate(file))}</span>
           <span class="exif-label">${escapeHtml(t('inspector.exifResolution'))}</span>
           <span class="exif-value">${width && height ? `${width} × ${height}` : '—'}</span>
           <span class="exif-label">${escapeHtml(t('inspector.exifCamera'))}</span>
