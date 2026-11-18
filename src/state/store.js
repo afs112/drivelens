@@ -37,6 +37,7 @@ const THEME_KEY = 'drivelens_theme';
 const RECENT_KEY = 'drivelens_recent_v1';
 const SETTINGS_KEY = 'drivelens_connect_prefs_v1';
 const UI_PREFS_KEY = 'drivelens_ui_prefs_v1';
+const ALBUM_CACHE_TTL_MS = 30 * 60 * 1000;
 const VALID_LAYOUT_MODES = ['justified', 'waterfall', 'grid'];
 const VALID_SORT_MODES = ['dateDesc', 'dateAsc', 'ratingDesc', 'nameAsc', 'sizeDesc'];
 
@@ -177,15 +178,22 @@ function saveUiPrefs(patch) {
   }
 }
 
+const photoTimestampCache = new WeakMap();
+
 function getPhotoTimestamp(file) {
+  if (!file || typeof file !== 'object') return 0;
   const raw = file.imageMediaMetadata?.time || file.createdTime || file.modifiedTime || '';
   if (!raw) return 0;
+  const cached = photoTimestampCache.get(file);
+  if (cached && cached.raw === raw) return cached.ts;
   // Handle EXIF format "YYYY:MM:DD HH:MM:SS" if Google Drive returns it
   const normalized = /^\d{4}:\d{2}:\d{2}\s/.test(raw)
     ? raw.replace(/^(\d{4}):(\d{2}):(\d{2})\s/, '$1-$2-$3T')
     : raw;
-  const ts = Date.parse(normalized);
-  return Number.isNaN(ts) ? 0 : ts;
+  const parsed = Date.parse(normalized);
+  const ts = Number.isNaN(parsed) ? 0 : parsed;
+  photoTimestampCache.set(file, { raw, ts });
+  return ts;
 }
 
 export class Store {
@@ -197,6 +205,9 @@ export class Store {
     this.connectSeq = 0;
     this.toastCounter = 0;
     this.deferredInstallPrompt = null;
+    this._aggMetaCache = new Map();
+    this._aggMetaRefs = null;
+    this._visiblePhotosCache = null;
 
     const initialLang = setLangCode(getLang());
     const prefs = loadConnectPrefs();
@@ -517,6 +528,7 @@ export class Store {
       localMetaSupportedOverride = null,
       syncStatus = 'syncing',
       syncMessageKey = 'store.syncCachedRevalidating',
+      backgroundRefreshing = false,
     }
   ) {
     if (!cached?.rootFolder || !Array.isArray(cached.files)) return false;
@@ -566,7 +578,7 @@ export class Store {
           : Boolean(cached.localMetaSupported),
       loading: false,
       loadingText: '',
-      backgroundRefreshing: syncStatus === 'syncing',
+      backgroundRefreshing: Boolean(backgroundRefreshing),
       cacheRestoredAt: Number(cached.savedAt || Date.now()),
       syncStatus,
       syncMessageKey,
@@ -598,6 +610,143 @@ export class Store {
       modal: null,
     });
     return true;
+  }
+
+  _recordRecentAlbum({ folderId, name, authType, clientId = '', apiKey = '', remember = true }) {
+    if (!remember || !folderId) return this.state.recentAlbums;
+    const recent = [
+      {
+        folderId,
+        name,
+        authType,
+        ...(clientId ? { clientId } : {}),
+        ...(apiKey ? { apiKey } : {}),
+        updatedAt: Date.now(),
+      },
+      ...this.state.recentAlbums.filter((a) => a.folderId !== folderId),
+    ].slice(0, 6);
+    try {
+      localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
+    } catch {
+      // Ignore
+    }
+    return recent;
+  }
+
+  _handleStreamingBatch(reqSeq, batch, { authType, folderId, clientId = '', apiKey = '', user }) {
+    if (reqSeq !== this.connectSeq || !batch?.files?.length) return;
+    const membersData = { ...(this.state.membersData || {}) };
+    if (user?.id && !membersData[user.id]) {
+      membersData[user.id] = {
+        version: 1,
+        member: { ...user, updatedAt: Date.now() },
+        items: {},
+      };
+    }
+    const curFolderIds = new Set((batch.folders || []).map((f) => f.id));
+    const curFileIds = new Set(batch.files.map((f) => f.id));
+    this.setState({
+      mode: 'gdrive',
+      authType,
+      folderId,
+      ...(clientId ? { clientId } : {}),
+      ...(apiKey ? { apiKey } : {}),
+      ...(user ? { currentUser: user } : {}),
+      loading: false,
+      loadingText: '',
+      backgroundRefreshing: true,
+      syncStatus: 'syncing',
+      syncMessageKey: 'store.syncStreamingAlbum',
+      syncMessage: t('store.syncStreamingAlbum'),
+      rootFolder: batch.rootFolder,
+      folders: batch.folders,
+      files: batch.files,
+      metaFolderId: batch.metaFolderId || this.state.metaFolderId,
+      canWrite: Boolean(batch.canWrite),
+      membersData,
+      activeFolderId:
+        this.state.activeFolderId && curFolderIds.has(this.state.activeFolderId)
+          ? this.state.activeFolderId
+          : batch.rootFolder.id,
+      focusedPhotoId:
+        this.state.focusedPhotoId && curFileIds.has(this.state.focusedPhotoId)
+          ? this.state.focusedPhotoId
+          : batch.files[0]?.id || null,
+      modal: null,
+    });
+  }
+
+  _commitLoadedAlbumState({
+    authType,
+    folderId,
+    album,
+    tagSchema,
+    tagSchemaFileId = null,
+    memberFilesById = {},
+    membersData,
+    canWrite = true,
+    localMetaSupported = false,
+    syncStatus,
+    syncMessageKey,
+    recent,
+  }) {
+    const sameActiveAlbum = this.state.mode === 'gdrive' && this.state.folderId === folderId;
+    const folderIds = new Set(album.folders.map((f) => f.id));
+    const fileIds = new Set(album.files.map((f) => f.id));
+    const nextSelectedIds = sameActiveAlbum
+      ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => fileIds.has(id)))
+      : new Set();
+
+    this.setState({
+      mode: 'gdrive',
+      authType,
+      localMetaSupported,
+      loading: false,
+      loadingText: '',
+      backgroundRefreshing: false,
+      cacheRestoredAt: Date.now(),
+      syncStatus,
+      syncMessageKey,
+      syncMessage: t(syncMessageKey),
+      rootFolder: album.rootFolder,
+      folders: album.folders,
+      files: album.files,
+      metaFolderId: album.metaFolderId || null,
+      canWrite,
+      tagSchemaFileId,
+      tagSchema,
+      memberFilesById,
+      membersData,
+      activeFolderId:
+        sameActiveAlbum && folderIds.has(this.state.activeFolderId)
+          ? this.state.activeFolderId
+          : album.rootFolder.id,
+      selectedPhotoIds: nextSelectedIds,
+      lastClickedPhotoId:
+        sameActiveAlbum && fileIds.has(this.state.lastClickedPhotoId)
+          ? this.state.lastClickedPhotoId
+          : null,
+      focusedPhotoId:
+        sameActiveAlbum && fileIds.has(this.state.focusedPhotoId)
+          ? this.state.focusedPhotoId
+          : album.files[0]?.id || null,
+      lightboxPhotoId:
+        sameActiveAlbum && fileIds.has(this.state.lightboxPhotoId)
+          ? this.state.lightboxPhotoId
+          : null,
+      ...(sameActiveAlbum
+        ? {}
+        : {
+            quickView: 'all',
+            minRating: 0,
+            memberFilterId: null,
+            ratingScope: 'avg',
+            selectedTagIds: new Set(),
+            searchQuery: '',
+          }),
+      recentAlbums: recent,
+      modal: null,
+    });
   }
 
   _scheduleAlbumCacheUpdate() {
@@ -677,6 +826,11 @@ export class Store {
     const cachedBeforeAuth = !forceRescan ? await getCachedAlbum('oauth', cleanFolderId) : null;
     if (reqSeq !== this.connectSeq) return false;
 
+    const isFreshCache =
+      Boolean(cachedBeforeAuth) &&
+      Date.now() - Number(cachedBeforeAuth.savedAt || 0) < ALBUM_CACHE_TTL_MS &&
+      cachedBeforeAuth.files.length > 0;
+
     let keepVisible =
       Boolean(cachedBeforeAuth) ||
       (this.state.mode === 'gdrive' &&
@@ -689,18 +843,21 @@ export class Store {
         folderId: cleanFolderId,
         clientId: cleanClientId,
         user: existingSavedUser || this.state.currentUser,
-        syncStatus: 'syncing',
-        syncMessageKey: 'store.syncCachedRevalidating',
+        syncStatus: isFreshCache ? (cachedBeforeAuth.canWrite ? 'synced' : 'readonly') : 'syncing',
+        syncMessageKey: isFreshCache ? 'store.syncFromCacheReady' : 'store.syncCachedRevalidating',
+        backgroundRefreshing: !isFreshCache,
       });
       this._updateUrlHash(cleanFolderId, cleanClientId);
-      this.toast(
-        t('store.loadedFromCacheToast', {
-          name: cachedBeforeAuth.rootFolder.name,
-          count: cachedBeforeAuth.files.length,
-        }),
-        'info',
-        2600
-      );
+      if (!isFreshCache) {
+        this.toast(
+          t('store.loadedFromCacheToast', {
+            name: cachedBeforeAuth.rootFolder.name,
+            count: cachedBeforeAuth.files.length,
+          }),
+          'info',
+          2400
+        );
+      }
     } else {
       this.setState({
         loading: !keepVisible,
@@ -751,15 +908,82 @@ export class Store {
         savedOAuthUser: nextSavedUser,
       });
 
-      const album = await loadSharedAlbum(cleanFolderId, session.accessToken, (prog) => {
-        if (reqSeq !== this.connectSeq || !this.state.loading) return;
-        this.setState({
-          loadingText: t('store.scanningProgress', {
-            folders: prog.folderCount,
-            files: prog.fileCount,
-          }),
+      // Cache-first fast path: skip directory scan when cache is fresh; sync metadata lightly
+      if (isFreshCache) {
+        const recent = this._recordRecentAlbum({
+          folderId: cleanFolderId,
+          name: cachedBeforeAuth.rootFolder.name,
+          authType: 'oauth',
+          clientId: cleanClientId,
+          remember,
         });
-      });
+        this.setState({ recentAlbums: recent });
+        if (cachedBeforeAuth.metaFolderId) {
+          loadAlbumMetadata(cachedBeforeAuth.metaFolderId, session.accessToken)
+            .then(async (meta) => {
+              if (reqSeq !== this.connectSeq) return;
+              const { mergedMembers, mergedSchema } = this._mergeFreshWithLocalEdits(
+                this.state.membersData,
+                meta.membersData || {},
+                this.state.tagSchema,
+                meta.tagSchema || { version: 1, tags: {} },
+                session.user.id
+              );
+              const myId = session.user.id;
+              if (!mergedMembers[myId]) {
+                mergedMembers[myId] = {
+                  version: 1,
+                  member: { ...session.user, updatedAt: Date.now() },
+                  items: {},
+                };
+              }
+              this.setState({
+                tagSchemaFileId: meta.tagSchemaFileId,
+                memberFilesById: meta.memberFilesById,
+                tagSchema: mergedSchema,
+                membersData: mergedMembers,
+              });
+              await setCachedAlbum('oauth', cleanFolderId, {
+                rootFolder: this.state.rootFolder,
+                folders: this.state.folders,
+                files: this.state.files,
+                metaFolderId: this.state.metaFolderId,
+                canWrite: this.state.canWrite,
+                tagSchemaFileId: meta.tagSchemaFileId,
+                tagSchema: mergedSchema,
+                memberFilesById: meta.memberFilesById,
+                membersData: mergedMembers,
+                localMetaSupported: false,
+                savedAt: cachedBeforeAuth.savedAt,
+              });
+            })
+            .catch(() => {});
+        }
+        return true;
+      }
+
+      const album = await loadSharedAlbum(
+        cleanFolderId,
+        session.accessToken,
+        (prog) => {
+          if (reqSeq !== this.connectSeq || !this.state.loading) return;
+          this.setState({
+            loadingText: t('store.scanningProgress', {
+              folders: prog.folderCount,
+              files: prog.fileCount,
+            }),
+          });
+        },
+        keepVisible
+          ? null
+          : (batch) =>
+              this._handleStreamingBatch(reqSeq, batch, {
+                authType: 'oauth',
+                folderId: cleanFolderId,
+                clientId: cleanClientId,
+                user: session.user,
+              })
+      );
       if (reqSeq !== this.connectSeq) return false;
 
       if (this.state.loading) {
@@ -794,7 +1018,7 @@ export class Store {
         }
       }
 
-      if (keepVisible && this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId) {
+      if ((keepVisible || this.state.files.length > 0) && this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId) {
         const merged = this._mergeFreshWithLocalEdits(
           this.state.membersData,
           membersData,
@@ -819,25 +1043,13 @@ export class Store {
         };
       }
 
-      let recent = this.state.recentAlbums;
-      if (remember) {
-        recent = [
-          {
-            folderId: cleanFolderId,
-            name: album.rootFolder.name,
-            authType: 'oauth',
-            clientId: cleanClientId,
-            updatedAt: Date.now(),
-          },
-          ...this.state.recentAlbums.filter((a) => a.folderId !== cleanFolderId),
-        ].slice(0, 6);
-
-        try {
-          localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
-        } catch {
-          // Ignore
-        }
-      }
+      const recent = this._recordRecentAlbum({
+        folderId: cleanFolderId,
+        name: album.rootFolder.name,
+        authType: 'oauth',
+        clientId: cleanClientId,
+        remember,
+      });
 
       const savedSnapshot = {
         rootFolder: album.rootFolder,
@@ -856,64 +1068,20 @@ export class Store {
 
       this._updateUrlHash(cleanFolderId, cleanClientId);
 
-      const sameActiveAlbum = this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId;
-      const folderIds = new Set(album.folders.map((f) => f.id));
-      const fileIds = new Set(album.files.map((f) => f.id));
-      const nextSelectedIds = sameActiveAlbum
-        ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => fileIds.has(id)))
-        : new Set();
-
       const msgKey = album.canWrite ? 'store.syncOAuthSynced' : 'store.syncReadonly';
-
-      this.setState({
-        mode: 'gdrive',
+      this._commitLoadedAlbumState({
         authType: 'oauth',
-        localMetaSupported: false,
-        loading: false,
-        loadingText: '',
-        backgroundRefreshing: false,
-        cacheRestoredAt: Date.now(),
-        syncStatus: album.canWrite ? 'synced' : 'readonly',
-        syncMessageKey: msgKey,
-        syncMessage: t(msgKey),
-        rootFolder: album.rootFolder,
-        folders: album.folders,
-        files: album.files,
-        metaFolderId: album.metaFolderId,
-        canWrite: album.canWrite,
-        tagSchemaFileId: meta.tagSchemaFileId,
+        folderId: cleanFolderId,
+        album,
         tagSchema,
+        tagSchemaFileId: meta.tagSchemaFileId,
         memberFilesById: meta.memberFilesById,
         membersData,
-        activeFolderId:
-          sameActiveAlbum && folderIds.has(this.state.activeFolderId)
-            ? this.state.activeFolderId
-            : album.rootFolder.id,
-        selectedPhotoIds: nextSelectedIds,
-        lastClickedPhotoId:
-          sameActiveAlbum && fileIds.has(this.state.lastClickedPhotoId)
-            ? this.state.lastClickedPhotoId
-            : null,
-        focusedPhotoId:
-          sameActiveAlbum && fileIds.has(this.state.focusedPhotoId)
-            ? this.state.focusedPhotoId
-            : album.files[0]?.id || null,
-        lightboxPhotoId:
-          sameActiveAlbum && fileIds.has(this.state.lightboxPhotoId)
-            ? this.state.lightboxPhotoId
-            : null,
-        ...(sameActiveAlbum
-          ? {}
-          : {
-              quickView: 'all',
-              minRating: 0,
-              memberFilterId: null,
-              ratingScope: 'avg',
-              selectedTagIds: new Set(),
-              searchQuery: '',
-            }),
-        recentAlbums: recent,
-        modal: null,
+        canWrite: album.canWrite,
+        localMetaSupported: false,
+        syncStatus: album.canWrite ? 'synced' : 'readonly',
+        syncMessageKey: msgKey,
+        recent,
       });
 
       if (!cachedBeforeAuth || forceRescan) {
@@ -998,6 +1166,11 @@ export class Store {
     const cached = !forceRescan ? await getCachedAlbum('apikey', cleanFolderId) : null;
     if (reqSeq !== this.connectSeq) return false;
 
+    const isFreshCache =
+      Boolean(cached) &&
+      Date.now() - Number(cached.savedAt || 0) < ALBUM_CACHE_TTL_MS &&
+      cached.files.length > 0;
+
     const keepVisible =
       Boolean(cached) ||
       (this.state.mode === 'gdrive' &&
@@ -1010,8 +1183,9 @@ export class Store {
         folderId: cleanFolderId,
         apiKey: cleanApiKey,
         user,
-        syncStatus: 'syncing',
-        syncMessageKey: 'store.syncCachedRevalidating',
+        syncStatus: isFreshCache ? (cached.localMetaSupported ? 'synced' : 'readonly') : 'syncing',
+        syncMessageKey: isFreshCache ? 'store.syncFromCacheReady' : 'store.syncCachedRevalidating',
+        backgroundRefreshing: !isFreshCache,
       });
       this.setState({
         nickname: cleanNick,
@@ -1020,13 +1194,73 @@ export class Store {
         accessToken: '',
       });
       this._updateUrlHash(cleanFolderId, '');
+
+      if (isFreshCache) {
+        const recent = this._recordRecentAlbum({
+          folderId: cleanFolderId,
+          name: cached.rootFolder.name,
+          authType: 'apikey',
+          apiKey: cleanApiKey,
+          remember,
+        });
+        this.setState({ recentAlbums: recent });
+        loadLocalServerMeta(cleanFolderId)
+          .then(async (serverMeta) => {
+            if (reqSeq !== this.connectSeq || !serverMeta) return;
+            let tagSchema = serverMeta.tagSchema?.tags
+              ? { version: 1, tags: serverMeta.tagSchema.tags }
+              : { version: 1, tags: {} };
+            let membersData =
+              serverMeta.membersData && typeof serverMeta.membersData === 'object'
+                ? { ...serverMeta.membersData }
+                : {};
+            const merged = this._mergeFreshWithLocalEdits(
+              this.state.membersData,
+              membersData,
+              this.state.tagSchema,
+              tagSchema,
+              user.id
+            );
+            membersData = merged.mergedMembers;
+            tagSchema = merged.mergedSchema;
+            if (!membersData[user.id]) {
+              membersData[user.id] = {
+                version: 1,
+                member: { ...user, updatedAt: Date.now() },
+                items: {},
+              };
+            }
+            this.setState({
+              localMetaSupported: true,
+              tagSchema,
+              membersData,
+              syncStatus: 'synced',
+            });
+            await setCachedAlbum('apikey', cleanFolderId, {
+              rootFolder: this.state.rootFolder,
+              folders: this.state.folders,
+              files: this.state.files,
+              metaFolderId: null,
+              canWrite: true,
+              tagSchemaFileId: null,
+              tagSchema,
+              memberFilesById: {},
+              membersData,
+              localMetaSupported: true,
+              savedAt: cached.savedAt,
+            });
+          })
+          .catch(() => {});
+        return true;
+      }
+
       this.toast(
         t('store.loadedFromCacheToast', {
           name: cached.rootFolder.name,
           count: cached.files.length,
         }),
         'info',
-        2600
+        2400
       );
     } else {
       this.setState({
@@ -1052,15 +1286,28 @@ export class Store {
     }
 
     try {
-      const album = await loadSharedAlbumWithApiKey(cleanFolderId, cleanApiKey, (prog) => {
-        if (reqSeq !== this.connectSeq || !this.state.loading) return;
-        this.setState({
-          loadingText: t('store.scanningProgress', {
-            folders: prog.folderCount,
-            files: prog.fileCount,
-          }),
-        });
-      });
+      const album = await loadSharedAlbumWithApiKey(
+        cleanFolderId,
+        cleanApiKey,
+        (prog) => {
+          if (reqSeq !== this.connectSeq || !this.state.loading) return;
+          this.setState({
+            loadingText: t('store.scanningProgress', {
+              folders: prog.folderCount,
+              files: prog.fileCount,
+            }),
+          });
+        },
+        keepVisible
+          ? null
+          : (batch) =>
+              this._handleStreamingBatch(reqSeq, batch, {
+                authType: 'apikey',
+                folderId: cleanFolderId,
+                apiKey: cleanApiKey,
+                user,
+              })
+      );
       if (reqSeq !== this.connectSeq) return false;
 
       if (this.state.loading) {
@@ -1098,7 +1345,7 @@ export class Store {
         }
       }
 
-      if (keepVisible && this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId) {
+      if ((keepVisible || this.state.files.length > 0) && this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId) {
         const merged = this._mergeFreshWithLocalEdits(
           this.state.membersData,
           membersData,
@@ -1123,25 +1370,13 @@ export class Store {
         };
       }
 
-      let recent = this.state.recentAlbums;
-      if (remember) {
-        recent = [
-          {
-            folderId: cleanFolderId,
-            name: album.rootFolder.name,
-            authType: 'apikey',
-            apiKey: cleanApiKey,
-            updatedAt: Date.now(),
-          },
-          ...this.state.recentAlbums.filter((a) => a.folderId !== cleanFolderId),
-        ].slice(0, 6);
-
-        try {
-          localStorage.setItem(RECENT_KEY, JSON.stringify(recent));
-        } catch {
-          // Ignore
-        }
-      }
+      const recent = this._recordRecentAlbum({
+        folderId: cleanFolderId,
+        name: album.rootFolder.name,
+        authType: 'apikey',
+        apiKey: cleanApiKey,
+        remember,
+      });
 
       try {
         localStorage.setItem(localStorageKey, JSON.stringify({ tagSchema, membersData }));
@@ -1166,64 +1401,20 @@ export class Store {
 
       this._updateUrlHash(cleanFolderId, '');
 
-      const sameActiveAlbum = this.state.mode === 'gdrive' && this.state.folderId === cleanFolderId;
-      const folderIds = new Set(album.folders.map((f) => f.id));
-      const fileIds = new Set(album.files.map((f) => f.id));
-      const nextSelectedIds = sameActiveAlbum
-        ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => fileIds.has(id)))
-        : new Set();
-
       const msgKey = localMetaSupported ? 'store.syncApiKeySynced' : 'store.syncApiKeyLocal';
-
-      this.setState({
-        mode: 'gdrive',
+      this._commitLoadedAlbumState({
         authType: 'apikey',
-        localMetaSupported,
-        loading: false,
-        loadingText: '',
-        backgroundRefreshing: false,
-        cacheRestoredAt: Date.now(),
-        syncStatus: localMetaSupported ? 'synced' : 'readonly',
-        syncMessageKey: msgKey,
-        syncMessage: t(msgKey),
-        rootFolder: album.rootFolder,
-        folders: album.folders,
-        files: album.files,
-        metaFolderId: null,
-        canWrite: true,
-        tagSchemaFileId: null,
+        folderId: cleanFolderId,
+        album,
         tagSchema,
+        tagSchemaFileId: null,
         memberFilesById: {},
         membersData,
-        activeFolderId:
-          sameActiveAlbum && folderIds.has(this.state.activeFolderId)
-            ? this.state.activeFolderId
-            : album.rootFolder.id,
-        selectedPhotoIds: nextSelectedIds,
-        lastClickedPhotoId:
-          sameActiveAlbum && fileIds.has(this.state.lastClickedPhotoId)
-            ? this.state.lastClickedPhotoId
-            : null,
-        focusedPhotoId:
-          sameActiveAlbum && fileIds.has(this.state.focusedPhotoId)
-            ? this.state.focusedPhotoId
-            : album.files[0]?.id || null,
-        lightboxPhotoId:
-          sameActiveAlbum && fileIds.has(this.state.lightboxPhotoId)
-            ? this.state.lightboxPhotoId
-            : null,
-        ...(sameActiveAlbum
-          ? {}
-          : {
-              quickView: 'all',
-              minRating: 0,
-              memberFilterId: null,
-              ratingScope: 'avg',
-              selectedTagIds: new Set(),
-              searchQuery: '',
-            }),
-        recentAlbums: recent,
-        modal: null,
+        canWrite: true,
+        localMetaSupported,
+        syncStatus: localMetaSupported ? 'synced' : 'readonly',
+        syncMessageKey: msgKey,
+        recent,
       });
 
       if (!cached || forceRescan) {
@@ -1252,6 +1443,57 @@ export class Store {
     }
   }
 
+  async restoreExpiredOAuthCacheOrPrompt({ clientId, folderInput }) {
+    const cleanClientId = String(clientId || '').trim();
+    const cleanFolderId = parseDriveFolderId(folderInput);
+    const savedUser = getSavedOAuthUser(cleanClientId);
+    const cached = cleanFolderId ? await getCachedAlbum('oauth', cleanFolderId) : null;
+
+    if (cached) {
+      this._hydrateFromAlbumCache(cached, {
+        authType: 'oauth',
+        folderId: cleanFolderId,
+        clientId: cleanClientId,
+        user: savedUser || {
+          id: 'saved-oauth',
+          name: 'Google',
+          email: '',
+          picture: '',
+          color: '#38bdf8',
+        },
+        syncStatus: 'readonly',
+        syncMessageKey: 'store.syncCachedSessionExpired',
+        backgroundRefreshing: false,
+      });
+      this.setState({ savedOAuthUser: savedUser });
+      this._updateUrlHash(cleanFolderId, cleanClientId);
+      this.toast(
+        t('store.cachedSessionReconnectHint', {
+          email: savedUser?.email || savedUser?.name || 'Google',
+        }),
+        'info'
+      );
+      return true;
+    }
+
+    this.setState({
+      authType: 'oauth',
+      clientId: cleanClientId,
+      folderId: folderInput,
+      savedOAuthUser: savedUser,
+    });
+    this.openModal('connect');
+    if (savedUser?.email || savedUser?.name) {
+      this.toast(
+        t('store.sessionExpiredReconnect', {
+          email: savedUser.email || savedUser.name,
+        }),
+        'info'
+      );
+    }
+    return false;
+  }
+
   async restoreSavedSession() {
     const prefs = loadConnectPrefs();
     if (!prefs.rememberCredentials || !prefs.autoConnect || !prefs.folderId) {
@@ -1277,50 +1519,10 @@ export class Store {
         });
       }
 
-      const savedUser = getSavedOAuthUser(prefs.clientId);
-      const cleanFolderId = parseDriveFolderId(prefs.folderId);
-      const cached = cleanFolderId ? await getCachedAlbum('oauth', cleanFolderId) : null;
-
-      if (cached) {
-        this._hydrateFromAlbumCache(cached, {
-          authType: 'oauth',
-          folderId: cleanFolderId,
-          clientId: prefs.clientId,
-          user: savedUser || {
-            id: 'saved-oauth',
-            name: 'Google',
-            email: '',
-            picture: '',
-            color: '#38bdf8',
-          },
-          syncStatus: 'readonly',
-          syncMessageKey: 'store.syncCachedSessionExpired',
-        });
-        this.setState({ savedOAuthUser: savedUser });
-        this._updateUrlHash(cleanFolderId, prefs.clientId);
-        this.toast(
-          t('store.cachedSessionReconnectHint', {
-            email: savedUser?.email || savedUser?.name || 'Google',
-          }),
-          'info'
-        );
-        return true;
-      }
-
-      this.setState({
-        authType: 'oauth',
+      return this.restoreExpiredOAuthCacheOrPrompt({
         clientId: prefs.clientId,
-        folderId: prefs.folderId,
-        savedOAuthUser: savedUser,
+        folderInput: prefs.folderId,
       });
-      this.openModal('connect');
-      this.toast(
-        t('store.sessionExpiredReconnect', {
-          email: savedUser?.email || savedUser?.name || 'Google',
-        }),
-        'info'
-      );
-      return false;
     }
 
     return false;
@@ -1476,8 +1678,23 @@ export class Store {
   }
 
   getAggregatedItemMeta(fileId) {
+    const membersData = this.state.membersData || {};
+    const tagSchema = this.state.tagSchema;
     const myId = this.state.currentUser?.id || 'me';
-    const membersEntries = Object.entries(this.state.membersData || {});
+    const refs = this._aggMetaRefs;
+    if (
+      !refs ||
+      refs.membersData !== membersData ||
+      refs.tagSchema !== tagSchema ||
+      refs.myId !== myId
+    ) {
+      this._aggMetaCache.clear();
+      this._aggMetaRefs = { membersData, tagSchema, myId };
+    } else if (this._aggMetaCache.has(fileId)) {
+      return this._aggMetaCache.get(fileId);
+    }
+
+    const membersEntries = Object.entries(membersData);
     const ratingsByMember = [];
     const notesByMember = [];
     const tagLatest = new Map();
@@ -1551,7 +1768,7 @@ export class Store {
       a.member.id === myId ? -1 : b.member.id === myId ? 1 : b.rating - a.rating
     );
 
-    return {
+    const result = {
       myRating,
       myFavorite,
       myNote,
@@ -1562,6 +1779,8 @@ export class Store {
       notesByMember,
       activeTagIds,
     };
+    this._aggMetaCache.set(fileId, result);
+    return result;
   }
 
   getMembersSummary() {
@@ -1616,6 +1835,11 @@ export class Store {
 
   getVisiblePhotos() {
     const {
+      files,
+      folders,
+      membersData,
+      tagSchema,
+      currentUser,
       activeFolderId,
       includeSubfolders,
       quickView,
@@ -1626,7 +1850,36 @@ export class Store {
       tagMatchMode,
       searchQuery,
       sortBy,
+      lang,
     } = this.state;
+
+    const myId = currentUser?.id || '';
+    const tagList = Array.from(selectedTagIds);
+    const tagKey = tagList.length > 0 ? [...tagList].sort().join(',') : '';
+    const cached = this._visiblePhotosCache;
+    if (
+      cached &&
+      cached.files === files &&
+      cached.filesLen === files.length &&
+      cached.folders === folders &&
+      cached.foldersLen === folders.length &&
+      cached.membersData === membersData &&
+      cached.tagSchema === tagSchema &&
+      cached.myId === myId &&
+      cached.activeFolderId === activeFolderId &&
+      cached.includeSubfolders === includeSubfolders &&
+      cached.quickView === quickView &&
+      cached.ratingScope === ratingScope &&
+      cached.minRating === minRating &&
+      cached.memberFilterId === memberFilterId &&
+      cached.tagKey === tagKey &&
+      cached.tagMatchMode === tagMatchMode &&
+      cached.searchQuery === searchQuery &&
+      cached.sortBy === sortBy &&
+      cached.lang === lang
+    ) {
+      return cached.result;
+    }
 
     const allowedFolderIds = activeFolderId
       ? includeSubfolders
@@ -1635,12 +1888,11 @@ export class Store {
       : null;
 
     const query = searchQuery.trim().toLowerCase();
-    const tagList = Array.from(selectedTagIds);
-    const schemaTags = this.state.tagSchema?.tags || {};
+    const schemaTags = tagSchema?.tags || {};
     const locale = getLocaleTag();
 
     const matched = [];
-    for (const file of this.state.files) {
+    for (const file of files) {
       if (allowedFolderIds && !allowedFolderIds.has(file.parentId)) continue;
 
       const meta = this.getAggregatedItemMeta(file.id);
@@ -1702,7 +1954,29 @@ export class Store {
       }
     });
 
-    return matched.map((x) => x.file);
+    const result = matched.map((x) => x.file);
+    this._visiblePhotosCache = {
+      files,
+      filesLen: files.length,
+      folders,
+      foldersLen: folders.length,
+      membersData,
+      tagSchema,
+      myId,
+      activeFolderId,
+      includeSubfolders,
+      quickView,
+      ratingScope,
+      minRating,
+      memberFilterId,
+      tagKey,
+      tagMatchMode,
+      searchQuery,
+      sortBy,
+      lang,
+      result,
+    };
+    return result;
   }
 
   // ---------- Mutation Actions (0ms Optimistic UI + Debounced Sync) ----------

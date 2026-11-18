@@ -1894,26 +1894,26 @@ def verify_mobile_ux(parsed_js):
         if missing:
             errors.append(f"{rel_js} missing touch handler(s): {missing}")
 
-    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v3'
+    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v4'
     checks += 1
     sw_path = ROOT_DIR / "sw.js"
     if not sw_path.is_file():
         errors.append("Missing sw.js")
     else:
         sw_toks = tokenize_js(sw_path.read_text(encoding="utf-8"), filename="sw.js")
-        has_v3 = any(
+        has_v4 = any(
             sw_toks[i].kind == "IDENT"
             and sw_toks[i].value == "CACHE_NAME"
             and sw_toks[i + 1].kind == "PUNCT"
             and sw_toks[i + 1].value == "="
             and sw_toks[i + 2].kind == "STRING"
-            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v3"
+            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v4"
             for i in range(len(sw_toks) - 2)
         )
-        if not has_v3:
-            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v3'")
+        if not has_v4:
+            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v4'")
 
-    # 5. albumCache.js and renderGallery.js waterfall exports
+    # 5. albumCache.js and renderGallery.js exports
     checks += 1
     album_cache_res = (ROOT_DIR / "src" / "storage" / "albumCache.js").resolve()
     if album_cache_res not in parsed_js:
@@ -1928,8 +1928,10 @@ def verify_mobile_ux(parsed_js):
     if gallery_res not in parsed_js:
         errors.append("src/ui/renderGallery.js missing or failed JS parsing")
     else:
-        if "computeWaterfallColumns" not in parsed_js[gallery_res]["exports"]:
-            errors.append("src/ui/renderGallery.js missing export computeWaterfallColumns")
+        gal_exports = parsed_js[gallery_res]["exports"]
+        for sym in ("computeWaterfallColumns", "previewGalleryRowHeight", "relayoutGalleryOnResize"):
+            if sym not in gal_exports:
+                errors.append(f"src/ui/renderGallery.js missing export {sym}")
 
     # 5. README.md preserves exact user-edited ## Design Inspiration & Independence section
     checks += 1

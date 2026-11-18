@@ -10,10 +10,10 @@ import {
 } from './ui/renderCompare.js';
 import {
   bindGalleryEvents,
+  relayoutGalleryOnResize,
   renderBatchBar,
   renderGalleryGrid,
   renderGallerySubbar,
-  resetGallerySignature,
 } from './ui/renderGallery.js';
 import {
   bindHeaderEvents,
@@ -61,10 +61,10 @@ function renderAll() {
   const visiblePhotos = store.getVisiblePhotos();
   renderHeader(topHeader, demoBanner, toastContainer, store);
   renderSidebar(sidebarPanel, store);
+  renderInspector(inspectorPanel, store);
   renderGallerySubbar(gallerySubbar, store, visiblePhotos);
   renderBatchBar(batchBar, store, visiblePhotos);
   renderGalleryGrid(galleryGrid, galleryScroll, store, visiblePhotos);
-  renderInspector(inspectorPanel, store);
   renderLightbox(lightboxRoot, store, visiblePhotos);
   renderCompare(compareRoot, store);
   renderModals(modalRoot, store);
@@ -111,8 +111,7 @@ if (typeof ResizeObserver !== 'undefined' && galleryScroll) {
     lastWidth = nextWidth;
     cancelAnimationFrame(rafId);
     rafId = requestAnimationFrame(() => {
-      resetGallerySignature();
-      renderGalleryGrid(galleryGrid, galleryScroll, store, store.getVisiblePhotos());
+      relayoutGalleryOnResize(galleryGrid, galleryScroll, store);
     });
   });
   resizeObserver.observe(galleryScroll);
@@ -189,7 +188,10 @@ function handleInitialUrlHash() {
       reuseSession: true,
     });
   } else {
-    store.openModal('connect');
+    store.restoreExpiredOAuthCacheOrPrompt({
+      clientId,
+      folderInput,
+    });
   }
 }
 

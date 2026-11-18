@@ -25,7 +25,7 @@
 - **Document Shell Meta Tags ([`index.html`](index.html))**:
   - Includes `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />`, `<meta name="theme-color" content="#0b0e14" />`, `<meta name="apple-mobile-web-app-capable" content="yes" />`, `<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />`, `<meta name="apple-mobile-web-app-title" content="DriveLens" />`, `<link rel="manifest" href="./manifest.webmanifest" />`, and `<link rel="apple-touch-icon" href="./icons/icon-192.png" />`.
 - **Service Worker ([`sw.js`](sw.js))**:
-  - Maintains `CACHE_NAME = 'drivelens-shell-v3'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
+  - Maintains `CACHE_NAME = 'drivelens-shell-v4'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
   - Deletes older `drivelens-*` cache buckets during `activate` and calls `self.clients.claim()`.
   - Intercepts only same-origin `GET` requests excluding `/api/` paths (so `serve.py` `/api/meta`, Google Drive API calls, GIS scripts, and `googleusercontent.com` thumbnails always bypass the Service Worker cache). Uses a **Network-First** strategy that refreshes cached `response.type === 'basic'` assets online and falls back to `caches.match()` or `./index.html` (for navigations) when offline.
 - **Install Prompt Lifecycle (`src/main.js`, `src/state/store.js`, `src/ui/renderHeader.js`)**:
@@ -68,7 +68,7 @@ Browser / Installed PWA Startup (src/main.js)
 drivelens/
 ├── index.html                   # Single-page shell (<html lang="en">, viewport-fit=cover), PWA meta links, 14 mount IDs
 ├── manifest.webmanifest         # Web App Manifest (relative ./ scope, standalone display, icon references)
-├── sw.js                        # Service Worker (drivelens-shell-v3 precache, Network-First same-origin shell cache)
+├── sw.js                        # Service Worker (drivelens-shell-v4 precache, Network-First same-origin shell cache)
 ├── icons/
 │   ├── icon.svg                 # Scalable vector app icon (any maskable)
 │   ├── icon-192.png             # 192x192 RGBA PNG app icon & apple-touch-icon
@@ -89,7 +89,7 @@ drivelens/
 └── src/
     ├── main.js                  # Entry point, SW registration, beforeinstallprompt, mobile nav/drawer, shortcuts
     ├── constants.js             # Empty runtime defaults (DEFAULT_API_KEY/CLIENT_ID/FOLDER_ID), concurrency/debounce
-    ├── i18n.js                  # Bilingual EN/ZH dictionary (416 mirrored keys); sole repository home for CJK strings
+    ├── i18n.js                  # Bilingual EN/ZH dictionary (433 mirrored keys); sole repository home for CJK strings
     ├── api/
     │   ├── gdrive.js            # GIS OAuth + hint/remember persistence, API Key & OAuth BFS crawlers, original download
     │   └── metaSync.js          # Cloud .drivelens/ LWW+isolated member sync & non-throwing ./api/meta helpers
@@ -149,6 +149,7 @@ flowchart TD
 
     UI_HDR --> ICONS["src/ui/icons.js"]
     UI_HDR --> UI_CMP
+    UI_HDR --> UI_GAL
     UI_HDR --> DEMO
     UI_HDR --> I18N
     UI_SB --> ICONS
@@ -172,20 +173,20 @@ flowchart TD
 | Module | Key Exports | Responsibility |
 | --- | --- | --- |
 | `src/constants.js` | `APP_CONFIG` | Empty credential placeholders (`DEFAULT_API_KEY`, `DEFAULT_CLIENT_ID`, `DEFAULT_FOLDER_ID`), `APP_TITLE`, `THUMBNAIL_CONCURRENCY` (`6`), `SYNC_DEBOUNCE_MS` (`800`) |
-| `src/i18n.js` | `SUPPORTED_LANGS`, `MESSAGES`, `getLang`, `setLangCode`, `getLocaleTag`, `t` | Strict `'en'`-default localization runtime, 416-key EN/ZH parity, `{param}` interpolation, sole CJK string store |
+| `src/i18n.js` | `SUPPORTED_LANGS`, `MESSAGES`, `getLang`, `setLangCode`, `getLocaleTag`, `t` | Strict `'en'`-default localization runtime, 433-key EN/ZH parity, `{param}` interpolation, sole CJK string store |
 | `serve.py` | `create_server`, `NoCacheStaticHandler`, `ReusableThreadingHTTPServer` | Static serving with strict MIME types (`.js`/`.mjs`, `.css`, `.webmanifest`, `.png`), `--open`/`--dry-run`, thread-safe `GET/POST /api/meta` |
-| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 14 core shell files (`drivelens-shell-v3`), Network-First same-origin cache, excludes cross-origin & `/api/` |
-| `src/api/gdrive.js` | `parseDriveFolderId`, `ensureGoogleIdentityLoaded`, `getCachedSession`, `getSavedOAuthUser`, `clearSession`, `authenticateGoogle`, `loadSharedAlbum`, `loadSharedAlbumWithApiKey`, `downloadOriginalFile` | OAuth 2.0 GIS token & hint flow, dual-storage session cache, API Key album loader, shared BFS media crawler, file download |
+| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 14 core shell files (`drivelens-shell-v4`), Network-First same-origin cache, excludes cross-origin & `/api/` |
+| `src/api/gdrive.js` | `parseDriveFolderId`, `ensureGoogleIdentityLoaded`, `getCachedSession`, `getSavedOAuthUser`, `clearSession`, `authenticateGoogle`, `loadSharedAlbum`, `loadSharedAlbumWithApiKey`, `downloadOriginalFile` | OAuth 2.0 GIS token & hint flow, dual-storage session cache, API Key album loader, shared BFS media crawler (`onBatch` streaming), file download |
 | `src/api/metaSync.js` | `META_FOLDER_NAME`, `TAGS_SCHEMA_FILENAME`, `sanitizeMemberKey`, `ensureMetaFolder`, `mergeTagSchemas`, `loadAlbumMetadata`, `saveMemberMetadata`, `saveTagSchema`, `loadLocalServerMeta`, `saveLocalServerMeta` | `.drivelens/` cloud JSON persistence, LWW tag schema merge, non-throwing `./api/meta` client |
-| `src/storage/albumCache.js` | `buildAlbumCacheKey`, `getCachedAlbum`, `setCachedAlbum`, `removeCachedAlbum`, `clearAllAlbumCaches` | IndexedDB + `localStorage` fallback SWR directory/metadata cache (max 12 albums; excludes secrets) |
-| `src/storage/imageLoader.js` | `buildDriveThumbUrl`, `loadPhotoIntoElement`, `fetchAuthorizedMediaBlobUrl`, `clearImageCache` | 6-concurrency image queue, `IntersectionObserver` lazy loading, expired-thumb recovery & 400-blob IDB cache |
-| `src/state/store.js` | `Store`, `getTagColors`, `TAG_COLORS`, `loadConnectPrefs` | Pub/sub store, SWR cache hydration/background sync, UI prefs (`drivelens_ui_prefs_v1`), `setLanguage`, `clearLocalCache` |
+| `src/storage/albumCache.js` | `buildAlbumCacheKey`, `getCachedAlbum`, `setCachedAlbum`, `removeCachedAlbum`, `clearAllAlbumCaches` | IndexedDB + `localStorage` fallback cache-first (`30 min` TTL) directory/metadata cache (max 12 albums; excludes secrets) |
+| `src/storage/imageLoader.js` | `buildDriveThumbUrl`, `loadPhotoIntoElement`, `fetchAuthorizedMediaBlobUrl`, `clearImageCache` | 6-concurrency image queue, `IntersectionObserver` lazy loading, `decoding="async"`, expired-thumb recovery & 400-blob IDB cache |
+| `src/state/store.js` | `Store`, `getTagColors`, `TAG_COLORS`, `loadConnectPrefs` | Pub/sub store, memoized selectors, 30-min cache-first hydration + metadata-only sync, UI prefs (`drivelens_ui_prefs_v1`), `setLanguage`, `clearLocalCache` |
 | `src/demo/demoAlbum.js` | `DEMO_STORAGE_KEY`, `DEMO_PERSONAS`, `DEFAULT_TAG_SCHEMA`, `getDemoPersonas`, `localizeDemoState`, `createDemoDataset`, `saveDemoState`, `resetDemoState` | Zero-CJK offline demo album builder (`5` folders, `16` items, `3` personas, `8` default tags) reading `MESSAGES[code]` |
-| `src/ui/renderHeader.js` | `renderHeader`, `bindHeaderEvents`, `renderMobileNav`, `bindMobileNavEvents` | Header skeleton, 3-view layout switcher, `#langSelect`, `[data-header="install-app"]`, `#mobileNavBar`, search popover |
-| `src/ui/renderSidebar.js` | `renderSidebar`, `bindSidebarEvents` | Mobile drawer header, gallery views (`Justified`/`Waterfall`/`Grid`), folder tree, star filter, collaborators, tags |
-| `src/ui/renderGallery.js` | `computeJustifiedRows`, `computeWaterfallColumns`, `renderGallerySubbar`, `renderBatchBar`, `renderGalleryGrid`, `resetGallerySignature`, `bindGalleryEvents` | Justified/Waterfall masonry/Square Grid layouts, `Select` subbar button, long-press & single-tap Lightbox UX |
-| `src/ui/renderInspector.js` | `renderInspector`, `bindInspectorEvents` | Mobile drawer header across all render states, preview preservation, note focus guard, collaborator scores, EXIF |
-| `src/ui/renderLightbox.js` | `renderLightbox`, `bindLightboxEvents` | 2048px image / video stream / iframe preview, mouse + touch pinch/double-tap/pan/swipe gestures, filmstrip |
+| `src/ui/renderHeader.js` | `renderHeader`, `bindHeaderEvents`, `renderMobileNav`, `bindMobileNavEvents` | Header skeleton, 3-view layout switcher, RAF slider preview (`input` -> `previewGalleryRowHeight`), `#langSelect`, `[data-header="install-app"]`, `#mobileNavBar`, search popover |
+| `src/ui/renderSidebar.js` | `renderSidebar`, `bindSidebarEvents` | Signature-guarded render, O(N + F) folder counts, mobile drawer header, gallery views, folders, filters, tags |
+| `src/ui/renderGallery.js` | `computeJustifiedRows`, `computeWaterfallColumns`, `renderGallerySubbar`, `renderBatchBar`, `renderGalleryGrid`, `previewGalleryRowHeight`, `relayoutGalleryOnResize`, `resetGallerySignature`, `bindGalleryEvents` | DOM-pooled Justified/Waterfall/Grid layouts, `80`-item scroll windowing, borderless cards (no filename fallback), floating month pill + back-to-top, touch UX |
+| `src/ui/renderInspector.js` | `renderInspector`, `bindInspectorEvents` | Signature-guarded render, mobile drawer header across all states, preview reuse, note focus guard, localized EXIF |
+| `src/ui/renderLightbox.js` | `renderLightbox`, `bindLightboxEvents` | Ambient blurred backdrop, 2048px image / video stream / iframe preview, mouse + touch pinch/double-tap/pan/swipe gestures, filmstrip |
 | `src/ui/renderCompare.js` | `openCompare`, `closeCompare`, `isCompareOpen`, `renderCompare`, `bindCompareEvents` | 2–4 pane side-by-side view with mouse + touch pinch/double-tap/synced drag-pan & inline HUD patching |
 | `src/ui/renderModals.js` | `renderModals`, `bindModalEvents` | 2-tab Connect (`#rememberApiKeyCheck`, `#rememberOAuthCheck`, saved OAuth account badge, `[data-action="forget-creds"]`), Tag, Export, Shortcuts modals |
 | `src/ui/icons.js` | `icon`, `escapeHtml`, `escapeAttr` | Inline SVG icon registry (`globe`, `appWindow`, etc.) & XSS-safe HTML/attribute escaping |
@@ -201,7 +202,7 @@ flowchart TD
 - **Strict `'en'` Default**: `getLang()` reads `localStorage.getItem('drivelens_lang_v1')` and returns `'zh'` **only** when that exact key equals `'zh'`. It deliberately **never inspects `navigator.language`**, guaranteeing deterministic English startup on any OS locale unless explicitly toggled by the user or URL hash `#lang=zh`.
 - **DOM & Document Sync**: `setLangCode(lang)` normalizes input (`'zh'` or `'en'`), persists to `drivelens_lang_v1`, updates `document.documentElement.lang` (`'zh-CN'` vs `'en'`), and updates `document.title = t('app.title')`.
 - **Locale-Aware Formatting**: `getLocaleTag()` returns `'zh-CN'` or `'en-US'`, consumed by `Store.getActiveTagList()`, `Store.getVisiblePhotos()` (`nameAsc` sorting), `renderSidebar.js` folder sorting, and `renderInspector.js` `formatDate()`.
-- **Translation Helper**: `t(key, params = {})` resolves `MESSAGES[currentLang]?.[key] ?? MESSAGES.en[key] ?? key` and substitutes `{param}` placeholders across all 416 mirrored keys in `MESSAGES.en` and `MESSAGES.zh`.
+- **Translation Helper**: `t(key, params = {})` resolves `MESSAGES[currentLang]?.[key] ?? MESSAGES.en[key] ?? key` and substitutes `{param}` placeholders across all 433 mirrored keys in `MESSAGES.en` and `MESSAGES.zh`.
 
 ### 3.2 Language Switching & Non-Destructive Demo Localization
 
@@ -247,7 +248,7 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 
 ### 4.4 Shared Recursive BFS Media Crawler (`crawlAlbumTree`)
 
-- Traverses nested subfolders via breadth-first queue (`MAX_DEPTH = 6`, `BATCH_SIZE = 4`, cycle-guarded via `visited` `Set`).
+- Traverses nested subfolders via breadth-first queue (`MAX_DEPTH = 6`, `BATCH_SIZE = 6`, cycle-guarded via `visited` `Set`), emitting incremental `onBatch` snapshots (~850ms cadence) on cold/manual scans.
 - Queries `'${folderId}' in parents and trashed = false and (mimeType = 'application/vnd.google-apps.folder' or mimeType contains 'image/' or mimeType contains 'video/')` with `pageSize=200`, `supportsAllDrives=true`, and `includeItemsFromAllDrives=true`.
 - Requests `thumbnailLink`, `webViewLink`, `webContentLink`, `imageMediaMetadata`, and `videoMediaMetadata` upfront so EXIF and justified aspect ratios render without downloading full files.
 - Captures `.drivelens` (`META_FOLDER_NAME`) under the root folder in OAuth mode (`captureMetaFolder: true`) and skips all dot-prefixed hidden directories (`entry.name.startsWith('.')`).
@@ -255,12 +256,12 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 ### 4.5 6-Concurrency Image Queue, `no-referrer` & IndexedDB Fallback (`src/storage/imageLoader.js`)
 
 1. **Global Concurrency Cap**: `ImageLoadQueue` limits simultaneous image resolutions to `APP_CONFIG.THUMBNAIL_CONCURRENCY` (`6`) to avoid HTTP 429/403 rate limiting.
-2. **Viewport Lazy Loading**: Gallery cards use `IntersectionObserver` (`rootMargin: '260px 0px'`, tracked via `WeakMap` `activeObservers`), while Inspector/Compare/Lightbox use `eager: true`.
-3. **URL Sizing (`buildDriveThumbUrl`)**: Rewrites `=s\d+` on `thumbnailLink` (`220` filmstrip, `600` gallery/inspector, `1600` compare, `2048` lightbox) or falls back to `https://drive.google.com/thumbnail?id=<id>&sz=w<targetSize>` when `thumbnailLink` is absent.
+2. **Viewport Lazy Loading**: Gallery cards use `IntersectionObserver` (`rootMargin: '260px 0px'`, tracked via `WeakMap` `activeObservers`), while Inspector/Compare/Lightbox use `eager: true`; gallery card images set `decoding = 'async'`.
+3. **URL Sizing (`buildDriveThumbUrl`)**: Rewrites `=s\d+` on `thumbnailLink` (`220` filmstrip, `480` gallery cards, `600` inspector, `1600` compare, `2048` lightbox) or falls back to `https://drive.google.com/thumbnail?id=<id>&sz=w<targetSize>` when `thumbnailLink` is absent.
 4. **Referer Bypass & Multi-Tier Fallback (`resolveImageSrc`)**:
    - Sets `referrerPolicy = 'no-referrer'` on both probe `Image()` and DOM `<img>` elements to avoid `googleusercontent.com` Referer rejections.
    - If `thumbnailLink` is missing and the `drive.google.com/thumbnail` probe fails, tries `https://lh3.googleusercontent.com/d/<id>=s<size>`.
-   - Finally checks in-memory `objectUrlCache` and IndexedDB **`drivelens-img-cache`** (object store `blobs`, indexed by `createdAt`, capped at `MAX_CACHE_ENTRIES = 120` oldest-evicted) before calling `fetchMediaBlobWithRetry` (`alt=media&supportsAllDrives=true` with Bearer token or `&key=`, single 1200ms retry on `429`/`503`).
+   - Finally checks in-memory `objectUrlCache` and IndexedDB **`drivelens-img-cache`** (object store `blobs`, indexed by `createdAt`, capped at `MAX_CACHE_ENTRIES = 400` oldest-evicted) before calling `fetchMediaBlobWithRetry` (`alt=media&supportsAllDrives=true` with Bearer token or `&key=`, single 1200ms retry on `429`/`503`).
 
 ---
 
@@ -292,8 +293,8 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 | `localStorage` | `drivelens_demo_state_v1` | Offline demo album state (`tagSchema`, `membersData`, `activePersonaId`) |
 | `localStorage` | `drivelens_apikey_meta_<folderId>` | Local mirror/fallback for API Key mode |
 | `localStorage` | `drivelens_readonly_<folderId>_<myId>` | Local fallback for OAuth Viewer-only folders |
-| `IndexedDB` | `drivelens-img-cache` (`blobs`) | Cached `alt=media` image/video Blobs (max 120 entries) |
-| `Cache Storage` | `drivelens-shell-v2` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
+| `IndexedDB` | `drivelens-img-cache` (`blobs`) | Cached `alt=media` image/video Blobs (max 400 entries) |
+| `Cache Storage` | `drivelens-shell-v4` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
 
 ---
 
@@ -301,11 +302,12 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 
 ### 6.1 0ms Optimistic Updates & 800ms Debounced Sync
 
-`Store` updates in-memory state and calls `emit()` synchronously (`0ms` UI feedback) on every rating, favorite, tag, or note edit, while `_persistChanges` batches cloud or `/api/meta` writes using independent 800ms timers (`APP_CONFIG.SYNC_DEBOUNCE_MS`).
+`Store` updates in-memory state and calls `emit()` synchronously (`0ms` UI feedback) on every rating, favorite, tag, or note edit, while `_persistChanges` batches cloud or `/api/meta` writes using independent 800ms timers (`APP_CONFIG.SYNC_DEBOUNCE_MS`). `Store` also memoizes `getPhotoTimestamp`, `getAggregatedItemMeta`, and `getVisiblePhotos` (`WeakMap` / reference-checked caches) so UI toggles, slider drags, and selection updates avoid redundant sorting or metadata aggregation.
 
-### 6.2 Signature-Patched DOM & Justified Row Layout
+### 6.2 DOM-Pooled Gallery, Dynamic Windowing & Instant Panel Toggling
 
-- **No-Flicker In-Place Patching**: `renderGalleryGrid` checks `sig = "${lang}|${isMobile ? 'm' : 'd'}|${layoutMode}|${rowHeight}|${Math.round(containerWidth)}|${visibleIds}"` to patch `.is-selected`, `.is-focused`, and `.photo-overlay` without recreating `<img>` nodes; `renderInspector` guards `#myNoteInput` focus and reuses `.inspector-preview img`; `renderLightbox` patches HUD/filmstrip when `activeLightboxPhotoId` and `activeLightboxLang` match; `renderCompare` patches `.compare-pane-hud` and zoom/pan transforms when `activeCompareKey` matches; `renderHeader` preserves `#searchInput` focus/cursor, `isSearchComposing` IME composition, `lang` dropdown rebuilds, `.mobile-search-open` state, and `[data-header="install-app"]` visibility.
+- **No-Flicker DOM Card/Row/Column Pooling & Windowing**: `renderGalleryGrid` maintains reusable card (`cardPool`, `480px` gallery thumbnails with `decoding="async"`), `.justified-row`, and `.waterfall-column` pools, mounting photos in `80`-item chunks (`PAGE_CHUNK = 80`) with an `IntersectionObserver` sentinel (`.gallery-load-sentinel`) and zero default filename overlays (unrated cards show optional hover-only EXIF metadata).
+- **60fps Slider & Instant Sidebar/Inspector Toggling**: `#rowHeightRange` `input` events call `previewGalleryRowHeight` (RAF-throttled) directly while `change` commits `store.setRowHeight`. Desktop `.sidebar.collapsed` and `.inspector.collapsed` switch via instant `display: none` (above `861px` / `1121px`, eliminating 220ms `margin-left`/`margin-right` flex-reflow storms), `renderAll()` applies inspector collapsed state before `renderGalleryGrid`, `renderSidebar` / `renderInspector` skip unchanged signatures (`O(N + F)` folder counts in sidebar), and `ResizeObserver` invokes `relayoutGalleryOnResize` with native CSS Grid reflow.
 - **Justified Rows (`computeJustifiedRows`)**: Clamps aspect ratio to `[0.45, 2.6]` (fallback `1.5`), breaks rows once `sumRatios * targetHeight + gap * (n - 1) >= safeWidth`, solves exact row height `(safeWidth - gap * (n - 1)) / sumRatios`, and caps the final incomplete row height at `Math.min(naturalHeight, targetHeight * 1.15)`.
 
 ### 6.3 Mobile Responsive & Touch UX Architecture
@@ -337,4 +339,4 @@ Run `python verify_project.py` (Python 3 stdlib only) to execute all 10 automate
 - **`[g]` Credential & Secret Hygiene (`verify_no_credentials_or_secrets`)**: Ensures zero credential config files (`config.js`, `.env*`, etc.) and zero API keys, Client IDs, personal emails, or local user paths appear anywhere in the repository.
 - **`[h]` i18n Integrity (`verify_i18n`)**: Validates `<html lang="en">`, strict `'en'` default, 100% key parity between `MESSAGES.en` and `MESSAGES.zh`, existence of all literal `t(...)` keys, and zero CJK characters in non-`i18n.js` repository files (including documentation, CSS, HTML, and source modules).
 - **`[i]` PWA Integrity (`verify_pwa`)**: Validates `manifest.webmanifest` (`display: 'standalone'`, `start_url: './'`), binary PNG dimensions (`192x192` and `512x512`) + SVG icon existence, `sw.js` syntax + `PRECACHE_ASSETS` disk resolution, and live `serve.py` MIME headers for `.webmanifest`, `sw.js`, and `.png`.
-- **`[j]` Mobile & Touch UX (`verify_mobile_ux`)**: Verifies `viewport-fit=cover` and `<nav id="mobileNavBar"` in `index.html`, safe-area CSS tokens and mobile/input rules across all 4 stylesheets, `touchstart`/`touchmove`/`touchend` handlers in `renderGallery.js`/`renderLightbox.js`/`renderCompare.js`, `'drivelens-shell-v2'` in `sw.js`, and preservation of the `README.md` `## Design Inspiration & Independence` section.
+- **`[j]` Mobile & Touch UX (`verify_mobile_ux`)**: Verifies `viewport-fit=cover` and `<nav id="mobileNavBar"` in `index.html`, safe-area CSS tokens and mobile/input rules across all 4 stylesheets, `touchstart`/`touchmove`/`touchend` handlers in `renderGallery.js`/`renderLightbox.js`/`renderCompare.js`, `'drivelens-shell-v4'` in `sw.js`, gallery exports, and preservation of the `README.md` `## Design Inspiration & Independence` section.

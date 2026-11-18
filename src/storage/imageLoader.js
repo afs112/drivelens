@@ -221,6 +221,7 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
     onLoaded = null,
   } = options;
   if (!imgEl || !item) return;
+  imgEl.decoding = 'async';
 
   if (item.isDemo) {
     imgEl.src = item.demoDataUrl;

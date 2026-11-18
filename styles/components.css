@@ -427,23 +427,23 @@
 .justified-gallery {
   display: flex;
   flex-direction: column;
-  gap: 8px;
+  gap: 4px;
 }
 
 .justified-row {
   display: flex;
-  gap: 8px;
+  gap: 4px;
 }
 
 .square-gallery {
   display: grid;
-  gap: 10px;
+  gap: 4px;
 }
 
 .waterfall-gallery {
   display: flex;
   align-items: flex-start;
-  gap: 10px;
+  gap: 4px;
   width: 100%;
 }
 
@@ -452,7 +452,7 @@
   min-width: 0;
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 4px;
 }
 
 .waterfall-gallery .photo-card {
@@ -462,29 +462,38 @@
 .photo-card {
   position: relative;
   overflow: hidden;
-  border-radius: var(--radius-sm);
+  border-radius: 2px;
   background: var(--bg-elevated);
-  border: 2px solid transparent;
+  border: none;
   cursor: pointer;
   flex-shrink: 0;
-  transition: transform var(--transition-fast), border-color var(--transition-fast), box-shadow var(--transition-fast);
+  contain: layout paint;
+  transition: none;
+}
+
+.photo-card::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  pointer-events: none;
+  z-index: 3;
 }
 
 .square-gallery .photo-card {
   aspect-ratio: 1 / 1;
 }
 
-.photo-card:hover {
-  box-shadow: var(--shadow-md);
+.photo-card:hover::after {
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.22);
 }
 
-.photo-card.is-focused {
-  border-color: var(--accent);
+.photo-card.is-focused::after {
+  box-shadow: inset 0 0 0 2px var(--accent);
 }
 
-.photo-card.is-selected {
-  border-color: var(--accent);
-  box-shadow: 0 0 0 2px var(--accent-soft);
+.photo-card.is-selected::after {
+  box-shadow: inset 0 0 0 2.5px var(--accent);
 }
 
 .photo-card img {
@@ -541,7 +550,8 @@
 }
 
 .photo-card:hover .photo-select-btn,
-.photo-card.is-selected .photo-select-btn {
+.photo-card.is-selected .photo-select-btn,
+.gallery-select-active .photo-select-btn {
   opacity: 1;
 }
 
@@ -571,8 +581,8 @@
   left: 0;
   right: 0;
   bottom: 0;
-  padding: 22px 8px 7px;
-  background: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, rgba(7, 9, 13, 0.85) 100%);
+  padding: 20px 8px 6px;
+  background: linear-gradient(180deg, rgba(0, 0, 0, 0) 0%, rgba(7, 9, 13, 0.8) 100%);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -581,6 +591,97 @@
   font-size: 11px;
   z-index: 2;
   opacity: 0.94;
+}
+
+.photo-overlay.is-empty {
+  display: none;
+}
+
+.photo-overlay.is-hover-only {
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--transition-fast);
+}
+
+@media (hover: hover) and (pointer: fine) {
+  .photo-card:hover .photo-overlay.is-hover-only {
+    opacity: 0.92;
+  }
+}
+
+.photo-overlay-exif {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  opacity: 0.86;
+  font-size: 10.5px;
+  letter-spacing: 0.01em;
+}
+
+.gallery-load-sentinel {
+  width: 100%;
+  height: 24px;
+  pointer-events: none;
+}
+
+.gallery-month-pill {
+  position: absolute;
+  left: 50%;
+  bottom: 18px;
+  transform: translateX(-50%) translateY(8px);
+  padding: 5px 12px;
+  border-radius: var(--radius-full);
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  border: 1px solid var(--border-subtle);
+  color: var(--text-primary);
+  font-size: 11.5px;
+  font-weight: 500;
+  letter-spacing: 0.01em;
+  box-shadow: var(--shadow-sm);
+  pointer-events: none;
+  opacity: 0;
+  z-index: 16;
+  transition: opacity var(--transition-fast), transform var(--transition-fast);
+}
+
+.gallery-month-pill.visible {
+  opacity: 1;
+  transform: translateX(-50%) translateY(0);
+}
+
+.gallery-back-top {
+  position: absolute;
+  right: 16px;
+  bottom: 16px;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  border: 1px solid var(--border-subtle);
+  background: var(--bg-glass);
+  backdrop-filter: blur(12px);
+  color: var(--text-primary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: var(--shadow-sm);
+  opacity: 0;
+  pointer-events: none;
+  transform: translateY(8px);
+  z-index: 16;
+  transition: opacity var(--transition-fast), transform var(--transition-fast), border-color var(--transition-fast);
+}
+
+.gallery-back-top:hover {
+  border-color: var(--border-focus);
+  color: var(--accent);
+}
+
+.gallery-back-top.visible {
+  opacity: 1;
+  pointer-events: auto;
+  transform: translateY(0);
 }
 
 .photo-overlay-left,
@@ -815,9 +916,30 @@
   display: flex;
   flex-direction: column;
   color: #f8fafc;
+  overflow: hidden;
+}
+
+.lightbox-ambient-bg {
+  position: absolute;
+  inset: -12%;
+  width: 124%;
+  height: 124%;
+  object-fit: cover;
+  filter: blur(52px) saturate(1.35) brightness(0.38);
+  opacity: 0;
+  pointer-events: none;
+  z-index: 0;
+  transition: opacity 260ms ease;
+}
+
+.lightbox-ambient-bg.loaded,
+.lightbox-ambient-bg.is-loaded {
+  opacity: 0.55;
 }
 
 .lightbox-topbar {
+  position: relative;
+  z-index: 2;
   height: calc(52px + var(--safe-top));
   flex-shrink: 0;
   padding: var(--safe-top) 16px 0;
@@ -831,9 +953,10 @@
 }
 
 .lightbox-stage {
+  position: relative;
+  z-index: 2;
   flex: 1;
   min-height: 0;
-  position: relative;
   display: flex;
   align-items: center;
   justify-content: center;
@@ -899,6 +1022,8 @@
 .lightbox-nav.next { right: 14px; }
 
 .lightbox-bottom {
+  position: relative;
+  z-index: 2;
   flex-shrink: 0;
   background: rgba(10, 12, 16, 0.88);
   border-top: 1px solid rgba(255, 255, 255, 0.08);
@@ -1196,11 +1321,18 @@ kbd {
 /* Mobile & Touch Responsive Overrides */
 @media (hover: none), (pointer: coarse), (max-width: 860px) {
   .photo-select-btn {
-    opacity: 1;
+    opacity: 0.58;
+    background: rgba(11, 13, 16, 0.32);
+    border-color: rgba(255, 255, 255, 0.48);
     width: 28px;
     height: 28px;
     top: 6px;
     left: 6px;
+  }
+
+  .photo-card.is-selected .photo-select-btn,
+  .gallery-select-active .photo-select-btn {
+    opacity: 1;
   }
 
   .tag-row-actions {
@@ -1232,13 +1364,22 @@ kbd {
 
   .justified-gallery,
   .justified-row {
-    gap: 6px;
+    gap: 3px;
   }
 
   .square-gallery,
   .waterfall-gallery,
   .waterfall-column {
-    gap: 6px;
+    gap: 3px;
+  }
+
+  .gallery-back-top {
+    right: 12px;
+    bottom: 12px;
+  }
+
+  .gallery-month-pill {
+    bottom: 14px;
   }
 }
 

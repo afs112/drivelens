@@ -2,6 +2,7 @@ import { getDemoPersonas } from '../demo/demoAlbum.js';
 import { SUPPORTED_LANGS, t } from '../i18n.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
 import { isCompareOpen, openCompare, closeCompare } from './renderCompare.js';
+import { previewGalleryRowHeight } from './renderGallery.js';
 
 const SIDEBAR_ICON_SVG =
   '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>';
@@ -78,7 +79,7 @@ function buildHeaderSkeleton(headerEl, state) {
         type="range"
         min="130"
         max="320"
-        step="10"
+        step="4"
         value="210"
         title="${escapeAttr(t('header.thumbSize'))}"
         aria-label="${escapeAttr(t('header.thumbSize'))}"
@@ -414,13 +415,22 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
       if (e.target.id === 'searchInput') {
         store.setState({ searchQuery: e.target.value });
       } else if (e.target.id === 'rowHeightRange') {
-        store.setRowHeight(Number(e.target.value));
+        const nextVal = Number(e.target.value);
+        e.target.title = t('header.thumbSizePx', { px: String(nextVal) });
+        previewGalleryRowHeight(
+          document.getElementById('galleryGrid'),
+          document.getElementById('galleryScroll'),
+          store,
+          nextVal
+        );
       }
     });
 
     headerEl.addEventListener('change', (e) => {
       if (e.target.id === 'langSelect') {
         store.setLanguage(e.target.value);
+      } else if (e.target.id === 'rowHeightRange') {
+        store.setRowHeight(Number(e.target.value));
       }
     });
 

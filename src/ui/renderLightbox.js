@@ -131,6 +131,7 @@ export function renderLightbox(container, store, visiblePhotos) {
 
   container.innerHTML = `
     <div class="lightbox">
+      <img class="lightbox-ambient-bg" alt="" aria-hidden="true" />
       <div class="lightbox-topbar">
         <div style="display:flex;align-items:center;gap:8px;min-width:0;flex:1">
           <span class="photo-count-badge">${idx >= 0 ? `${idx + 1} / ${total}` : escapeHtml(t('lightbox.preview'))}</span>
@@ -210,6 +211,16 @@ export function renderLightbox(container, store, visiblePhotos) {
         getApiKey: () => store.state.apiKey,
       });
     }
+  }
+
+  const ambientEl = container.querySelector('.lightbox-ambient-bg');
+  if (ambientEl) {
+    loadPhotoIntoElement(ambientEl, file, {
+      size: 240,
+      eager: true,
+      getAccessToken: () => store.state.accessToken,
+      getApiKey: () => store.state.apiKey,
+    });
   }
 
   // Load filmstrip thumbnails lazily

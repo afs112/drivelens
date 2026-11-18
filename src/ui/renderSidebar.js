@@ -1,6 +1,21 @@
 import { getLocaleTag, t } from '../i18n.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
 
+const objRefIds = new WeakMap();
+let nextObjRefId = 1;
+let lastSidebarSignature = '';
+
+function getRefId(obj) {
+  if (!obj || typeof obj !== 'object') return 0;
+  let id = objRefIds.get(obj);
+  if (!id) {
+    id = nextObjRefId;
+    nextObjRefId += 1;
+    objRefIds.set(obj, id);
+  }
+  return id;
+}
+
 function getInitial(name) {
   const s = String(name || '?').trim();
   return s ? s[0].toUpperCase() : '?';
@@ -34,10 +49,29 @@ function renderFolderTree(store, state) {
   }
   walk('__root__', 0);
 
+  // Precompute per-folder and subtree counts in O(N + F) instead of scanning all files per folder
+  const directCounts = new Map();
+  for (const file of state.files) {
+    if (file.parentId) {
+      directCounts.set(file.parentId, (directCounts.get(file.parentId) || 0) + 1);
+    }
+  }
+  const subtreeCounts = new Map(directCounts);
+  for (let i = ordered.length - 1; i >= 0; i -= 1) {
+    const f = ordered[i].folder;
+    const total = subtreeCounts.get(f.id) || 0;
+    if (f.parentId && total > 0) {
+      subtreeCounts.set(f.parentId, (subtreeCounts.get(f.parentId) || 0) + total);
+    }
+  }
+
   return ordered
     .map(({ folder, level }) => {
       const isActive = activeFolderId === folder.id;
-      const count = store.getFolderPhotoCount(folder.id, includeSubfolders || folder.depth === 0);
+      const includeChildren = includeSubfolders || folder.depth === 0;
+      const count = includeChildren
+        ? subtreeCounts.get(folder.id) || 0
+        : directCounts.get(folder.id) || 0;
       const padLeft = 8 + level * 14;
       return `
         <button
@@ -125,6 +159,40 @@ function renderTagManager(store, state) {
 export function renderSidebar(container, store) {
   if (!container) return;
   const state = store.state;
+  const isCollapsed = Boolean(state.sidebarCollapsed) && !state.sidebarOpen;
+  container.classList.toggle('collapsed', isCollapsed);
+  if (isCollapsed && container.childElementCount > 0) return;
+
+  const selectedTagsKey =
+    state.selectedTagIds && state.selectedTagIds.size > 0
+      ? Array.from(state.selectedTagIds).sort().join(',')
+      : '';
+  const sig = [
+    state.lang,
+    state.mode,
+    state.files.length,
+    state.folders.length,
+    state.activeFolderId || '',
+    state.includeSubfolders ? 1 : 0,
+    state.quickView,
+    state.layoutMode,
+    state.minRating,
+    state.ratingScope,
+    state.memberFilterId || '',
+    selectedTagsKey,
+    state.tagMatchMode,
+    state.currentUser?.id || '',
+    getRefId(state.files),
+    getRefId(state.folders),
+    getRefId(state.membersData),
+    getRefId(state.tagSchema),
+  ].join('|');
+
+  if (sig === lastSidebarSignature && container.childElementCount > 0) {
+    return;
+  }
+  lastSidebarSignature = sig;
+
   const members = store.getMembersSummary();
 
   const totalCount = state.files.length;
@@ -135,8 +203,6 @@ export function renderSidebar(container, store) {
     if (m.favoriteCount > 0) favTotal += 1;
     if (m.ratingCount === 0) unratedTotal += 1;
   }
-
-  container.classList.toggle('collapsed', Boolean(state.sidebarCollapsed) && !state.sidebarOpen);
 
   container.innerHTML = `
     <div class="mobile-drawer-header">

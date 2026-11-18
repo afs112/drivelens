@@ -344,7 +344,13 @@ async function listFolderChildren(folderId, auth) {
   return items;
 }
 
-async function crawlAlbumTree({ rootFolder, auth, onProgress = null, captureMetaFolder = true }) {
+async function crawlAlbumTree({
+  rootFolder,
+  auth,
+  onProgress = null,
+  onBatch = null,
+  captureMetaFolder = true,
+}) {
   const folders = [rootFolder];
   const files = [];
   let metaFolderId = null;
@@ -352,7 +358,9 @@ async function crawlAlbumTree({ rootFolder, auth, onProgress = null, captureMeta
   let queue = [{ id: rootFolder.id, depth: 0 }];
   const visited = new Set([rootFolder.id]);
   const MAX_DEPTH = 6;
-  const BATCH_SIZE = 4;
+  const BATCH_SIZE = 6;
+  let lastBatchEmit = 0;
+  let emittedInitialBatch = false;
 
   while (queue.length > 0) {
     const batch = queue.slice(0, BATCH_SIZE);
@@ -408,6 +416,21 @@ async function crawlAlbumTree({ rootFolder, auth, onProgress = null, captureMeta
     if (onProgress) {
       onProgress({ folderCount: folders.length, fileCount: files.length });
     }
+
+    if (onBatch && files.length > 0 && queue.length > 0) {
+      const now = Date.now();
+      if (!emittedInitialBatch || now - lastBatchEmit >= 850) {
+        emittedInitialBatch = true;
+        lastBatchEmit = now;
+        onBatch({
+          rootFolder,
+          folders: [...folders],
+          files: [...files],
+          metaFolderId,
+          canWrite: rootFolder.canWrite,
+        });
+      }
+    }
   }
 
   return {
@@ -419,7 +442,7 @@ async function crawlAlbumTree({ rootFolder, auth, onProgress = null, captureMeta
   };
 }
 
-export async function loadSharedAlbum(folderId, accessToken, onProgress = null) {
+export async function loadSharedAlbum(folderId, accessToken, onProgress = null, onBatch = null) {
   const cleanId = parseDriveFolderId(folderId);
   if (!cleanId) {
     throw new Error(t('gdrive.invalidFolder'));
@@ -448,10 +471,15 @@ export async function loadSharedAlbum(folderId, accessToken, onProgress = null) 
     canWrite,
   };
 
-  return crawlAlbumTree({ rootFolder, auth, onProgress, captureMetaFolder: true });
+  return crawlAlbumTree({ rootFolder, auth, onProgress, onBatch, captureMetaFolder: true });
 }
 
-export async function loadSharedAlbumWithApiKey(folderId, apiKey, onProgress = null) {
+export async function loadSharedAlbumWithApiKey(
+  folderId,
+  apiKey,
+  onProgress = null,
+  onBatch = null
+) {
   const cleanId = parseDriveFolderId(folderId);
   if (!cleanId) {
     throw new Error(t('gdrive.invalidFolder'));
@@ -477,7 +505,7 @@ export async function loadSharedAlbumWithApiKey(folderId, apiKey, onProgress = n
     canWrite: true,
   };
 
-  return crawlAlbumTree({ rootFolder, auth, onProgress, captureMetaFolder: false });
+  return crawlAlbumTree({ rootFolder, auth, onProgress, onBatch, captureMetaFolder: false });
 }
 
 function triggerDownloadUrl(url, filename) {

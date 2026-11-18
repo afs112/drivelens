@@ -33,7 +33,21 @@ function getInitial(name) {
   return s ? s[0].toUpperCase() : '?';
 }
 
+const objRefIds = new WeakMap();
+let nextObjRefId = 1;
 let lastInspectorKey = '';
+let lastInspectorRenderSig = '';
+
+function getRefId(obj) {
+  if (!obj || typeof obj !== 'object') return 0;
+  let id = objRefIds.get(obj);
+  if (!id) {
+    id = nextObjRefId;
+    nextObjRefId += 1;
+    objRefIds.set(obj, id);
+  }
+  return id;
+}
 
 function buildMobileDrawerHeaderHtml() {
   return `<div class="mobile-drawer-header"><span>${escapeHtml(t('mobile.inspectorTitle'))}</span><button type="button" class="btn btn-ghost btn-icon btn-sm" data-insp="close-inspector" aria-label="${escapeAttr(t('mobile.closeDrawer'))}">${icon('x', 16)}</button></div>`;
@@ -57,6 +71,28 @@ export function renderInspector(container, store) {
   }
 
   const selectedCount = state.selectedPhotoIds.size;
+  const photoId =
+    selectedCount > 1
+      ? ''
+      : state.lightboxPhotoId || state.focusedPhotoId || Array.from(state.selectedPhotoIds)[0] || '';
+  const file = selectedCount <= 1 && photoId ? state.files.find((f) => f.id === photoId) || null : null;
+  const folder = file ? state.folders.find((f) => f.id === file.parentId) : null;
+
+  const renderSig = [
+    state.lang,
+    selectedCount > 1 ? `multi:${selectedCount}` : selectedCount,
+    selectedCount > 1 ? '__multi__' : file ? file.id : '__empty__',
+    getRefId(file),
+    getRefId(state.membersData),
+    getRefId(state.tagSchema),
+    state.currentUser?.id || '',
+    folder?.name || '',
+  ].join('|');
+
+  if (renderSig === lastInspectorRenderSig && container.childElementCount > 0) {
+    return;
+  }
+  lastInspectorRenderSig = renderSig;
 
   // Multi-select batch inspector view
   if (selectedCount > 1) {
@@ -92,9 +128,6 @@ export function renderInspector(container, store) {
     return;
   }
 
-  const photoId = state.lightboxPhotoId || state.focusedPhotoId || Array.from(state.selectedPhotoIds)[0];
-  const file = state.files.find((f) => f.id === photoId);
-
   if (!file) {
     lastInspectorKey = 'empty';
     container.innerHTML = `
@@ -110,7 +143,6 @@ export function renderInspector(container, store) {
 
   const meta = store.getAggregatedItemMeta(file.id);
   const schemaTags = state.tagSchema?.tags || {};
-  const folder = state.folders.find((f) => f.id === file.parentId);
   const exif = file.imageMediaMetadata || {};
   const vid = file.videoMediaMetadata || {};
 

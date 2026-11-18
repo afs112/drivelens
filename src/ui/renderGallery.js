@@ -1,6 +1,48 @@
-import { t } from '../i18n.js';
+import { getLocaleTag, t } from '../i18n.js';
 import { loadPhotoIntoElement } from '../storage/imageLoader.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
+
+const GALLERY_THUMB_SIZE = 480;
+const PAGE_CHUNK = 80;
+
+const cardTimestampCache = new WeakMap();
+const visiblePhotosIdSigCache = new WeakMap();
+const monthFormatterCache = new Map();
+
+function getPhotoTimestampValue(file) {
+  if (!file || typeof file !== 'object') return 0;
+  const raw = file.imageMediaMetadata?.time || file.createdTime || file.modifiedTime || '';
+  if (!raw) return 0;
+  const cached = cardTimestampCache.get(file);
+  if (cached && cached.raw === raw) return cached.ts;
+  const normalized = /^\d{4}:\d{2}:\d{2}\s/.test(raw)
+    ? raw.replace(/^(\d{4}):(\d{2}):(\d{2})\s/, '$1-$2-$3T')
+    : raw;
+  const parsed = Date.parse(normalized);
+  const ts = Number.isNaN(parsed) ? 0 : parsed;
+  cardTimestampCache.set(file, { raw, ts });
+  return ts;
+}
+
+function getPhotosIdSig(visiblePhotos) {
+  if (!visiblePhotos || visiblePhotos.length === 0) return '0';
+  let sig = visiblePhotosIdSigCache.get(visiblePhotos);
+  if (sig === undefined) {
+    sig = visiblePhotos.map((p) => p.id).join(',');
+    visiblePhotosIdSigCache.set(visiblePhotos, sig);
+  }
+  return sig;
+}
+
+function formatMonthPillLabel(ts) {
+  const locale = getLocaleTag();
+  let fmt = monthFormatterCache.get(locale);
+  if (!fmt) {
+    fmt = new Intl.DateTimeFormat(locale, { year: 'numeric', month: 'short' });
+    monthFormatterCache.set(locale, fmt);
+  }
+  return fmt.format(new Date(ts));
+}
 
 function getItemAspectRatio(file) {
   const w = Number(file.imageMediaMetadata?.width || file.videoMediaMetadata?.width || 0);
@@ -100,73 +142,194 @@ function formatDuration(ms) {
   return `${min}:${sec}`;
 }
 
-function buildOverlayHtml(file, store) {
+function buildOverlayData(file, store) {
   const meta = store.getAggregatedItemMeta(file.id);
   const schemaTags = store.state.tagSchema?.tags || {};
+  const hasPersistent =
+    meta.avgRating > 0 || meta.favoriteCount > 0 || meta.activeTagIds.length > 0;
 
-  let starHtml = '';
-  if (meta.avgRating > 0) {
-    const avgText = Number.isInteger(meta.avgRating)
-      ? `${meta.avgRating}.0`
-      : meta.avgRating.toFixed(1);
-    const myPart = meta.myRating > 0
-      ? `<span style="opacity:0.75;font-weight:400">${escapeHtml(t('gallery.meBadge', { n: meta.myRating }))}</span>`
-      : '';
-    starHtml = `<span class="photo-star-badge">${icon('starFilled', 12)}<span>${avgText}</span>${myPart}</span>`;
-  } else {
-    starHtml = `<span style="opacity:0.45;font-size:10.5px">${escapeHtml(file.name.slice(0, 14))}</span>`;
-  }
+  if (hasPersistent) {
+    let starHtml = '';
+    if (meta.avgRating > 0) {
+      const avgText = Number.isInteger(meta.avgRating)
+        ? `${meta.avgRating}.0`
+        : meta.avgRating.toFixed(1);
+      const myPart =
+        meta.myRating > 0
+          ? `<span style="opacity:0.75;font-weight:400">${escapeHtml(t('gallery.meBadge', { n: meta.myRating }))}</span>`
+          : '';
+      starHtml = `<span class="photo-star-badge">${icon('starFilled', 12)}<span>${avgText}</span>${myPart}</span>`;
+    }
 
-  const heartHtml =
-    meta.favoriteCount > 0
-      ? `<span class="photo-heart-badge">${icon('heartFilled', 12)}${meta.favoriteCount > 1 ? `<span>${meta.favoriteCount}</span>` : ''}</span>`
-      : '';
+    const heartHtml =
+      meta.favoriteCount > 0
+        ? `<span class="photo-heart-badge">${icon('heartFilled', 12)}${meta.favoriteCount > 1 ? `<span>${meta.favoriteCount}</span>` : ''}</span>`
+        : '';
 
-  const dotsHtml = meta.activeTagIds
-    .slice(0, 5)
-    .map((tid) => {
-      const tag = schemaTags[tid];
-      if (!tag) return '';
-      return `<span class="photo-tag-dot" style="background:var(--tag-${escapeAttr(tag.color || 'blue')})" title="${escapeAttr(tag.name)}"></span>`;
-    })
-    .join('');
+    const tagParts = [];
+    const dotsHtml = meta.activeTagIds
+      .slice(0, 5)
+      .map((tid) => {
+        const tag = schemaTags[tid];
+        if (!tag) return '';
+        tagParts.push(`${tid}:${tag.color || 'blue'}:${tag.name}`);
+        return `<span class="photo-tag-dot" style="background:var(--tag-${escapeAttr(tag.color || 'blue')})" title="${escapeAttr(tag.name)}"></span>`;
+      })
+      .join('');
 
-  return `
+    const html = `
     <div class="photo-overlay-left">${starHtml}${heartHtml}</div>
     <div class="photo-overlay-right"><span class="photo-tag-dots">${dotsHtml}</span></div>
   `;
+    return {
+      mode: 'persistent',
+      sig: `p|${store.state.lang}|${meta.avgRating}|${meta.myRating}|${meta.favoriteCount}|${tagParts.join(',')}`,
+      html,
+    };
+  }
+
+  // Hover-only subtle EXIF line for unrated/untagged cards (never show filenames by default)
+  const exif = file.imageMediaMetadata || {};
+  const parts = [];
+  if (exif.cameraModel) parts.push(String(exif.cameraModel).trim());
+  if (exif.focalLength) parts.push(`${exif.focalLength}mm`);
+  if (exif.aperture) parts.push(`f/${exif.aperture}`);
+  if (exif.isoSpeed) parts.push(`ISO ${exif.isoSpeed}`);
+  const exifText = parts.filter(Boolean).join(' · ');
+
+  if (exifText) {
+    return {
+      mode: 'hover',
+      sig: `h|${exifText}`,
+      html: `<span class="photo-overlay-exif">${escapeHtml(exifText)}</span>`,
+    };
+  }
+
+  return {
+    mode: 'empty',
+    sig: 'empty',
+    html: '',
+  };
 }
 
-function createPhotoCardElement(file, store, styleAttr = '') {
+function patchCardMeta(card, file, store, selectTitle) {
   const isSelected = store.state.selectedPhotoIds.has(file.id);
   const isFocused = store.state.focusedPhotoId === file.id;
-  const isVideo = file.mimeType && file.mimeType.startsWith('video/');
-  const dur = isVideo ? formatDuration(file.videoMediaMetadata?.durationMillis) : '';
 
-  const card = document.createElement('div');
-  card.className = `photo-card ${isSelected ? 'is-selected' : ''} ${isFocused ? 'is-focused' : ''}`;
-  card.dataset.photoId = file.id;
-  if (styleAttr) card.setAttribute('style', styleAttr);
+  if (card._selected !== isSelected) {
+    card.classList.toggle('is-selected', isSelected);
+    card._selected = isSelected;
+  }
+  if (card._focused !== isFocused) {
+    card.classList.toggle('is-focused', isFocused);
+    card._focused = isFocused;
+  }
+  if (card._selectBtn && card._selectTitle !== selectTitle) {
+    card._selectBtn.title = selectTitle;
+    card._selectTitle = selectTitle;
+  }
 
-  card.innerHTML = `
-    <div class="photo-skeleton"></div>
-    <button type="button" class="photo-select-btn" data-action="toggle-select" title="${escapeAttr(t('gallery.toggleSelect'))}">
-      ${icon('check', 13)}
-    </button>
-    ${isVideo ? `<span class="photo-video-badge">${icon('video', 11)}<span>${dur || escapeHtml(t('gallery.video'))}</span></span>` : ''}
-    <img alt="${escapeAttr(file.name)}" decoding="async" />
-    <div class="photo-overlay">${buildOverlayHtml(file, store)}</div>
-  `;
+  const overlayEl = card._overlayEl;
+  if (overlayEl) {
+    const ov = buildOverlayData(file, store);
+    if (card._overlayMode !== ov.mode) {
+      overlayEl.className = `photo-overlay ${
+        ov.mode === 'hover' ? 'is-hover-only' : ov.mode === 'empty' ? 'is-empty' : ''
+      }`;
+      card._overlayMode = ov.mode;
+    }
+    if (card._overlaySig !== ov.sig) {
+      overlayEl.innerHTML = ov.html;
+      card._overlaySig = ov.sig;
+    }
+  }
+}
 
-  const imgEl = card.querySelector('img');
-  loadPhotoIntoElement(imgEl, file, {
-    size: 600,
-    getAccessToken: () => store.state.accessToken,
-    getApiKey: () => store.state.apiKey,
-  });
+function acquirePhotoCard(file, store, styleAttr = '', isWaterfall = false, patchMeta = true) {
+  let card = cardPool.get(file.id);
+  if (!card) {
+    const isVideo = file.mimeType && file.mimeType.startsWith('video/');
+    const dur = isVideo ? formatDuration(file.videoMediaMetadata?.durationMillis) : '';
+
+    card = document.createElement('div');
+    card.className = 'photo-card';
+    card.dataset.photoId = file.id;
+    card.innerHTML = `
+      <div class="photo-skeleton"></div>
+      <button type="button" class="photo-select-btn" data-action="toggle-select" title="${escapeAttr(t('gallery.toggleSelect'))}">
+        ${icon('check', 13)}
+      </button>
+      ${isVideo ? `<span class="photo-video-badge">${icon('video', 11)}<span>${dur || escapeHtml(t('gallery.video'))}</span></span>` : ''}
+      <img alt="${escapeAttr(file.name)}" decoding="async" />
+      <div class="photo-overlay is-empty"></div>
+    `;
+
+    card._imgEl = card.querySelector('img');
+    card._overlayEl = card.querySelector('.photo-overlay');
+    card._selectBtn = card.querySelector('.photo-select-btn');
+    card._selectTitle = card._selectBtn?.title || '';
+    card._styleAttr = null;
+    card._loadedKey = '';
+    card._selected = false;
+    card._focused = false;
+    card._overlayMode = 'empty';
+    card._overlaySig = '';
+    card._waterfall = false;
+
+    cardPool.set(file.id, card);
+  }
+
+  const tsStr = String(getPhotoTimestampValue(file));
+  if (card.dataset.ts !== tsStr) {
+    card.dataset.ts = tsStr;
+  }
+
+  if (card._styleAttr !== styleAttr) {
+    card.style.cssText = styleAttr;
+    card._styleAttr = styleAttr;
+  }
+
+  if (card._waterfall !== isWaterfall) {
+    card.classList.toggle('waterfall-card', isWaterfall);
+    card._waterfall = isWaterfall;
+  }
+
+  const loadKey = `${file.id}|${file.thumbnailLink || ''}|${Boolean(store.state.accessToken)}|${Boolean(store.state.apiKey)}`;
+  if (card._loadedKey !== loadKey && card._imgEl) {
+    card._loadedKey = loadKey;
+    loadPhotoIntoElement(card._imgEl, file, {
+      size: GALLERY_THUMB_SIZE,
+      getAccessToken: () => store.state.accessToken,
+      getApiKey: () => store.state.apiKey,
+    });
+  }
+
+  if (patchMeta) {
+    patchCardMeta(card, file, store, t('gallery.toggleSelect'));
+  }
 
   return card;
 }
+
+const cardPool = new Map();
+const rowPool = [];
+const colPool = [];
+
+let pooledAlbumKey = '';
+let lastSubbarSignature = '';
+let lastBatchSignature = '';
+let lastGridSignature = '';
+let lastFilterKey = '';
+let renderedLimit = PAGE_CHUNK;
+let lastVisiblePhotos = [];
+let lastContainerWidth = 0;
+let lastIsMobile = false;
+let lastRenderedMode = '';
+let sentinelEl = null;
+let loadMoreObserver = null;
+let previewRafId = 0;
+let pendingPreviewHeight = null;
+let mobileSelectMode = false;
 
 export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
   if (!subbarEl) return;
@@ -204,6 +367,22 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
     chips.push({ label: t('gallery.chipSearch', { q: state.searchQuery.trim() }), clear: 'search' });
   }
 
+  const selectActive = mobileSelectMode || state.selectedPhotoIds.size > 0;
+  const subbarSig = [
+    state.lang,
+    activeFolder?.id || '',
+    activeFolder?.name || '',
+    visiblePhotos.length,
+    chips.map((c) => `${c.clear}:${c.label}`).join(','),
+    selectActive ? 1 : 0,
+    state.sortBy,
+  ].join('|');
+
+  if (subbarSig === lastSubbarSignature && subbarEl.childElementCount > 0) {
+    return;
+  }
+  lastSubbarSignature = subbarSig;
+
   subbarEl.innerHTML = `
     <div class="gallery-subbar-left">
       <span class="breadcrumb-text">${escapeHtml(activeFolder?.name || t('gallery.allPhotos'))}</span>
@@ -225,9 +404,9 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
     <div class="gallery-subbar-right">
       <button
         type="button"
-        class="btn btn-sm mobile-only-inline ${mobileSelectMode || state.selectedPhotoIds.size > 0 ? 'is-active' : ''}"
+        class="btn btn-sm mobile-only-inline ${selectActive ? 'is-active' : ''}"
         data-subbar="toggle-select-mode"
-      >${icon('check', 12)} <span>${escapeHtml(mobileSelectMode || state.selectedPhotoIds.size > 0 ? t('mobile.doneSelect') : t('mobile.selectMode'))}</span></button>
+      >${icon('check', 12)} <span>${escapeHtml(selectActive ? t('mobile.doneSelect') : t('mobile.selectMode'))}</span></button>
       <select class="select-sm" id="sortBySelect" title="${escapeAttr(t('gallery.sortTitle'))}">
         <option value="dateDesc" ${state.sortBy === 'dateDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateDesc'))}</option>
         <option value="dateAsc" ${state.sortBy === 'dateAsc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateAsc'))}</option>
@@ -242,6 +421,12 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
 export function renderBatchBar(batchBarEl, store, visiblePhotos) {
   if (!batchBarEl) return;
   const count = store.state.selectedPhotoIds.size;
+  const batchSig = count === 0 ? '0' : `${store.state.lang}|${count}|${visiblePhotos.length}`;
+  if (batchSig === lastBatchSignature && (count === 0 || batchBarEl.childElementCount > 0)) {
+    return;
+  }
+  lastBatchSignature = batchSig;
+
   if (count === 0) {
     batchBarEl.classList.add('hidden');
     batchBarEl.innerHTML = '';
@@ -270,17 +455,322 @@ export function renderBatchBar(batchBarEl, store, visiblePhotos) {
   `;
 }
 
-let lastGridSignature = '';
-let mobileSelectMode = false;
-
 function isTouchViewport() {
   return window.innerWidth <= 860 || Boolean(window.matchMedia?.('(pointer: coarse)').matches);
+}
+
+function syncContainerChildren(containerEl, nextChildren) {
+  const existing = containerEl.children;
+  let same = existing.length === nextChildren.length;
+  if (same) {
+    for (let i = 0; i < existing.length; i += 1) {
+      if (existing[i] !== nextChildren[i]) {
+        same = false;
+        break;
+      }
+    }
+  }
+  if (same) return;
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < nextChildren.length; i += 1) {
+    frag.appendChild(nextChildren[i]);
+  }
+  containerEl.replaceChildren(frag);
+}
+
+function teardownLoadMoreObserver() {
+  if (loadMoreObserver) {
+    loadMoreObserver.disconnect();
+    loadMoreObserver = null;
+  }
+}
+
+function buildFilterKey(state) {
+  const tags =
+    state.selectedTagIds && state.selectedTagIds.size > 0
+      ? Array.from(state.selectedTagIds).sort().join(',')
+      : '';
+  return [
+    state.lang,
+    state.mode,
+    state.folderId || '',
+    state.activeFolderId || '',
+    state.includeSubfolders ? 1 : 0,
+    state.quickView,
+    state.ratingScope,
+    state.minRating,
+    state.memberFilterId || '',
+    tags,
+    state.tagMatchMode,
+    state.searchQuery,
+    state.sortBy,
+  ].join('|');
+}
+
+function buildGridSignature(state, isMobile, rowHeight, roundedWidth, visiblePhotos, limit) {
+  return `${state.lang}|${isMobile ? 'm' : 'd'}|${state.layoutMode}|${rowHeight}|${roundedWidth}|${limit}|${visiblePhotos.length}|${getPhotosIdSig(visiblePhotos)}`;
+}
+
+function updateFloatingScrollState(scrollContainer) {
+  const pillEl = scrollContainer._dlMonthPill;
+  const backBtn = scrollContainer._dlBackTopBtn;
+  if (!pillEl || !backBtn) return;
+
+  const backLabel = t('gallery.backToTop');
+  if (backBtn.title !== backLabel) {
+    backBtn.title = backLabel;
+    backBtn.setAttribute('aria-label', backLabel);
+  }
+
+  const show = scrollContainer.scrollTop > 320 && lastVisiblePhotos.length > 0;
+  backBtn.classList.toggle('visible', show);
+  if (!show) {
+    pillEl.classList.remove('visible');
+    return;
+  }
+
+  const rect = scrollContainer.getBoundingClientRect();
+  const sampleX = rect.left + Math.max(40, Math.round(rect.width * 0.22));
+  const hitCard =
+    document.elementFromPoint(sampleX, rect.top + 48)?.closest('.photo-card[data-ts]') ||
+    document.elementFromPoint(sampleX, rect.top + 68)?.closest('.photo-card[data-ts]');
+  const ts = hitCard ? Number(hitCard.dataset.ts || 0) : 0;
+  if (ts > 0) {
+    pillEl.textContent = formatMonthPillLabel(ts);
+    pillEl.classList.add('visible');
+  } else {
+    pillEl.classList.remove('visible');
+  }
+}
+
+function ensureGalleryFloatingUi(scrollContainer) {
+  const host = scrollContainer.parentElement;
+  if (!host) return;
+  if (scrollContainer._dlFloatingAttached) {
+    updateFloatingScrollState(scrollContainer);
+    return;
+  }
+
+  const pillEl = document.createElement('div');
+  pillEl.className = 'gallery-month-pill';
+  pillEl.setAttribute('aria-hidden', 'true');
+
+  const backBtn = document.createElement('button');
+  backBtn.type = 'button';
+  backBtn.className = 'gallery-back-top';
+  backBtn.innerHTML = icon('arrowUp', 16);
+  backBtn.title = t('gallery.backToTop');
+  backBtn.setAttribute('aria-label', t('gallery.backToTop'));
+  backBtn.addEventListener('click', () => {
+    scrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
+  });
+
+  host.appendChild(pillEl);
+  host.appendChild(backBtn);
+
+  scrollContainer._dlMonthPill = pillEl;
+  scrollContainer._dlBackTopBtn = backBtn;
+  scrollContainer._dlFloatingAttached = true;
+
+  let scrollRafId = 0;
+  scrollContainer.addEventListener(
+    'scroll',
+    () => {
+      if (scrollRafId) return;
+      scrollRafId = requestAnimationFrame(() => {
+        scrollRafId = 0;
+        updateFloatingScrollState(scrollContainer);
+      });
+    },
+    { passive: true }
+  );
+
+  updateFloatingScrollState(scrollContainer);
+}
+
+function hideGalleryFloatingUi(scrollContainer) {
+  if (!scrollContainer) return;
+  scrollContainer._dlMonthPill?.classList.remove('visible');
+  scrollContainer._dlBackTopBtn?.classList.remove('visible');
+}
+
+function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, targetHeight, patchMeta) {
+  const state = store.state;
+  const { layoutMode, lang } = state;
+  const isMobile = scrollContainer.clientWidth <= 600;
+  const containerWidth = Math.max(240, scrollContainer.clientWidth - (isMobile ? 6 : 16));
+  const roundedWidth = Math.round(containerWidth);
+  const gap = isMobile ? 3 : 4;
+  const effectiveRowHeight = isMobile
+    ? Math.round(Math.max(105, targetHeight * 0.62))
+    : targetHeight;
+
+  const limit = Math.min(renderedLimit, visiblePhotos.length);
+  const windowedPhotos =
+    limit < visiblePhotos.length ? visiblePhotos.slice(0, limit) : visiblePhotos;
+
+  let wrapperEl = null;
+
+  if (layoutMode === 'waterfall') {
+    const columns = computeWaterfallColumns(
+      windowedPhotos,
+      containerWidth,
+      targetHeight,
+      gap,
+      isMobile
+    );
+    const existingWrapper =
+      lastRenderedMode === 'waterfall' &&
+      gridEl.firstElementChild?.classList.contains('waterfall-gallery')
+        ? gridEl.firstElementChild
+        : null;
+    wrapperEl = existingWrapper || document.createElement('div');
+    wrapperEl.className = 'waterfall-gallery';
+
+    const colNodes = [];
+    for (let i = 0; i < columns.length; i += 1) {
+      let colEl = colPool[i];
+      if (!colEl) {
+        colEl = document.createElement('div');
+        colEl.className = 'waterfall-column';
+        colPool[i] = colEl;
+      }
+      const colItems = columns[i];
+      const colCards = new Array(colItems.length);
+      for (let j = 0; j < colItems.length; j += 1) {
+        const cell = colItems[j];
+        colCards[j] = acquirePhotoCard(
+          cell.item,
+          store,
+          `width:100%;height:${cell.height}px;`,
+          true,
+          patchMeta
+        );
+      }
+      syncContainerChildren(colEl, colCards);
+      colNodes.push(colEl);
+    }
+    syncContainerChildren(wrapperEl, colNodes);
+  } else if (layoutMode === 'grid') {
+    const existingWrapper =
+      lastRenderedMode === 'grid' &&
+      gridEl.firstElementChild?.classList.contains('square-gallery')
+        ? gridEl.firstElementChild
+        : null;
+    wrapperEl = existingWrapper || document.createElement('div');
+    wrapperEl.className = 'square-gallery';
+    const minCard = isMobile
+      ? Math.max(98, Math.round(targetHeight * 0.5))
+      : Math.max(130, targetHeight - 20);
+    const nextCols = `repeat(auto-fill, minmax(${minCard}px, 1fr))`;
+    if (wrapperEl.style.gridTemplateColumns !== nextCols) {
+      wrapperEl.style.gridTemplateColumns = nextCols;
+    }
+
+    const cards = new Array(windowedPhotos.length);
+    for (let i = 0; i < windowedPhotos.length; i += 1) {
+      cards[i] = acquirePhotoCard(windowedPhotos[i], store, '', false, patchMeta);
+    }
+    syncContainerChildren(wrapperEl, cards);
+  } else {
+    const rows = computeJustifiedRows(windowedPhotos, containerWidth, effectiveRowHeight, gap);
+    const existingWrapper =
+      lastRenderedMode === 'justified' &&
+      gridEl.firstElementChild?.classList.contains('justified-gallery')
+        ? gridEl.firstElementChild
+        : null;
+    wrapperEl = existingWrapper || document.createElement('div');
+    wrapperEl.className = 'justified-gallery';
+
+    const rowNodes = [];
+    for (let i = 0; i < rows.length; i += 1) {
+      let rowEl = rowPool[i];
+      if (!rowEl) {
+        rowEl = document.createElement('div');
+        rowEl.className = 'justified-row';
+        rowPool[i] = rowEl;
+      }
+      const row = rows[i];
+      const nextHeightPx = `${row.height}px`;
+      if (rowEl.style.height !== nextHeightPx) {
+        rowEl.style.height = nextHeightPx;
+      }
+      const rowCards = new Array(row.items.length);
+      for (let j = 0; j < row.items.length; j += 1) {
+        const cell = row.items[j];
+        rowCards[j] = acquirePhotoCard(
+          cell.item,
+          store,
+          `width:${cell.width}px;height:${row.height}px;`,
+          false,
+          patchMeta
+        );
+      }
+      syncContainerChildren(rowEl, rowCards);
+      rowNodes.push(rowEl);
+    }
+    syncContainerChildren(wrapperEl, rowNodes);
+  }
+
+  lastRenderedMode = layoutMode;
+  lastContainerWidth = roundedWidth;
+  lastIsMobile = isMobile;
+  lastGridSignature = buildGridSignature(
+    { ...state, lang },
+    isMobile,
+    targetHeight,
+    roundedWidth,
+    visiblePhotos,
+    renderedLimit
+  );
+
+  const hasMore = visiblePhotos.length > limit;
+  if (hasMore) {
+    if (!sentinelEl) {
+      sentinelEl = document.createElement('div');
+      sentinelEl.className = 'gallery-load-sentinel';
+      sentinelEl.setAttribute('aria-hidden', 'true');
+    }
+    syncContainerChildren(gridEl, [wrapperEl, sentinelEl]);
+    teardownLoadMoreObserver();
+    if (typeof IntersectionObserver !== 'undefined') {
+      loadMoreObserver = new IntersectionObserver(
+        (entries) => {
+          if (!entries.some((entry) => entry.isIntersecting)) return;
+          if (renderedLimit >= lastVisiblePhotos.length) return;
+          renderedLimit = Math.min(lastVisiblePhotos.length, renderedLimit + PAGE_CHUNK);
+          renderGalleryGrid(gridEl, scrollContainer, store, lastVisiblePhotos);
+        },
+        { root: scrollContainer, rootMargin: '600px 0px', threshold: 0 }
+      );
+      loadMoreObserver.observe(sentinelEl);
+    }
+  } else {
+    teardownLoadMoreObserver();
+    syncContainerChildren(gridEl, [wrapperEl]);
+  }
 }
 
 export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos) {
   if (!gridEl || !scrollContainer) return;
 
+  const albumKey = `${store.state.mode}:${store.state.folderId || 'demo'}`;
+  if (albumKey !== pooledAlbumKey) {
+    pooledAlbumKey = albumKey;
+    cardPool.clear();
+    rowPool.length = 0;
+    colPool.length = 0;
+    lastRenderedMode = '';
+    lastGridSignature = '';
+  }
+
+  const selectActive = mobileSelectMode || store.state.selectedPhotoIds.size > 0;
+  gridEl.classList.toggle('gallery-select-active', selectActive);
+
   if (store.state.loading) {
+    teardownLoadMoreObserver();
+    lastVisiblePhotos = [];
+    lastRenderedMode = '';
     lastGridSignature = '__loading__';
     gridEl.innerHTML = `
       <div class="empty-state">
@@ -288,10 +778,14 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
         <div style="font-size:14px;color:var(--text-primary)">${escapeHtml(store.state.loadingText || t('gallery.loadingAlbum'))}</div>
       </div>
     `;
+    hideGalleryFloatingUi(scrollContainer);
     return;
   }
 
   if (visiblePhotos.length === 0) {
+    teardownLoadMoreObserver();
+    lastVisiblePhotos = [];
+    lastRenderedMode = '';
     lastGridSignature = '__empty__';
     gridEl.innerHTML = `
       <div class="empty-state">
@@ -301,102 +795,105 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
         <button type="button" class="btn btn-primary" data-clear-empty="true">${escapeHtml(t('gallery.resetAllFilters'))}</button>
       </div>
     `;
+    hideGalleryFloatingUi(scrollContainer);
     return;
   }
 
-  const { layoutMode, rowHeight, lang } = store.state;
+  ensureGalleryFloatingUi(scrollContainer);
+  lastVisiblePhotos = visiblePhotos;
+
+  const filterKey = buildFilterKey(store.state);
+  if (filterKey !== lastFilterKey) {
+    lastFilterKey = filterKey;
+    renderedLimit = PAGE_CHUNK;
+  } else {
+    renderedLimit = Math.min(
+      Math.max(renderedLimit, PAGE_CHUNK),
+      Math.max(PAGE_CHUNK, visiblePhotos.length)
+    );
+  }
+
+  const { rowHeight } = store.state;
   const isMobile = scrollContainer.clientWidth <= 600;
-  const containerWidth = Math.max(240, scrollContainer.clientWidth - (isMobile ? 16 : 36));
-  const effectiveRowHeight = isMobile ? Math.round(Math.max(105, rowHeight * 0.62)) : rowHeight;
-  const sig = `${lang}|${isMobile ? 'm' : 'd'}|${layoutMode}|${rowHeight}|${Math.round(containerWidth)}|${visiblePhotos.map((p) => p.id).join(',')}`;
+  const containerWidth = Math.max(240, scrollContainer.clientWidth - (isMobile ? 6 : 16));
+  const roundedWidth = Math.round(containerWidth);
+  const sig = buildGridSignature(
+    store.state,
+    isMobile,
+    rowHeight,
+    roundedWidth,
+    visiblePhotos,
+    renderedLimit
+  );
 
-  // Fast path: patch selection, focus & overlays in-place without flashing thumbnails
-  if (sig === lastGridSignature) {
-    const byId = new Map(visiblePhotos.map((p) => [p.id, p]));
-    const cards = gridEl.querySelectorAll('.photo-card[data-photo-id]');
-    for (const card of cards) {
-      const pid = card.dataset.photoId;
-      const file = byId.get(pid);
-      if (!file) continue;
-      card.classList.toggle('is-selected', store.state.selectedPhotoIds.has(pid));
-      card.classList.toggle('is-focused', store.state.focusedPhotoId === pid);
-      const overlay = card.querySelector('.photo-overlay');
-      if (overlay) {
-        overlay.innerHTML = buildOverlayHtml(file, store);
+  // Fast path: patch selection, focus & overlays in-place without recalculating layout
+  if (sig === lastGridSignature && lastRenderedMode) {
+    const selectTitle = t('gallery.toggleSelect');
+    const limit = Math.min(renderedLimit, visiblePhotos.length);
+    for (let i = 0; i < limit; i += 1) {
+      const file = visiblePhotos[i];
+      const card = cardPool.get(file.id);
+      if (card) {
+        patchCardMeta(card, file, store, selectTitle);
       }
     }
     return;
   }
 
-  lastGridSignature = sig;
-  gridEl.innerHTML = '';
+  applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, rowHeight, true);
+}
 
-  if (layoutMode === 'waterfall') {
-    const gap = isMobile ? 6 : 10;
-    const columns = computeWaterfallColumns(visiblePhotos, containerWidth, rowHeight, gap, isMobile);
-    const wrapper = document.createElement('div');
-    wrapper.className = 'waterfall-gallery';
-    const frag = document.createDocumentFragment();
+export function previewGalleryRowHeight(gridEl, scrollContainer, store, nextHeight) {
+  if (!gridEl || !scrollContainer || !store) return;
+  const clamped = Math.max(130, Math.min(320, Math.round(Number(nextHeight) || 210)));
+  pendingPreviewHeight = clamped;
+  if (previewRafId) return;
+  previewRafId = requestAnimationFrame(() => {
+    previewRafId = 0;
+    if (pendingPreviewHeight === null) return;
+    const heightToApply = pendingPreviewHeight;
+    pendingPreviewHeight = null;
+    if (store.state.loading || lastVisiblePhotos.length === 0) return;
+    applyGalleryGeometry(gridEl, scrollContainer, store, lastVisiblePhotos, heightToApply, false);
+  });
+}
 
-    for (const colItems of columns) {
-      const colEl = document.createElement('div');
-      colEl.className = 'waterfall-column';
-      for (const cell of colItems) {
-        const card = createPhotoCardElement(cell.item, store, `width:100%;height:${cell.height}px;`);
-        card.classList.add('waterfall-card');
-        colEl.appendChild(card);
-      }
-      frag.appendChild(colEl);
-    }
+export function relayoutGalleryOnResize(gridEl, scrollContainer, store) {
+  if (!gridEl || !scrollContainer || !store) return;
+  if (store.state.loading || lastVisiblePhotos.length === 0) return;
 
-    wrapper.appendChild(frag);
-    gridEl.appendChild(wrapper);
+  const isMobile = scrollContainer.clientWidth <= 600;
+  const containerWidth = Math.max(240, scrollContainer.clientWidth - (isMobile ? 6 : 16));
+  const roundedWidth = Math.round(containerWidth);
+  if (roundedWidth === lastContainerWidth && isMobile === lastIsMobile) return;
+
+  const targetHeight = Math.max(130, Math.min(320, Number(store.state.rowHeight || 210)));
+
+  // CSS Grid tracks reflow natively on container width changes
+  if (
+    store.state.layoutMode === 'grid' &&
+    lastRenderedMode === 'grid' &&
+    isMobile === lastIsMobile
+  ) {
+    lastContainerWidth = roundedWidth;
+    lastGridSignature = buildGridSignature(
+      store.state,
+      isMobile,
+      targetHeight,
+      roundedWidth,
+      lastVisiblePhotos,
+      renderedLimit
+    );
     return;
   }
 
-  if (layoutMode === 'grid') {
-    const grid = document.createElement('div');
-    grid.className = 'square-gallery';
-    const minCard = isMobile ? Math.max(96, Math.round(rowHeight * 0.5)) : Math.max(130, rowHeight - 20);
-    grid.style.gridTemplateColumns = `repeat(auto-fill, minmax(${minCard}px, 1fr))`;
-
-    const frag = document.createDocumentFragment();
-    for (const file of visiblePhotos) {
-      frag.appendChild(createPhotoCardElement(file, store));
-    }
-    grid.appendChild(frag);
-    gridEl.appendChild(grid);
-    return;
-  }
-
-  // Justified row layout
-  const rows = computeJustifiedRows(visiblePhotos, containerWidth, effectiveRowHeight, isMobile ? 6 : 8);
-  const wrapper = document.createElement('div');
-  wrapper.className = 'justified-gallery';
-  const frag = document.createDocumentFragment();
-
-  for (const row of rows) {
-    const rowEl = document.createElement('div');
-    rowEl.className = 'justified-row';
-    rowEl.style.height = `${row.height}px`;
-    for (const cell of row.items) {
-      rowEl.appendChild(
-        createPhotoCardElement(
-          cell.item,
-          store,
-          `width:${cell.width}px;height:${row.height}px;`
-        )
-      );
-    }
-    frag.appendChild(rowEl);
-  }
-
-  wrapper.appendChild(frag);
-  gridEl.appendChild(wrapper);
+  applyGalleryGeometry(gridEl, scrollContainer, store, lastVisiblePhotos, targetHeight, false);
 }
 
 export function resetGallerySignature() {
   lastGridSignature = '';
+  lastSubbarSignature = '';
+  lastBatchSignature = '';
 }
 
 export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
