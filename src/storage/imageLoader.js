@@ -1,3 +1,4 @@
+import { fetchFreshThumbnailLink, fetchWithDriveBackoff } from '../api/gdrive.js';
 import { APP_CONFIG } from '../constants.js';
 
 const DB_NAME = 'drivelens-img-cache';
@@ -198,18 +199,20 @@ function loadViaImgTag(url) {
   });
 }
 
-async function fetchMediaBlobWithRetry(fileId, auth = {}, attempt = 0) {
+let driveStorageFailCount = 0;
+
+function isStaleDriveStorageUrl(url) {
+  return Boolean(url && url.includes('/drive-storage/') && driveStorageFailCount >= 2);
+}
+
+async function fetchMediaBlobWithRetry(fileId, auth = {}) {
   const { accessToken = '', apiKey = '' } = typeof auth === 'string' ? { accessToken: auth } : auth;
   const baseUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`;
   const url = !accessToken && apiKey
     ? `${baseUrl}&key=${encodeURIComponent(apiKey)}`
     : baseUrl;
   const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
-  const resp = await fetch(url, { headers });
-  if ((resp.status === 429 || resp.status === 503) && attempt < 1) {
-    await new Promise((r) => setTimeout(r, 1200));
-    return fetchMediaBlobWithRetry(fileId, { accessToken, apiKey }, attempt + 1);
-  }
+  const resp = await fetchWithDriveBackoff(url, { headers });
   if (!resp.ok) {
     throw new Error(`HTTP ${resp.status}`);
   }
@@ -226,13 +229,15 @@ async function resolveImageSrc(item, size, getAccessToken, getApiKey) {
   }
 
   const thumbUrl = buildDriveThumbUrl(item, size);
-  if (thumbUrl) {
+  if (thumbUrl && !isStaleDriveStorageUrl(thumbUrl)) {
     try {
       await loadViaImgTag(thumbUrl);
+      if (thumbUrl.includes('/drive-storage/')) driveStorageFailCount = 0;
       objectUrlCache.set(memKey, thumbUrl);
       return thumbUrl;
     } catch {
-      // Fall through to fresh Drive / lh3 / alt=media fallbacks (handles expired thumbnailLink tokens)
+      if (thumbUrl.includes('/drive-storage/')) driveStorageFailCount += 1;
+      // Fall through to zero-quota Drive/lh3 CDN or 5-unit fresh thumbnailLink
     }
   }
 
@@ -248,7 +253,27 @@ async function resolveImageSrc(item, size, getAccessToken, getApiKey) {
         objectUrlCache.set(memKey, candidateUrl);
         return candidateUrl;
       } catch {
-        // Try next lightweight endpoint
+        // Try next zero-quota endpoint
+      }
+    }
+  }
+
+  const token = typeof getAccessToken === 'function' ? getAccessToken() : '';
+  const apiKey = typeof getApiKey === 'function' ? getApiKey() : '';
+
+  // Spend 5 quota units (files.get?fields=thumbnailLink) before 200-unit alt=media download
+  if ((token || apiKey) && item.id) {
+    const freshLink = await fetchFreshThumbnailLink(item.id, { accessToken: token, apiKey });
+    if (freshLink) {
+      item.thumbnailLink = freshLink;
+      driveStorageFailCount = 0;
+      const freshSized = buildDriveThumbUrl(item, size);
+      try {
+        await loadViaImgTag(freshSized);
+        objectUrlCache.set(memKey, freshSized);
+        return freshSized;
+      } catch {
+        // Fall through to alt=media fallback
       }
     }
   }
@@ -265,8 +290,6 @@ async function resolveImageSrc(item, size, getAccessToken, getApiKey) {
     return objUrl;
   }
 
-  const token = typeof getAccessToken === 'function' ? getAccessToken() : '';
-  const apiKey = typeof getApiKey === 'function' ? getApiKey() : '';
   if (!token && !apiKey) {
     throw new Error('Missing Google Drive access token or API key');
   }
@@ -316,44 +339,54 @@ function rememberHdInMemory(hdKey, fileId, url, protectedIds = null) {
   }
 }
 
-function decodeImageUrl(url) {
+function decodeImageUrl(url, signal = null) {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
     const probe = new Image();
+    let settled = false;
+    const cleanup = () => {
+      signal?.removeEventListener('abort', onAbort);
+    };
+    function onAbort() {
+      if (settled) return;
+      settled = true;
+      probe.src = '';
+      cleanup();
+      reject(new DOMException('Aborted', 'AbortError'));
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
     probe.referrerPolicy = 'no-referrer';
     probe.decoding = 'async';
     probe.onload = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
       if (typeof probe.decode === 'function') {
         probe.decode().then(() => resolve(url), () => resolve(url));
       } else {
         resolve(url);
       }
     };
-    probe.onerror = () => reject(new Error('HD image decode failed'));
+    probe.onerror = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      reject(new Error('HD image decode failed'));
+    };
     probe.src = url;
   });
 }
 
-async function fetchOriginalHdStream(item, auth = {}, signal = null, onProgress = null, attempt = 0) {
+async function fetchOriginalHdStream(item, auth = {}, signal = null, onProgress = null) {
   const { accessToken = '', apiKey = '' } = auth;
   const baseUrl = `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(item.id)}?alt=media&supportsAllDrives=true`;
   const url = !accessToken && apiKey ? `${baseUrl}&key=${encodeURIComponent(apiKey)}` : baseUrl;
   const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
 
-  const resp = await fetch(url, { headers, signal });
-  if ((resp.status === 429 || resp.status === 503) && attempt < 1) {
-    await new Promise((resolve, reject) => {
-      const timer = setTimeout(resolve, 900);
-      signal?.addEventListener(
-        'abort',
-        () => {
-          clearTimeout(timer);
-          reject(new DOMException('Aborted', 'AbortError'));
-        },
-        { once: true }
-      );
-    });
-    return fetchOriginalHdStream(item, auth, signal, onProgress, attempt + 1);
-  }
+  const resp = await fetchWithDriveBackoff(url, { headers, signal });
   if (!resp.ok) {
     throw new Error(`HTTP ${resp.status}`);
   }
@@ -441,6 +474,68 @@ export async function loadHdPhoto(
 
   const token = typeof getAccessToken === 'function' ? getAccessToken() : '';
   const apiKey = typeof getApiKey === 'function' ? getApiKey() : '';
+
+  // Step 1: Zero-quota 4K (3840px) Google Edge Image CDN (0 quota units, 0 Drive API 1TB egress)
+  let simVal = 0.14;
+  const simTimer = onProgress
+    ? setInterval(() => {
+        simVal = Math.min(0.86, simVal + (0.9 - simVal) * 0.24);
+        onProgress(simVal);
+      }, 85)
+    : null;
+
+  try {
+    const directThumb = buildDriveThumbUrl(item, 3840);
+    const cdnCandidates = [
+      !isStaleDriveStorageUrl(directThumb) ? directThumb : '',
+      `https://lh3.googleusercontent.com/d/${encodeURIComponent(item.id)}=s3840`,
+      `https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w3840`,
+    ].filter(Boolean);
+
+    const seen = new Set();
+    for (const candidateUrl of cdnCandidates) {
+      if (seen.has(candidateUrl)) continue;
+      seen.add(candidateUrl);
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      try {
+        await decodeImageUrl(candidateUrl, signal);
+        if (candidateUrl.includes('/drive-storage/')) driveStorageFailCount = 0;
+        rememberHdInMemory(hdKey, item.id, candidateUrl, smartHdState.protectedIds);
+        if (onProgress) onProgress(1);
+        return { src: candidateUrl, fromMemory: false };
+      } catch (err) {
+        if (err?.name === 'AbortError' || signal?.aborted) throw err;
+        if (candidateUrl.includes('/drive-storage/')) driveStorageFailCount += 1;
+      }
+    }
+
+    // Step 2: 5-quota-unit fresh thumbnailLink refresh (40x cheaper than 200-unit alt=media)
+    if (token || apiKey) {
+      const freshLink = await fetchFreshThumbnailLink(
+        item.id,
+        { accessToken: token, apiKey },
+        signal
+      );
+      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+      if (freshLink) {
+        item.thumbnailLink = freshLink;
+        driveStorageFailCount = 0;
+        const freshHdUrl = buildDriveThumbUrl(item, 3840);
+        try {
+          await decodeImageUrl(freshHdUrl, signal);
+          rememberHdInMemory(hdKey, item.id, freshHdUrl, smartHdState.protectedIds);
+          if (onProgress) onProgress(1);
+          return { src: freshHdUrl, fromMemory: false };
+        } catch (err) {
+          if (err?.name === 'AbortError' || signal?.aborted) throw err;
+        }
+      }
+    }
+  } finally {
+    if (simTimer) clearInterval(simTimer);
+  }
+
+  // Step 3: 200-quota-unit alt=media original stream fallback (only when no Drive thumbnail exists)
   const mime = item.mimeType || 'image/jpeg';
   const fileSize = Number(item.size || 0);
   const canStreamOriginal =
@@ -449,69 +544,26 @@ export async function loadHdPhoto(
     (fileSize === 0 || fileSize <= MAX_ORIGINAL_STREAM_BYTES);
 
   if (canStreamOriginal) {
+    const blob = await fetchOriginalHdStream(
+      item,
+      { accessToken: token, apiKey },
+      signal,
+      onProgress
+    );
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    const objUrl = URL.createObjectURL(blob);
     try {
-      const blob = await fetchOriginalHdStream(
-        item,
-        { accessToken: token, apiKey },
-        signal,
-        onProgress
-      );
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      const objUrl = URL.createObjectURL(blob);
-      try {
-        await decodeImageUrl(objUrl);
-        rememberHdInMemory(hdKey, item.id, objUrl, smartHdState.protectedIds);
-        if (blob.size > 0 && blob.size <= MAX_IDB_HD_BLOB_BYTES) {
-          setCachedBlob(hdKey, blob).catch(() => {});
-        }
-        if (onProgress) onProgress(1);
-        return { src: objUrl, fromMemory: false };
-      } catch (decodeErr) {
-        URL.revokeObjectURL(objUrl);
-        throw decodeErr;
+      await decodeImageUrl(objUrl, signal);
+      rememberHdInMemory(hdKey, item.id, objUrl, smartHdState.protectedIds);
+      if (blob.size > 0 && blob.size <= MAX_IDB_HD_BLOB_BYTES) {
+        setCachedBlob(hdKey, blob).catch(() => {});
       }
-    } catch (err) {
-      if (err?.name === 'AbortError' || signal?.aborted) {
-        throw err;
-      }
-      // Fall through to 4096px server-rendered HD fallback (RAW/HEIC or restricted download quota)
+      if (onProgress) onProgress(1);
+      return { src: objUrl, fromMemory: false };
+    } catch (decodeErr) {
+      URL.revokeObjectURL(objUrl);
+      throw decodeErr;
     }
-  }
-
-  let simVal = 0.22;
-  const simTimer = onProgress
-    ? setInterval(() => {
-        simVal = Math.min(0.86, simVal + (0.9 - simVal) * 0.22);
-        onProgress(simVal);
-      }, 90)
-    : null;
-
-  try {
-    const candidates = [
-      `https://lh3.googleusercontent.com/d/${encodeURIComponent(item.id)}=s4096`,
-      `https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w4096`,
-      buildDriveThumbUrl(item, 4096),
-      `https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w2048`,
-      buildDriveThumbUrl(item, 2048),
-    ].filter(Boolean);
-
-    const seen = new Set();
-    for (const candidateUrl of candidates) {
-      if (seen.has(candidateUrl)) continue;
-      seen.add(candidateUrl);
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      try {
-        await decodeImageUrl(candidateUrl);
-        if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-        rememberHdInMemory(hdKey, item.id, candidateUrl, smartHdState.protectedIds);
-        if (onProgress) onProgress(1);
-        return { src: candidateUrl, fromMemory: false };
-      } catch {
-        // Try next HD endpoint
-      }
-    }
-  } finally {
-    if (simTimer) clearInterval(simTimer);
   }
 
   throw new Error('Failed to load HD photo');
@@ -588,14 +640,13 @@ function selectNextSmartHdTarget() {
 function pumpSmartHdScheduler() {
   const next = selectNextSmartHdTarget();
 
-  // Tier 1: Always load page & slide previews FIRST before starting heavy HD downloads
-  if (!loadQueue.isIdle()) {
+  // Tier 1: Background preloads (lookahead idx+1..idx+3 and rated/favorited page picks)
+  // always wait until all page previews finish; only the 1 photo actively open in front of
+  // the user (next.isCurrentLightbox) may load its 4K CDN HD without waiting behind 80 cards.
+  if (!loadQueue.isIdle() && !next?.isCurrentLightbox) {
     if (smartHdState.currentJob && smartHdState.currentJob.tier === 'rated') {
       smartHdState.currentJob.abortCtrl?.abort();
       smartHdState.currentJob = null;
-    }
-    if (next && next.isCurrentLightbox && !smartHdState.currentJob) {
-      emitHdStatus({ itemId: next.item.id, status: 'queued', progress: 0.06, tier: 'lightbox' });
     }
     return;
   }
@@ -687,6 +738,7 @@ export function updateSmartHdSchedule({
 } = {}) {
   if (albumKey && albumKey !== smartHdState.albumKey) {
     smartHdState.albumKey = albumKey;
+    driveStorageFailCount = 0;
     failedHdIds.clear();
     if (smartHdState.currentJob) {
       smartHdState.currentJob.abortCtrl?.abort();
@@ -826,6 +878,7 @@ export async function clearImageCache() {
   }
   hdCachedIds.clear();
   failedHdIds.clear();
+  driveStorageFailCount = 0;
   for (const url of objectUrlCache.values()) {
     if (typeof url === 'string' && url.startsWith('blob:')) {
       try {

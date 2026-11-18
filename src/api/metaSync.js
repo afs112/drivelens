@@ -4,6 +4,7 @@
  * - member-<key>.json: Each member writes ONLY to their own JSON file
  */
 import { t } from '../i18n.js';
+import { fetchWithDriveBackoff } from './gdrive.js';
 
 const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const DRIVE_UPLOAD_API = 'https://www.googleapis.com/upload/drive/v3';
@@ -23,7 +24,7 @@ export function sanitizeMemberKey(memberId) {
 }
 
 async function fetchJsonMedia(fileId, accessToken) {
-  const resp = await fetch(
+  const resp = await fetchWithDriveBackoff(
     `${DRIVE_API}/files/${encodeURIComponent(fileId)}?alt=media&supportsAllDrives=true`,
     { headers: { Authorization: `Bearer ${accessToken}` } }
   );
@@ -46,7 +47,7 @@ async function findChildByName(parentId, name, mimeType, accessToken) {
     supportsAllDrives: 'true',
     includeItemsFromAllDrives: 'true',
   });
-  const resp = await fetch(`${DRIVE_API}/files?${params.toString()}`, {
+  const resp = await fetchWithDriveBackoff(`${DRIVE_API}/files?${params.toString()}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!resp.ok) {
@@ -65,7 +66,7 @@ export async function ensureMetaFolder(rootFolderId, accessToken) {
   );
   if (existing) return existing.id;
 
-  const resp = await fetch(`${DRIVE_API}/files?supportsAllDrives=true`, {
+  const resp = await fetchWithDriveBackoff(`${DRIVE_API}/files?supportsAllDrives=true`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${accessToken}`,
@@ -102,7 +103,7 @@ async function createJsonFile(parentId, name, dataObj, accessToken) {
     `${content}\r\n` +
     `--${boundary}--`;
 
-  const resp = await fetch(
+  const resp = await fetchWithDriveBackoff(
     `${DRIVE_UPLOAD_API}/files?uploadType=multipart&supportsAllDrives=true`,
     {
       method: 'POST',
@@ -121,7 +122,7 @@ async function createJsonFile(parentId, name, dataObj, accessToken) {
 }
 
 async function updateJsonFile(fileId, dataObj, accessToken) {
-  const resp = await fetch(
+  const resp = await fetchWithDriveBackoff(
     `${DRIVE_UPLOAD_API}/files/${encodeURIComponent(fileId)}?uploadType=media&supportsAllDrives=true`,
     {
       method: 'PATCH',
@@ -177,7 +178,7 @@ export async function loadAlbumMetadata(metaFolderId, accessToken) {
     supportsAllDrives: 'true',
     includeItemsFromAllDrives: 'true',
   });
-  const listResp = await fetch(`${DRIVE_API}/files?${params.toString()}`, {
+  const listResp = await fetchWithDriveBackoff(`${DRIVE_API}/files?${params.toString()}`, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
   if (!listResp.ok) {

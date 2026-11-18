@@ -84,7 +84,7 @@ DriveLens ships with [`manifest.webmanifest`](manifest.webmanifest), [`sw.js`](s
 - **Requirements**: Service Worker registration and PWA installation activate automatically on HTTPS deployments (`GitHub Pages`, `Cloudflare Pages`, `Netlify Drop`) and on local `http://localhost:<port>` / `http://127.0.0.1:<port>` (treated as secure contexts by browsers; remote plain HTTP LAN IPs do not allow Service Workers).
 - **Desktop Chrome / Edge**: Look for the **Install App** button (`[data-header="install-app"]`) in the DriveLens top header—shown automatically when the browser fires `beforeinstallprompt`—or click the install icon in the browser address bar to launch DriveLens in its own standalone window.
 - **iOS / iPadOS Safari**: Open your HTTPS-hosted DriveLens URL in Safari and choose **Share → Add to Home Screen** (`apple-mobile-web-app-capable` and `apple-touch-icon` are preconfigured in [`index.html`](index.html)).
-- **Offline App Shell Caching**: `sw.js` (`drivelens-shell-v7`) precaches the core HTML, CSS, SVG/PNG icons, and entry ES modules using a **Network-First** strategy with navigation fallback to `./index.html`. Cross-origin Google Drive API calls and local `/api/` metadata calls always bypass the Service Worker cache.
+- **Offline App Shell Caching**: `sw.js` (`drivelens-shell-v8`) precaches the core HTML, CSS, SVG/PNG icons, and entry ES modules using a **Network-First** strategy with navigation fallback to `./index.html`. Cross-origin Google Drive API calls and local `/api/` metadata calls always bypass the Service Worker cache.
 
 ---
 

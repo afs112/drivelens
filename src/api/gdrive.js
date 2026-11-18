@@ -1,6 +1,7 @@
 /**
  * Google Drive API v3 & Google Identity Services (OAuth 2.0) Client
  */
+import { APP_CONFIG } from '../constants.js';
 import { t } from '../i18n.js';
 
 const GIS_SCRIPT_URL = 'https://accounts.google.com/gsi/client';
@@ -271,10 +272,104 @@ export async function authenticateGoogle(clientId, options = {}) {
   return session;
 }
 
+async function isRetryableDriveResponse(resp) {
+  if (
+    resp.status === 429 ||
+    resp.status === 500 ||
+    resp.status === 502 ||
+    resp.status === 503 ||
+    resp.status === 504
+  ) {
+    return true;
+  }
+  if (resp.status === 403) {
+    const bodyText = await resp
+      .clone()
+      .text()
+      .catch(() => '');
+    return bodyText.includes('rateLimitExceeded') || bodyText.includes('userRateLimitExceeded');
+  }
+  return false;
+}
+
+function sleepWithAbort(ms, signal = null) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException('Aborted', 'AbortError'));
+      return;
+    }
+    const timer = setTimeout(() => {
+      signal?.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    function onAbort() {
+      clearTimeout(timer);
+      reject(new DOMException('Aborted', 'AbortError'));
+    }
+    signal?.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Official Google Drive API truncated exponential backoff with random millisecond jitter:
+ * wait = min((2^n) * 1000 + random_ms(0..1000), maximum_backoff)
+ * Ref: https://developers.google.com/workspace/drive/api/guides/limits
+ */
+export async function fetchWithDriveBackoff(
+  url,
+  fetchOptions = {},
+  {
+    maxRetries = APP_CONFIG.DRIVE_MAX_RETRIES || 4,
+    maxBackoffMs = APP_CONFIG.DRIVE_MAX_BACKOFF_MS || 32000,
+    baseDelayMs = 1000,
+  } = {}
+) {
+  const signal = fetchOptions?.signal || null;
+  let attempt = 0;
+
+  while (true) {
+    const resp = await fetch(url, fetchOptions);
+    if (resp.ok || attempt >= maxRetries || !(await isRetryableDriveResponse(resp))) {
+      return resp;
+    }
+
+    const retryAfterSec = Number(resp.headers.get('retry-after') || 0);
+    const jitterMs = Math.floor(Math.random() * 1000);
+    const expMs = Math.min(2 ** attempt * baseDelayMs + jitterMs, maxBackoffMs);
+    const waitMs =
+      Number.isFinite(retryAfterSec) && retryAfterSec > 0
+        ? Math.min(Math.max(expMs, retryAfterSec * 1000 + jitterMs), maxBackoffMs)
+        : expMs;
+
+    attempt += 1;
+    await sleepWithAbort(waitMs, signal);
+  }
+}
+
+export async function fetchFreshThumbnailLink(fileId, auth = {}, signal = null) {
+  if (!fileId) return '';
+  const { accessToken = '', apiKey = '' } =
+    typeof auth === 'string' ? { accessToken: auth } : auth;
+  if (!accessToken && !apiKey) return '';
+
+  const baseUrl = `${DRIVE_API}/files/${encodeURIComponent(fileId)}?fields=thumbnailLink&supportsAllDrives=true`;
+  const url = !accessToken && apiKey ? `${baseUrl}&key=${encodeURIComponent(apiKey)}` : baseUrl;
+  const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+  try {
+    const resp = await fetchWithDriveBackoff(url, { headers, signal }, { maxRetries: 2 });
+    if (!resp.ok) return '';
+    const data = await resp.json();
+    return typeof data?.thumbnailLink === 'string' ? data.thumbnailLink : '';
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    return '';
+  }
+}
+
 async function driveJsonFetch(url, auth = {}) {
   const { accessToken = '', apiKey = '' } = typeof auth === 'string' ? { accessToken: auth } : auth;
   const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
-  const resp = await fetch(url, { headers });
+  const resp = await fetchWithDriveBackoff(url, { headers });
 
   if (resp.status === 400 && !accessToken && apiKey) {
     const text = await resp.text().catch(() => '');
@@ -327,7 +422,7 @@ async function listFolderChildren(folderId, auth) {
     const params = new URLSearchParams({
       q,
       fields,
-      pageSize: '200',
+      pageSize: String(APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000),
       supportsAllDrives: 'true',
       includeItemsFromAllDrives: 'true',
     });
@@ -358,7 +453,7 @@ async function crawlAlbumTree({
   let queue = [{ id: rootFolder.id, depth: 0 }];
   const visited = new Set([rootFolder.id]);
   const MAX_DEPTH = 6;
-  const BATCH_SIZE = 6;
+  const BATCH_SIZE = 4;
   let lastBatchEmit = 0;
   let emittedInitialBatch = false;
 
@@ -542,7 +637,7 @@ export async function downloadOriginalFile(item, accessToken, apiKey = '') {
   const fetchOptions = accessToken ? { headers: { Authorization: `Bearer ${accessToken}` } } : {};
 
   try {
-    const resp = await fetch(url, fetchOptions);
+    const resp = await fetchWithDriveBackoff(url, fetchOptions);
     if (!resp.ok) {
       if (!accessToken && apiKey) {
         window.open(fallbackDownloadUrl, '_blank', 'noopener');
