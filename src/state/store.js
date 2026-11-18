@@ -39,7 +39,16 @@ const SETTINGS_KEY = 'drivelens_connect_prefs_v1';
 const UI_PREFS_KEY = 'drivelens_ui_prefs_v1';
 const ALBUM_CACHE_TTL_MS = 30 * 60 * 1000;
 const VALID_LAYOUT_MODES = ['justified', 'waterfall', 'grid'];
-const VALID_SORT_MODES = ['dateDesc', 'dateAsc', 'ratingDesc', 'nameAsc', 'sizeDesc'];
+const VALID_SORT_MODES = [
+  'dateDesc',
+  'dateAsc',
+  'ratingDesc',
+  'ratingAsc',
+  'nameAsc',
+  'nameDesc',
+  'sizeDesc',
+  'sizeAsc',
+];
 
 const MEMBER_COLORS = [
   '#38bdf8',
@@ -295,6 +304,8 @@ export class Store {
       includeSubfolders: uiPrefs.includeSubfolders,
       searchQuery: '',
       quickView: 'all',
+      mediaFilter: 'all',
+      aspectFilter: 'all',
       ratingScope: 'avg',
       minRating: 0,
       memberFilterId: null,
@@ -494,6 +505,8 @@ export class Store {
       focusedPhotoId: firstPhoto,
       lightboxPhotoId: null,
       quickView: 'all',
+      mediaFilter: 'all',
+      aspectFilter: 'all',
       minRating: 0,
       memberFilterId: null,
       ratingScope: 'avg',
@@ -1887,6 +1900,8 @@ export class Store {
       activeFolderId,
       includeSubfolders,
       quickView,
+      mediaFilter,
+      aspectFilter,
       ratingScope,
       minRating,
       memberFilterId,
@@ -1913,6 +1928,8 @@ export class Store {
       cached.activeFolderId === activeFolderId &&
       cached.includeSubfolders === includeSubfolders &&
       cached.quickView === quickView &&
+      cached.mediaFilter === mediaFilter &&
+      cached.aspectFilter === aspectFilter &&
       cached.ratingScope === ratingScope &&
       cached.minRating === minRating &&
       cached.memberFilterId === memberFilterId &&
@@ -1938,6 +1955,19 @@ export class Store {
     const matched = [];
     for (const file of files) {
       if (allowedFolderIds && !allowedFolderIds.has(file.parentId)) continue;
+
+      const isVideo = Boolean(file.mimeType && file.mimeType.startsWith('video/'));
+      if (mediaFilter === 'photo' && isVideo) continue;
+      if (mediaFilter === 'video' && !isVideo) continue;
+
+      if (aspectFilter && aspectFilter !== 'all') {
+        const w = Number(file.imageMediaMetadata?.width || file.videoMediaMetadata?.width || 0);
+        const h = Number(file.imageMediaMetadata?.height || file.videoMediaMetadata?.height || 0);
+        const ratio = w > 0 && h > 0 ? w / h : 1.5;
+        if (aspectFilter === 'landscape' && ratio <= 1.08) continue;
+        if (aspectFilter === 'portrait' && ratio >= 0.92) continue;
+        if (aspectFilter === 'square' && (ratio < 0.92 || ratio > 1.08)) continue;
+      }
 
       const meta = this.getAggregatedItemMeta(file.id);
 
@@ -1969,10 +1999,14 @@ export class Store {
       }
 
       if (query) {
-        const camText = `${file.imageMediaMetadata?.cameraMake || ''} ${file.imageMediaMetadata?.cameraModel || ''}`;
+        const exif = file.imageMediaMetadata || {};
+        const camText = `${exif.cameraMake || ''} ${exif.cameraModel || ''} ${exif.focalLength ? `${exif.focalLength}mm` : ''} ${exif.isoSpeed ? `iso${exif.isoSpeed}` : ''}`;
         const notesText = meta.notesByMember.map((n) => n.note).join(' ');
         const tagNames = meta.activeTagIds.map((id) => schemaTags[id]?.name || '').join(' ');
-        const haystack = `${file.name} ${camText} ${notesText} ${tagNames}`.toLowerCase();
+        const ts = getPhotoTimestamp(file);
+        const dateStr = ts > 0 ? new Date(ts).toISOString().slice(0, 10) : '';
+        const dateSlash = dateStr ? dateStr.replace(/-/g, '/') : '';
+        const haystack = `${file.name} ${camText} ${notesText} ${tagNames} ${dateStr} ${dateSlash}`.toLowerCase();
         if (!haystack.includes(query)) continue;
       }
 
@@ -1988,10 +2022,19 @@ export class Store {
           if (Math.abs(diff) > 0.001) return diff;
           return b.meta.ratingCount - a.meta.ratingCount || getPhotoTimestamp(b.file) - getPhotoTimestamp(a.file);
         }
+        case 'ratingAsc': {
+          const diff = a.meta.avgRating - b.meta.avgRating;
+          if (Math.abs(diff) > 0.001) return diff;
+          return a.meta.ratingCount - b.meta.ratingCount || getPhotoTimestamp(a.file) - getPhotoTimestamp(b.file);
+        }
         case 'nameAsc':
           return a.file.name.localeCompare(b.file.name, locale);
+        case 'nameDesc':
+          return b.file.name.localeCompare(a.file.name, locale);
         case 'sizeDesc':
           return (b.file.size || 0) - (a.file.size || 0);
+        case 'sizeAsc':
+          return (a.file.size || 0) - (b.file.size || 0);
         case 'dateDesc':
         default:
           return getPhotoTimestamp(b.file) - getPhotoTimestamp(a.file);
@@ -2010,6 +2053,8 @@ export class Store {
       activeFolderId,
       includeSubfolders,
       quickView,
+      mediaFilter,
+      aspectFilter,
       ratingScope,
       minRating,
       memberFilterId,
@@ -2546,6 +2591,8 @@ export class Store {
   clearAllFilters() {
     this.setState({
       quickView: 'all',
+      mediaFilter: 'all',
+      aspectFilter: 'all',
       ratingScope: 'avg',
       minRating: 0,
       memberFilterId: null,

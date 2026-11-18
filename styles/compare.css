@@ -304,9 +304,12 @@
 }
 
 .compare-avg-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
   font-size: 11.5px;
   font-weight: 600;
-  color: var(--star-gold);
+  color: var(--text-primary);
   white-space: nowrap;
 }
 
@@ -323,14 +326,14 @@
 }
 
 .compare-fav-btn.is-favorited {
-  color: var(--heart-rose);
-  border-color: rgba(244, 63, 94, 0.45);
-  background: var(--heart-soft);
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+  background: var(--lg-pill-bg);
 }
 
 .compare-fav-btn.is-favorited:hover {
-  background: rgba(244, 63, 94, 0.24);
-  border-color: rgba(244, 63, 94, 0.6);
+  background: var(--bg-active);
+  border-color: var(--border-strong);
 }
 
 .compare-fav-count {

@@ -2,7 +2,7 @@ import { downloadOriginalFile } from '../api/gdrive.js';
 import { getLocaleTag, t } from '../i18n.js';
 import { resolvePhotoTimestamp } from '../state/store.js';
 import { loadPhotoIntoElement } from '../storage/imageLoader.js';
-import { escapeAttr, escapeHtml, icon } from './icons.js';
+import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 
 function formatBytes(bytes) {
   const n = Number(bytes || 0);
@@ -109,7 +109,7 @@ export function renderInspector(container, store) {
               ${[1, 2, 3, 4, 5]
                 .map(
                   (r) =>
-                    `<button type="button" class="star-btn" data-insp="batch-rate" data-rating="${r}" title="${escapeAttr(t('inspector.batchRateTitle', { n: r }))}">${icon('starFilled', 18)}</button>`
+                    `<button type="button" class="star-btn" data-insp="batch-rate" data-rating="${r}" title="${escapeAttr(t('inspector.batchRateTitle', { n: r }))}">${starSectorIcon(r, 18)}</button>`
                 )
                 .join('')}
             </div>
@@ -161,7 +161,7 @@ export function renderInspector(container, store) {
         data-photo-id="${escapeAttr(file.id)}"
         data-rating="${r}"
         title="${escapeAttr(t('inspector.rateTitle', { n: r }))}"
-      >${icon(meta.myRating >= r ? 'starFilled' : 'star', 18)}</button>
+      >${icon(meta.myRating >= r ? 'starFilled' : 'star', 17)}</button>
     `
     )
     .join('');
@@ -178,13 +178,13 @@ export function renderInspector(container, store) {
               </span>
               <span>${escapeHtml(entry.member.name)}${entry.member.id === state.currentUser.id ? escapeHtml(t('sidebar.meSuffix')) : ''}</span>
             </span>
-            <span style="display:inline-flex;align-items:center;gap:6px">
+            <span style="display:inline-flex;align-items:center;gap:6px;color:var(--text-primary)">
               ${
                 entry.rating > 0
-                  ? `<span style="color:var(--star-gold);font-weight:600">${entry.rating} ★</span>`
+                  ? `<span style="display:inline-flex;align-items:center;gap:3px;font-weight:600">${starSectorIcon(entry.rating, 13)}<span>${entry.rating}</span></span>`
                   : ''
               }
-              ${entry.favorite ? `<span style="color:var(--heart-rose)">${icon('heartFilled', 13)}</span>` : ''}
+              ${entry.favorite ? `<span style="display:inline-flex">${icon('heartFilled', 13)}</span>` : ''}
             </span>
           </div>
         `
@@ -251,7 +251,7 @@ export function renderInspector(container, store) {
       <div class="inspector-card">
         <div class="inspector-card-title">
           <span>${escapeHtml(t('inspector.ratingSection'))}</span>
-          <span style="color:var(--star-gold)">${escapeHtml(t('inspector.avgSummary', { avg: avgText, count: meta.ratingCount }))}</span>
+          <span style="display:inline-flex;align-items:center;gap:4px;color:var(--text-primary)">${starSectorIcon(meta.avgRating, 13)}<span>${escapeHtml(t('inspector.avgSummary', { avg: avgText, count: meta.ratingCount }))}</span></span>
         </div>
         <div style="display:flex;align-items:center;justify-content:space-between;gap:8px">
           <div class="star-input">
@@ -266,7 +266,6 @@ export function renderInspector(container, store) {
             <button
               type="button"
               class="btn btn-sm ${meta.myFavorite ? 'is-active' : ''}"
-              style="${meta.myFavorite ? 'color:var(--heart-rose);border-color:rgba(244,63,94,0.45);background:var(--heart-soft)' : ''}"
               data-insp="toggle-fav"
               data-photo-id="${escapeAttr(file.id)}"
               title="${escapeAttr(t('inspector.favToggleTitle'))}"

@@ -7,7 +7,7 @@ import {
   loadPhotoIntoElement,
   subscribeHdStatus,
 } from '../storage/imageLoader.js';
-import { escapeAttr, escapeHtml, icon } from './icons.js';
+import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 
 let activeLightboxPhotoId = null;
 let activeLightboxLang = '';
@@ -16,6 +16,7 @@ let lastPhotoIndex = -1;
 let pendingSwipeOffsetPx = null;
 let isClosingAnimated = false;
 
+let liveZoom = 1;
 let panX = 0;
 let panY = 0;
 let isDragging = false;
@@ -23,12 +24,14 @@ let isPinching = false;
 let isTouchPanning = false;
 let dragStartX = 0;
 let dragStartY = 0;
+let transformRafId = 0;
 
 const slideCache = new Map();
 const slideProgressById = new Map();
 let hdHideTimer = 0;
 let activeLightboxContainer = null;
 let activeStoreRef = null;
+let resizeBound = false;
 
 function trimSlideCache(keepIds) {
   if (slideCache.size <= 7) return;
@@ -44,6 +47,10 @@ function trimSlideCache(keepIds) {
 function clearAllSlideLoads() {
   clearTimeout(hdHideTimer);
   hdHideTimer = 0;
+  if (transformRafId) {
+    cancelAnimationFrame(transformRafId);
+    transformRafId = 0;
+  }
   slideProgressById.clear();
   slideCache.clear();
 }
@@ -69,6 +76,7 @@ subscribeHdStatus(({ itemId, status, progress, src, fromMemory }) => {
   if (slide && status === 'ready' && src && slide._imgEl) {
     slide._imgEl.referrerPolicy = 'no-referrer';
     slide._imgEl.dataset.hdLoaded = 'true';
+    slide._imgEl.dataset.loadedSize = '3840';
     slide._imgEl.src = src;
     slide._imgEl.classList.add('is-loaded');
     slide._hdReady = true;
@@ -111,31 +119,138 @@ function getCssEscape(val) {
   return String(val).replace(/["\\]/g, '\\$&');
 }
 
-function applyImageTransform(container, zoom) {
-  const img = container.querySelector('.lightbox-img');
+function resolveItemIntrinsicSize(item, fallbackImg = null) {
+  const metaW = Number(item?.imageMediaMetadata?.width || item?.videoMediaMetadata?.width || 0);
+  const metaH = Number(item?.imageMediaMetadata?.height || item?.videoMediaMetadata?.height || 0);
+  if (metaW > 0 && metaH > 0) {
+    return { width: metaW, height: metaH, hasExactMeta: true };
+  }
+  if (fallbackImg && fallbackImg.naturalWidth > 0 && fallbackImg.naturalHeight > 0) {
+    return {
+      width: fallbackImg.naturalWidth,
+      height: fallbackImg.naturalHeight,
+      hasExactMeta: false,
+    };
+  }
+  const cardImg = item?.id
+    ? document.querySelector(`.photo-card[data-photo-id="${getCssEscape(item.id)}"] img`)
+    : null;
+  if (cardImg && cardImg.naturalWidth > 0 && cardImg.naturalHeight > 0) {
+    return { width: cardImg.naturalWidth, height: cardImg.naturalHeight, hasExactMeta: false };
+  }
+  return { width: 1600, height: 1067, hasExactMeta: false };
+}
+
+function computeFittedMediaBox(container, item, imgEl = null) {
+  const stage = container?.querySelector('.lightbox-stage');
+  const stageW = stage?.clientWidth || window.innerWidth || 1280;
+  const stageH = stage?.clientHeight || window.innerHeight || 800;
+  const padX = stageW <= 640 ? 8 : 24;
+  const padY = stageW <= 640 ? 12 : 20;
+  const availW = Math.max(120, stageW - padX * 2);
+  const availH = Math.max(120, stageH - padY * 2);
+
+  const { width, height, hasExactMeta } = resolveItemIntrinsicSize(item, imgEl);
+  const ratio = width > 0 && height > 0 ? width / height : 1.5;
+
+  const maxW = hasExactMeta && width >= 320 ? Math.min(availW, width) : availW;
+  const maxH = hasExactMeta && height >= 320 ? Math.min(availH, height) : availH;
+
+  let boxW = maxW;
+  let boxH = boxW / ratio;
+  if (boxH > maxH) {
+    boxH = maxH;
+    boxW = boxH * ratio;
+  }
+
+  return {
+    width: Math.max(80, Math.round(boxW)),
+    height: Math.max(80, Math.round(boxH)),
+    stageW,
+    stageH,
+  };
+}
+
+function applySlideMediaBox(container, slide) {
+  const imgEl = slide?._imgEl;
+  const item = slide?._itemRef;
+  if (!imgEl || !item) return null;
+  const box = computeFittedMediaBox(container, item, imgEl);
+  const nextW = `${box.width}px`;
+  const nextH = `${box.height}px`;
+  if (imgEl.style.width !== nextW) imgEl.style.width = nextW;
+  if (imgEl.style.height !== nextH) imgEl.style.height = nextH;
+  slide._fittedBox = box;
+  return box;
+}
+
+function applyImageTransformNow(container) {
+  transformRafId = 0;
+  if (!container) return;
+  const curSlide = activeLightboxPhotoId ? slideCache.get(activeLightboxPhotoId) : null;
+  const img = curSlide?._imgEl || container.querySelector('.lightbox-img');
   if (!img) return;
-  img.style.transition = isDragging || isPinching || isTouchPanning ? 'none' : '';
-  if (zoom <= 1) {
+  const interacting = isDragging || isPinching || isTouchPanning;
+  img.style.transition = interacting ? 'none' : 'transform 140ms cubic-bezier(0.22, 1, 0.36, 1)';
+  if (liveZoom <= 1) {
     panX = 0;
     panY = 0;
     img.style.cursor = 'grab';
     img.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
   } else {
     img.style.cursor = isDragging ? 'grabbing' : 'grab';
-    img.style.transform = `translate3d(${panX}px, ${panY}px, 0) scale(${zoom})`;
+    img.style.transform = `translate3d(${Math.round(panX * 2) / 2}px, ${Math.round(panY * 2) / 2}px, 0) scale(${liveZoom})`;
   }
 }
 
-function computeFlipFromGridCard(container, fileId) {
+function scheduleImageTransform(container, immediate = false) {
+  if (immediate) {
+    if (transformRafId) {
+      cancelAnimationFrame(transformRafId);
+      transformRafId = 0;
+    }
+    applyImageTransformNow(container);
+    return;
+  }
+  if (transformRafId) return;
+  transformRafId = requestAnimationFrame(() => applyImageTransformNow(container));
+}
+
+function setLiveZoom(container, store, nextZoom, immediate = false) {
+  const clamped = Math.max(1, Math.min(3, Number(nextZoom.toFixed(2))));
+  liveZoom = clamped;
+  if (store?.state) {
+    store.state.lightboxZoom = clamped;
+  }
+  if (clamped <= 1) {
+    panX = 0;
+    panY = 0;
+  }
+  const zoomLabel = container?.querySelector('[data-lb-zoom-label]');
+  if (zoomLabel) {
+    zoomLabel.textContent = `${Math.round(clamped * 100)}%`;
+  }
+  scheduleImageTransform(container, immediate);
+}
+
+function computeFlipFromGridCard(container, fileId, targetBoxWidth = 0) {
   const stage = container.querySelector('.lightbox-stage');
   const card = document.querySelector(`.photo-card[data-photo-id="${getCssEscape(fileId)}"]`);
   if (!stage || !card) return null;
   const stageRect = stage.getBoundingClientRect();
   const cardRect = card.getBoundingClientRect();
   if (!stageRect.width || !cardRect.width) return null;
+
+  // Only animate to card position if the card actually overlaps the visible viewport
+  const vh = window.innerHeight || stageRect.height;
+  if (cardRect.bottom < -20 || cardRect.top > vh + 20) {
+    return null;
+  }
+
   const dx = Math.round(cardRect.left + cardRect.width / 2 - (stageRect.left + stageRect.width / 2));
   const dy = Math.round(cardRect.top + cardRect.height / 2 - (stageRect.top + stageRect.height / 2));
-  const scale = Math.max(0.18, Math.min(0.92, cardRect.width / (stageRect.width * 0.88)));
+  const refW = targetBoxWidth > 0 ? targetBoxWidth : stageRect.width * 0.86;
+  const scale = Math.max(0.16, Math.min(0.94, cardRect.width / refW));
   return { dx, dy, scale: Number(scale.toFixed(3)) };
 }
 
@@ -143,7 +258,6 @@ function acquireSlideElement(item, role, state, store) {
   const isCurrent = role === 'current';
   const isVideo = Boolean(item.mimeType && item.mimeType.startsWith('video/'));
 
-  // Non-demo active video needs fresh video/iframe element rather than image cache
   if (isVideo && !item.isDemo && isCurrent) {
     const slide = document.createElement('div');
     slide.className = `lightbox-slide is-${role}`;
@@ -188,9 +302,6 @@ function acquireSlideElement(item, role, state, store) {
     slide._imgEl = slide.querySelector('img');
     slide._previewRequested = false;
     slide._hdReady = false;
-    slide._hdLoading = false;
-    slide._hdProgress = 0;
-    slide._hdAbort = null;
     slideCache.set(item.id, slide);
   }
 
@@ -225,26 +336,23 @@ function ensureSlidePreview(slide, store) {
       imgEl.src = memHd;
     }
     imgEl.dataset.hdLoaded = 'true';
+    imgEl.dataset.loadedSize = '3840';
     imgEl.classList.add('is-loaded');
     slide._hdReady = true;
-    slide._hdProgress = 1;
     return;
   }
 
-  if (!imgEl.getAttribute('src')) {
-    const instant = getInstantCachedSrc(item, [2048, 600, 480]);
-    if (instant) {
-      imgEl.referrerPolicy = 'no-referrer';
-      imgEl.src = instant;
-      imgEl.classList.add('is-loaded');
-      return;
-    }
+  const instant = getInstantCachedSrc(item);
+  if (instant && !imgEl.getAttribute('src')) {
+    imgEl.referrerPolicy = 'no-referrer';
+    imgEl.src = instant;
+    imgEl.classList.add('is-loaded');
   }
 
   if (!slide._previewRequested && !slide._hdReady) {
     slide._previewRequested = true;
     loadPhotoIntoElement(imgEl, item, {
-      size: 480,
+      size: 800,
       eager: true,
       getAccessToken: () => store.state.accessToken,
       getApiKey: () => store.state.apiKey,
@@ -263,14 +371,64 @@ function syncCurrentSlideHdIndicator(container, item) {
   updateHdFloatIndicator(container, true, activeProg !== undefined ? Math.max(0.06, activeProg) : 0.06);
 }
 
+function renderLazyFilmstrip(container, store, visiblePhotos, activeFileId, activeIdx) {
+  if (lightboxChromeHidden) return;
+  const stripEl = container.querySelector('.lightbox-filmstrip');
+  if (!stripEl) return;
+
+  const total = visiblePhotos.length;
+  const WINDOW_HALF = 18;
+  const start = Math.max(0, (activeIdx >= 0 ? activeIdx : 0) - WINDOW_HALF);
+  const end = Math.min(total, start + WINDOW_HALF * 2);
+  const winKey = `${total}:${start}:${end}`;
+
+  if (stripEl.dataset.winKey !== winKey) {
+    stripEl.dataset.winKey = winKey;
+    const slice = visiblePhotos.slice(start, end);
+    stripEl.innerHTML = slice
+      .map(
+        (p) => `
+        <button type="button" class="filmstrip-thumb ${p.id === activeFileId ? 'active' : ''}" data-lb="jump" data-photo-id="${escapeAttr(p.id)}" title="${escapeAttr(p.name)}">
+          <img alt="" data-film-id="${escapeAttr(p.id)}" />
+        </button>
+      `
+      )
+      .join('');
+    const byId = new Map(slice.map((p) => [p.id, p]));
+    for (const simg of stripEl.querySelectorAll('img[data-film-id]')) {
+      const p = byId.get(simg.dataset.filmId);
+      if (p) {
+        loadPhotoIntoElement(simg, p, {
+          size: 240,
+          getAccessToken: () => store.state.accessToken,
+          getApiKey: () => store.state.apiKey,
+        });
+      }
+    }
+  } else {
+    for (const th of stripEl.querySelectorAll('.filmstrip-thumb')) {
+      th.classList.toggle('active', th.dataset.photoId === activeFileId);
+    }
+  }
+
+  const activeThumb = stripEl.querySelector('.filmstrip-thumb.active');
+  if (activeThumb && stripEl.clientWidth > 0) {
+    const targetLeft =
+      activeThumb.offsetLeft - (stripEl.clientWidth - activeThumb.offsetWidth) * 0.5;
+    stripEl.scrollLeft = Math.max(0, Math.round(targetLeft));
+  }
+}
+
 function buildLightboxRatingOptions() {
   return [1, 2, 3, 4, 5]
-    .map((n) => `
+    .map(
+      (n) => `
       <button type="button" class="btn btn-sm" data-lb="rate" data-rating="${n}"
         aria-pressed="false" aria-label="${escapeAttr(t('lightbox.rateTitle', { n }))}">
-        ${icon('star', 16)}<span>${n}</span>
+        ${starSectorIcon(n, 16)}<span>${n}</span>
       </button>
-    `)
+    `
+    )
     .join('');
 }
 
@@ -279,9 +437,8 @@ function buildLightboxTools() {
     <div class="lightbox-action-bar lightbox-glass-pill">
       <button type="button" class="btn btn-sm btn-icon" data-lb="toggle-rating" data-lb-popover
         aria-label="${escapeAttr(t('lightbox.ratingTitle'))}" aria-controls="lightboxRating" aria-expanded="false">
-        <span class="lightbox-rating-star" aria-hidden="true">${icon('star', 24)}</span>
+        <span class="lightbox-rating-star" data-lb-star-icon aria-hidden="true">${starSectorIcon(0, 18)}</span>
       </button>
-      <span class="lightbox-action-divider" aria-hidden="true"></span>
       <button
         type="button"
         class="btn btn-sm btn-icon"
@@ -302,10 +459,9 @@ function buildLightboxTools() {
   `;
 }
 
-function buildLightboxShell(container, store, zoom) {
+function buildLightboxShell(container, zoom) {
   container.innerHTML = `
     <div class="lightbox chrome-hidden">
-      <img class="lightbox-ambient-bg" alt="" aria-hidden="true" />
       <div
         class="lightbox-hd-float"
         data-lb-hd-float
@@ -341,7 +497,7 @@ function buildLightboxShell(container, store, zoom) {
         <section id="lightboxInfo" class="lightbox-popover lightbox-info lightbox-glass-pill hidden" aria-labelledby="lightboxInfoTitle">
           <h2 id="lightboxInfoTitle">${escapeHtml(t('mobile.inspectorTitle'))}</h2>
           <div class="lightbox-info-rating">
-            ${icon('starFilled', 15)}<span data-lb-average></span>
+            ${starSectorIcon(5, 15)}<span data-lb-average></span>
           </div>
           <div class="lightbox-info-tags">
             <h3>${escapeHtml(t('lightbox.tags'))}</h3>
@@ -382,6 +538,7 @@ export function renderLightbox(container, store, visiblePhotos) {
     lastPhotoIndex = -1;
     pendingSwipeOffsetPx = null;
     isClosingAnimated = false;
+    liveZoom = 1;
     panX = 0;
     panY = 0;
     isDragging = false;
@@ -406,15 +563,15 @@ export function renderLightbox(container, store, visiblePhotos) {
   const meta = store.getAggregatedItemMeta(file.id);
   const schemaTags = state.tagSchema?.tags || {};
   const isVideo = Boolean(file.mimeType && file.mimeType.startsWith('video/'));
-  const zoom = state.lightboxZoom || 1;
 
   const wasClosed = activeLightboxPhotoId === null;
   if (wasClosed) {
     lightboxChromeHidden = true;
+    liveZoom = state.lightboxZoom || 1;
   }
 
   if (!container.querySelector('.lightbox') || activeLightboxLang !== state.lang) {
-    buildLightboxShell(container, store, zoom);
+    buildLightboxShell(container, liveZoom);
     activeLightboxLang = state.lang;
   }
 
@@ -424,6 +581,9 @@ export function renderLightbox(container, store, visiblePhotos) {
   }
 
   const isSamePhoto = activeLightboxPhotoId === file.id;
+  if (!isSamePhoto) {
+    liveZoom = state.lightboxZoom || 1;
+  }
 
   const tagsHtml = meta.activeTagIds
     .map((tid) => {
@@ -445,16 +605,24 @@ export function renderLightbox(container, store, visiblePhotos) {
       : t('lightbox.unrated');
 
   const zoomLabel = container.querySelector('[data-lb-zoom-label]');
-  if (zoomLabel) zoomLabel.textContent = `${Math.round(zoom * 100)}%`;
+  if (zoomLabel) zoomLabel.textContent = `${Math.round(liveZoom * 100)}%`;
 
   const zoomControls = container.querySelector('[data-lb-zoom-controls]');
   if (zoomControls) zoomControls.classList.toggle('hidden', isVideo);
 
   const ratingBtn = container.querySelector('[data-lb="toggle-rating"]');
+  const ratingIconWrap = container.querySelector('[data-lb-star-icon]');
   const ratingLabel = t('lightbox.ratingValue', { n: meta.myRating });
-  ratingBtn.style.setProperty('--rating-fill', `${meta.myRating * 72}deg`);
-  ratingBtn.setAttribute('aria-label', ratingLabel);
-  ratingBtn.title = ratingLabel;
+  if (ratingBtn) {
+    ratingBtn.setAttribute('aria-label', ratingLabel);
+    ratingBtn.title = ratingLabel;
+    ratingBtn.classList.toggle('has-rating', meta.myRating > 0);
+  }
+  if (ratingIconWrap && ratingIconWrap.dataset.rating !== String(meta.myRating)) {
+    ratingIconWrap.dataset.rating = String(meta.myRating);
+    ratingIconWrap.innerHTML = starSectorIcon(meta.myRating, 18);
+  }
+
   for (const option of container.querySelectorAll('.lightbox-rating-options [data-rating]')) {
     option.setAttribute('aria-pressed', String(Number(option.dataset.rating) === meta.myRating));
   }
@@ -469,13 +637,8 @@ export function renderLightbox(container, store, visiblePhotos) {
     tagsHtml || `<span class="lightbox-tags-empty">${escapeHtml(t('lightbox.noTags'))}</span>`;
 
   if (isSamePhoto) {
-    const thumbs = container.querySelectorAll('.filmstrip-thumb');
-    for (const th of thumbs) {
-      const active = th.dataset.photoId === file.id;
-      th.classList.toggle('active', active);
-      if (active) th.scrollIntoView({ inline: 'center', block: 'nearest', behavior: 'smooth' });
-    }
-    applyImageTransform(container, zoom);
+    renderLazyFilmstrip(container, store, visiblePhotos, file.id, idx);
+    scheduleImageTransform(container, true);
     return;
   }
 
@@ -499,7 +662,6 @@ export function renderLightbox(container, store, visiblePhotos) {
   if (prevBtn) prevBtn.disabled = idx <= 0;
   if (nextBtn) nextBtn.disabled = idx >= total - 1 || idx === -1;
 
-  // Mount 3-slide carousel track (prev / current / next preloaded)
   const trackEl = container.querySelector('[data-lb-track]');
   const prevItem = idx > 0 ? visiblePhotos[idx - 1] : null;
   const nextItem = idx >= 0 && idx < total - 1 ? visiblePhotos[idx + 1] : null;
@@ -515,7 +677,10 @@ export function renderLightbox(container, store, visiblePhotos) {
     trackEl.style.transform = 'translate3d(0px, 0px, 0px)';
     trackEl.replaceChildren(...slides);
 
+    let currentBox = null;
     for (const sl of slides) {
+      const box = applySlideMediaBox(container, sl);
+      if (sl === curSlideEl) currentBox = box;
       ensureSlidePreview(sl, store);
     }
     syncCurrentSlideHdIndicator(container, file);
@@ -532,8 +697,8 @@ export function renderLightbox(container, store, visiblePhotos) {
     trimSlideCache(keepIds);
 
     if (wasClosed) {
-      const curSlide = trackEl.querySelector('.lightbox-slide.is-current');
-      const flip = computeFlipFromGridCard(container, file.id);
+      const curSlide = curSlideEl;
+      const flip = computeFlipFromGridCard(container, file.id, currentBox?.width || 0);
       if (rootEl && curSlide) {
         rootEl.style.transition = 'none';
         rootEl.style.opacity = '0';
@@ -542,9 +707,9 @@ export function renderLightbox(container, store, visiblePhotos) {
           ? `translate3d(${flip.dx}px, ${flip.dy}px, 0) scale(${flip.scale})`
           : 'translate3d(0px, 10px, 0) scale(0.92)';
         void curSlide.offsetWidth;
-        rootEl.style.transition = 'opacity 220ms cubic-bezier(0.32, 0.72, 0, 1)';
+        rootEl.style.transition = 'opacity 200ms cubic-bezier(0.32, 0.72, 0, 1)';
         rootEl.style.opacity = '1';
-        curSlide.style.transition = 'transform 250ms cubic-bezier(0.32, 0.72, 0, 1)';
+        curSlide.style.transition = 'transform 230ms cubic-bezier(0.32, 0.72, 0, 1)';
         curSlide.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
       }
     } else if (pendingSwipeOffsetPx !== null || (prevIndex !== -1 && idx !== -1 && prevIndex !== idx)) {
@@ -558,67 +723,21 @@ export function renderLightbox(container, store, visiblePhotos) {
       trackEl.style.transition = 'none';
       trackEl.style.transform = `translate3d(${Math.round(startX)}px, 0px, 0px)`;
       void trackEl.offsetWidth;
-      trackEl.style.transition = 'transform 220ms cubic-bezier(0.32, 0.72, 0, 1)';
+      trackEl.style.transition = 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1)';
       trackEl.style.transform = 'translate3d(0px, 0px, 0px)';
     }
   }
 
   pendingSwipeOffsetPx = null;
-
-  const ambientEl = container.querySelector('.lightbox-ambient-bg');
-  if (ambientEl) {
-    const instant = getInstantCachedSrc(file, [240, 480, 600]);
-    ambientEl.classList.remove('is-loaded');
-    if (instant) {
-      ambientEl.src = instant;
-      ambientEl.classList.add('is-loaded');
-    } else {
-      loadPhotoIntoElement(ambientEl, file, {
-        size: 240,
-        eager: true,
-        getAccessToken: () => store.state.accessToken,
-        getApiKey: () => store.state.apiKey,
-      });
-    }
-  }
-
-  const stripEl = container.querySelector('.lightbox-filmstrip');
-  if (stripEl) {
-    if (!stripEl.childElementCount || stripEl.dataset.count !== String(total)) {
-      stripEl.dataset.count = String(total);
-      stripEl.innerHTML = visiblePhotos
-        .map(
-          (p) => `
-          <button type="button" class="filmstrip-thumb ${p.id === file.id ? 'active' : ''}" data-lb="jump" data-photo-id="${escapeAttr(p.id)}" title="${escapeAttr(p.name)}">
-            <img alt="" data-film-id="${escapeAttr(p.id)}" />
-          </button>
-        `
-        )
-        .join('');
-      const byId = new Map(visiblePhotos.map((p) => [p.id, p]));
-      for (const simg of stripEl.querySelectorAll('img[data-film-id]')) {
-        const p = byId.get(simg.dataset.filmId);
-        if (p) {
-          loadPhotoIntoElement(simg, p, {
-            size: 220,
-            getAccessToken: () => store.state.accessToken,
-            getApiKey: () => store.state.apiKey,
-          });
-        }
-      }
-    } else {
-      for (const th of stripEl.querySelectorAll('.filmstrip-thumb')) {
-        th.classList.toggle('active', th.dataset.photoId === file.id);
-      }
-    }
-    const activeThumb = stripEl.querySelector('.filmstrip-thumb.active');
-    if (activeThumb) {
-      activeThumb.scrollIntoView({ inline: 'center', block: 'nearest' });
-    }
-  }
+  renderLazyFilmstrip(container, store, visiblePhotos, file.id, idx);
 }
 
-function closeWithAnimation(container, store) {
+export function closeLightboxWithAnimation(container, store) {
+  if (!store?.state?.lightboxPhotoId) return;
+  if (!container) {
+    store.closeLightbox();
+    return;
+  }
   if (isClosingAnimated) return;
   if (window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
     store.closeLightbox();
@@ -627,34 +746,41 @@ function closeWithAnimation(container, store) {
   const rootEl = container.querySelector('.lightbox');
   const curSlide = container.querySelector('.lightbox-slide.is-current');
   const pid = store.state.lightboxPhotoId;
-  const flip = pid ? computeFlipFromGridCard(container, pid) : null;
-  if (!rootEl || !curSlide || !flip) {
+  if (!rootEl || !curSlide) {
     store.closeLightbox();
     return;
   }
+
+  const cachedSlide = pid ? slideCache.get(pid) : null;
+  const targetW = cachedSlide?._fittedBox?.width || 0;
+  const flip = pid ? computeFlipFromGridCard(container, pid, targetW) : null;
+
   isClosingAnimated = true;
   rootEl.classList.add('chrome-hidden');
-  rootEl.style.transition = 'opacity 180ms ease';
+  rootEl.style.transition = 'opacity 180ms cubic-bezier(0.32, 0.72, 0, 1)';
   rootEl.style.opacity = '0';
-  curSlide.style.transition = 'transform 190ms cubic-bezier(0.32, 0.72, 0, 1)';
-  curSlide.style.transform = `translate3d(${flip.dx}px, ${flip.dy}px, 0) scale(${flip.scale})`;
+  curSlide.style.transition = 'transform 185ms cubic-bezier(0.32, 0.72, 0, 1)';
+  curSlide.style.transform = flip
+    ? `translate3d(${flip.dx}px, ${flip.dy}px, 0) scale(${flip.scale})`
+    : 'translate3d(0px, 12px, 0) scale(0.91)';
+
   setTimeout(() => {
     isClosingAnimated = false;
     store.closeLightbox();
-  }, 190);
+  }, 185);
 }
 
 export function dismissLightboxPopover(container) {
-  const trigger = container.querySelector('[data-lb-popover][aria-expanded="true"]');
+  const trigger = container?.querySelector('[data-lb-popover][aria-expanded="true"]');
   if (!trigger) return false;
   const panel = document.getElementById(trigger.getAttribute('aria-controls'));
-  if (panel.contains(document.activeElement)) trigger.focus({ preventScroll: true });
+  if (panel?.contains(document.activeElement)) trigger.focus({ preventScroll: true });
   trigger.setAttribute('aria-expanded', 'false');
-  panel.classList.add('hidden');
+  panel?.classList.add('hidden');
   return true;
 }
 
-function toggleLightboxPopover(container, trigger) {
+function toggleLightboxPopover(container, trigger, store) {
   if (!trigger) return;
   const wasOpen = trigger.getAttribute('aria-expanded') === 'true';
   dismissLightboxPopover(container);
@@ -662,16 +788,41 @@ function toggleLightboxPopover(container, trigger) {
 
   lightboxChromeHidden = false;
   container.querySelector('.lightbox')?.classList.remove('chrome-hidden');
+  if (store && activeLightboxPhotoId) {
+    const visible = store.getVisiblePhotos();
+    const idx = visible.findIndex((p) => p.id === activeLightboxPhotoId);
+    renderLazyFilmstrip(container, store, visible, activeLightboxPhotoId, idx);
+  }
   trigger.setAttribute('aria-expanded', 'true');
-  document.getElementById(trigger.getAttribute('aria-controls')).classList.remove('hidden');
+  document.getElementById(trigger.getAttribute('aria-controls'))?.classList.remove('hidden');
 }
 
 export function toggleLightboxInfo(container) {
-  toggleLightboxPopover(container, container.querySelector('[data-lb="toggle-info"]'));
+  toggleLightboxPopover(
+    container,
+    container.querySelector('[data-lb="toggle-info"]'),
+    activeStoreRef
+  );
 }
 
 export function bindLightboxEvents(container, store) {
   if (!container) return;
+
+  if (!resizeBound && typeof window !== 'undefined') {
+    resizeBound = true;
+    let resizeRaf = 0;
+    window.addEventListener('resize', () => {
+      if (!activeLightboxContainer || !activeLightboxPhotoId) return;
+      cancelAnimationFrame(resizeRaf);
+      resizeRaf = requestAnimationFrame(() => {
+        if (!activeLightboxContainer) return;
+        for (const sl of activeLightboxContainer.querySelectorAll('.lightbox-slide')) {
+          const cached = slideCache.get(sl.dataset.photoId);
+          if (cached) applySlideMediaBox(activeLightboxContainer, cached);
+        }
+      });
+    });
+  }
 
   let pinchStartDist = 0;
   let pinchStartZoom = 1;
@@ -694,21 +845,49 @@ export function bindLightboxEvents(container, store) {
   let mouseSwipeDragging = false;
   let mouseSwipeAxis = null;
   let mouseLastDx = 0;
+  let trackMoveRafId = 0;
+  let pendingTrackDx = 0;
+
+  function setInteracting(active) {
+    container.querySelector('.lightbox')?.classList.toggle('is-interacting', active);
+  }
+
+  function scheduleTrackTranslate(dx) {
+    pendingTrackDx = dx;
+    if (trackMoveRafId) return;
+    trackMoveRafId = requestAnimationFrame(() => {
+      trackMoveRafId = 0;
+      const trackEl = container.querySelector('[data-lb-track]');
+      if (trackEl) {
+        trackEl.style.transition = 'none';
+        trackEl.style.transform = `translate3d(${Math.round(pendingTrackDx)}px, 0px, 0px)`;
+      }
+    });
+  }
 
   function toggleChrome() {
     if (dismissLightboxPopover(container)) return;
     lightboxChromeHidden = !lightboxChromeHidden;
     container.querySelector('.lightbox')?.classList.toggle('chrome-hidden', lightboxChromeHidden);
+    if (!lightboxChromeHidden && activeLightboxPhotoId) {
+      const visible = store.getVisiblePhotos();
+      const idx = visible.findIndex((p) => p.id === activeLightboxPhotoId);
+      renderLazyFilmstrip(container, store, visible, activeLightboxPhotoId, idx);
+    }
   }
 
   function stepWithSwipe(delta, dragDx = 0) {
+    if (trackMoveRafId) {
+      cancelAnimationFrame(trackMoveRafId);
+      trackMoveRafId = 0;
+    }
     const visible = store.getVisiblePhotos();
     const curIdx = visible.findIndex((p) => p.id === store.state.lightboxPhotoId);
     const targetIdx = curIdx + delta;
     if (curIdx === -1 || targetIdx < 0 || targetIdx >= visible.length) {
       const trackEl = container.querySelector('[data-lb-track]');
       if (trackEl) {
-        trackEl.style.transition = 'transform 220ms cubic-bezier(0.32, 0.72, 0, 1)';
+        trackEl.style.transition = 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1)';
         trackEl.style.transform = 'translate3d(0px, 0px, 0px)';
       }
       return false;
@@ -721,8 +900,11 @@ export function bindLightboxEvents(container, store) {
 
   container.addEventListener('click', (e) => {
     const btn = e.target.closest('[data-lb]');
-    if (!e.target.closest('.lightbox-popover, [data-lb-popover]')
-      && dismissLightboxPopover(container) && !btn) {
+    if (
+      !e.target.closest('.lightbox-popover, [data-lb-popover]') &&
+      dismissLightboxPopover(container) &&
+      !btn
+    ) {
       return;
     }
     if (btn) {
@@ -730,7 +912,7 @@ export function bindLightboxEvents(container, store) {
       singleTapTimer = 0;
       const act = btn.dataset.lb;
       const pid = store.state.lightboxPhotoId;
-      if (act === 'close') closeWithAnimation(container, store);
+      if (act === 'close') closeLightboxWithAnimation(container, store);
       else if (act === 'prev') store.stepPhoto(-1);
       else if (act === 'next') store.stepPhoto(1);
       else if (act === 'jump') store.openLightbox(btn.dataset.photoId);
@@ -745,7 +927,7 @@ export function bindLightboxEvents(container, store) {
       } else if (act === 'quick-tag' && pid) {
         store.openModal('quickTag', { photoIds: [pid] });
       } else if (act === 'toggle-info' || act === 'toggle-rating') {
-        toggleLightboxPopover(container, btn);
+        toggleLightboxPopover(container, btn, store);
       } else if (act === 'open-inspector') {
         store.setState({ inspectorOpen: true, sidebarOpen: false });
         store.closeLightbox();
@@ -757,13 +939,11 @@ export function bindLightboxEvents(container, store) {
           );
         }
       } else if (act === 'zoom-in') {
-        const next = Math.min(3, Number((store.state.lightboxZoom + 0.5).toFixed(2)));
-        store.setState({ lightboxZoom: next });
+        setLiveZoom(container, store, liveZoom + 0.5, true);
       } else if (act === 'zoom-out') {
-        const next = Math.max(1, Number((store.state.lightboxZoom - 0.5).toFixed(2)));
-        store.setState({ lightboxZoom: next });
+        setLiveZoom(container, store, liveZoom - 0.5, true);
       } else if (act === 'zoom-reset') {
-        store.setState({ lightboxZoom: store.state.lightboxZoom > 1 ? 1 : 2 });
+        setLiveZoom(container, store, liveZoom > 1 ? 1 : 2, true);
       }
       return;
     }
@@ -786,10 +966,11 @@ export function bindLightboxEvents(container, store) {
     singleTapTimer = 0;
     if (Date.now() < suppressNextDblClickUntil) return;
     if (e.target.classList.contains('lightbox-img')) {
-      store.setState({ lightboxZoom: store.state.lightboxZoom > 1 ? 1 : 2 });
+      setLiveZoom(container, store, liveZoom > 1 ? 1 : 2, true);
     }
   });
 
+  let wheelIdleTimer = 0;
   container.addEventListener(
     'wheel',
     (e) => {
@@ -797,11 +978,14 @@ export function bindLightboxEvents(container, store) {
       if (!e.target.closest('.lightbox-stage')) return;
       if (e.target.closest('video, iframe')) return;
       e.preventDefault();
-      const cur = store.state.lightboxZoom || 1;
+      setInteracting(true);
+      clearTimeout(wheelIdleTimer);
+      wheelIdleTimer = setTimeout(() => setInteracting(false), 160);
+
       const step = e.deltaY < 0 ? 0.25 : -0.25;
-      const next = Math.max(1, Math.min(3, Number((cur + step).toFixed(2))));
-      if (next !== cur) {
-        store.setState({ lightboxZoom: next });
+      const next = Math.max(1, Math.min(3, Number((liveZoom + step).toFixed(2))));
+      if (next !== liveZoom) {
+        setLiveZoom(container, store, next, false);
       }
     },
     { passive: false }
@@ -809,18 +993,22 @@ export function bindLightboxEvents(container, store) {
 
   container.addEventListener('mousedown', (e) => {
     if (e.button !== 0 || !store.state.lightboxPhotoId) return;
-    if (!e.target.closest('.lightbox-stage') || e.target.closest('.lightbox-nav, button, video, iframe')) {
+    if (
+      !e.target.closest('.lightbox-stage') ||
+      e.target.closest('.lightbox-nav, button, video, iframe')
+    ) {
       return;
     }
     didDragPan = false;
     swipeStartX = e.clientX;
     swipeStartY = e.clientY;
     swipeStartTime = performance.now();
-    if ((store.state.lightboxZoom || 1) > 1) {
+    setInteracting(true);
+    if (liveZoom > 1) {
       isDragging = true;
       dragStartX = e.clientX - panX;
       dragStartY = e.clientY - panY;
-      applyImageTransform(container, store.state.lightboxZoom);
+      scheduleImageTransform(container, true);
     } else {
       mouseSwipeDragging = true;
       mouseSwipeAxis = null;
@@ -830,12 +1018,15 @@ export function bindLightboxEvents(container, store) {
 
   window.addEventListener('mousemove', (e) => {
     if (isDragging) {
-      if (Math.abs(e.clientX - (panX + dragStartX)) > 3 || Math.abs(e.clientY - (panY + dragStartY)) > 3) {
+      if (
+        Math.abs(e.clientX - (panX + dragStartX)) > 3 ||
+        Math.abs(e.clientY - (panY + dragStartY)) > 3
+      ) {
         didDragPan = true;
       }
       panX = e.clientX - dragStartX;
       panY = e.clientY - dragStartY;
-      applyImageTransform(container, store.state.lightboxZoom);
+      scheduleImageTransform(container, false);
       return;
     }
     if (!mouseSwipeDragging) return;
@@ -853,22 +1044,20 @@ export function bindLightboxEvents(container, store) {
         effDx = dx * 0.32;
       }
       mouseLastDx = effDx;
-      const trackEl = container.querySelector('[data-lb-track]');
-      if (trackEl) {
-        trackEl.style.transition = 'none';
-        trackEl.style.transform = `translate3d(${Math.round(effDx)}px, 0px, 0px)`;
-      }
+      scheduleTrackTranslate(effDx);
     }
   });
 
   window.addEventListener('mouseup', () => {
     if (isDragging) {
       isDragging = false;
-      applyImageTransform(container, store.state.lightboxZoom);
+      setInteracting(false);
+      scheduleImageTransform(container, true);
       return;
     }
     if (!mouseSwipeDragging) return;
     mouseSwipeDragging = false;
+    setInteracting(false);
     if (mouseSwipeAxis === 'x') {
       const vx = mouseLastDx / Math.max(16, performance.now() - swipeStartTime);
       suppressWrapClickUntil = Date.now() + 250;
@@ -877,9 +1066,13 @@ export function bindLightboxEvents(container, store) {
       } else if (mouseLastDx > 52 || vx > 0.45) {
         stepWithSwipe(-1, mouseLastDx);
       } else {
+        if (trackMoveRafId) {
+          cancelAnimationFrame(trackMoveRafId);
+          trackMoveRafId = 0;
+        }
         const trackEl = container.querySelector('[data-lb-track]');
         if (trackEl) {
-          trackEl.style.transition = 'transform 220ms cubic-bezier(0.32, 0.72, 0, 1)';
+          trackEl.style.transition = 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1)';
           trackEl.style.transform = 'translate3d(0px, 0px, 0px)';
         }
       }
@@ -894,13 +1087,14 @@ export function bindLightboxEvents(container, store) {
       if (!e.target.closest('.lightbox-stage') || e.target.closest('.lightbox-nav, button')) {
         return;
       }
+      setInteracting(true);
       if (e.touches.length === 2) {
         isPinching = true;
         isTouchPanning = false;
         touchMoved = true;
         gestureAxis = null;
         pinchStartDist = getTouchDistance(e.touches[0], e.touches[1]);
-        pinchStartZoom = store.state.lightboxZoom || 1;
+        pinchStartZoom = liveZoom || 1;
       } else if (e.touches.length === 1) {
         isPinching = false;
         isTouchPanning = false;
@@ -929,17 +1123,14 @@ export function bindLightboxEvents(container, store) {
         if (!isPinching) {
           isPinching = true;
           pinchStartDist = getTouchDistance(e.touches[0], e.touches[1]);
-          pinchStartZoom = store.state.lightboxZoom || 1;
+          pinchStartZoom = liveZoom || 1;
         }
         e.preventDefault();
         touchMoved = true;
         if (pinchStartDist > 0) {
           const dist = getTouchDistance(e.touches[0], e.touches[1]);
           const nextZoom = Math.max(1, Math.min(3, pinchStartZoom * (dist / pinchStartDist)));
-          store.state.lightboxZoom = nextZoom;
-          const zoomLabel = container.querySelector('[data-lb-zoom-label]');
-          if (zoomLabel) zoomLabel.textContent = `${Math.round(nextZoom * 100)}%`;
-          applyImageTransform(container, nextZoom);
+          setLiveZoom(container, store, nextZoom, false);
         }
         return;
       }
@@ -947,7 +1138,6 @@ export function bindLightboxEvents(container, store) {
       if (e.touches.length === 1 && !isPinching) {
         const dx = e.touches[0].clientX - swipeStartX;
         const dy = e.touches[0].clientY - swipeStartY;
-        const curZoom = store.state.lightboxZoom || 1;
 
         if (Math.abs(dx) > 6 || Math.abs(dy) > 6) {
           touchMoved = true;
@@ -956,12 +1146,12 @@ export function bindLightboxEvents(container, store) {
           }
         }
 
-        if (curZoom > 1) {
+        if (liveZoom > 1) {
           e.preventDefault();
           isTouchPanning = true;
           panX = panStartX + dx;
           panY = panStartY + dy;
-          applyImageTransform(container, curZoom);
+          scheduleImageTransform(container, false);
           return;
         }
 
@@ -974,11 +1164,7 @@ export function bindLightboxEvents(container, store) {
             effDx = dx * 0.32;
           }
           lastDragDx = effDx;
-          const trackEl = container.querySelector('[data-lb-track]');
-          if (trackEl) {
-            trackEl.style.transition = 'none';
-            trackEl.style.transform = `translate3d(${Math.round(effDx)}px, 0px, 0px)`;
-          }
+          scheduleTrackTranslate(effDx);
         } else if (gestureAxis === 'y' && dy > 0) {
           e.preventDefault();
           lastDragDy = dy;
@@ -1005,11 +1191,8 @@ export function bindLightboxEvents(container, store) {
         if (e.touches.length < 2) {
           isPinching = false;
           isTouchPanning = false;
+          setInteracting(false);
           suppressWrapClickUntil = Date.now() + 350;
-          const finalZoom = Math.max(
-            1,
-            Math.min(3, Number((store.state.lightboxZoom || 1).toFixed(2)))
-          );
           if (e.touches.length === 1) {
             swipeStartX = e.touches[0].clientX;
             swipeStartY = e.touches[0].clientY;
@@ -1017,26 +1200,25 @@ export function bindLightboxEvents(container, store) {
             panStartY = panY;
             touchMoved = true;
           }
-          store.setState({ lightboxZoom: finalZoom });
+          setLiveZoom(container, store, liveZoom, true);
           lastTapTime = 0;
         }
         return;
       }
 
       isTouchPanning = false;
+      setInteracting(false);
       if (!e.target.closest('.lightbox-stage') || e.target.closest('.lightbox-nav, button')) {
         return;
       }
       if (e.changedTouches.length === 0) return;
 
       const touch = e.changedTouches[0];
-      const dx = touch.clientX - swipeStartX;
       const dy = touch.clientY - swipeStartY;
       const now = Date.now();
-      const curZoom = store.state.lightboxZoom || 1;
 
-      if (curZoom > 1) {
-        applyImageTransform(container, curZoom);
+      if (liveZoom > 1) {
+        scheduleImageTransform(container, true);
       }
 
       const isMediaTarget =
@@ -1062,7 +1244,7 @@ export function bindLightboxEvents(container, store) {
         lastTapTime = 0;
         suppressNextDblClickUntil = now + 400;
         suppressWrapClickUntil = now + 400;
-        store.setState({ lightboxZoom: curZoom > 1 ? 1 : 2 });
+        setLiveZoom(container, store, liveZoom > 1 ? 1 : 2, true);
         return;
       }
 
@@ -1081,7 +1263,7 @@ export function bindLightboxEvents(container, store) {
       }
       lastTapTime = 0;
 
-      if (curZoom <= 1 && touchMoved) {
+      if (liveZoom <= 1 && touchMoved) {
         suppressWrapClickUntil = now + 350;
         if (gestureAxis === 'x') {
           const vx = lastDragDx / Math.max(16, performance.now() - swipeStartTime);
@@ -1090,20 +1272,24 @@ export function bindLightboxEvents(container, store) {
           } else if (lastDragDx > 46 || vx > 0.4) {
             stepWithSwipe(-1, lastDragDx);
           } else {
+            if (trackMoveRafId) {
+              cancelAnimationFrame(trackMoveRafId);
+              trackMoveRafId = 0;
+            }
             const trackEl = container.querySelector('[data-lb-track]');
             if (trackEl) {
-              trackEl.style.transition = 'transform 220ms cubic-bezier(0.32, 0.72, 0, 1)';
+              trackEl.style.transition = 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1)';
               trackEl.style.transform = 'translate3d(0px, 0px, 0px)';
             }
           }
         } else if (gestureAxis === 'y') {
           const rootEl = container.querySelector('.lightbox');
           if (lastDragDy > 75 || dy > 80) {
-            closeWithAnimation(container, store);
+            closeLightboxWithAnimation(container, store);
           } else {
             const curSlide = container.querySelector('.lightbox-slide.is-current');
             if (curSlide) {
-              curSlide.style.transition = 'transform 220ms cubic-bezier(0.32, 0.72, 0, 1)';
+              curSlide.style.transition = 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1)';
               curSlide.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
             }
             if (rootEl) rootEl.style.background = '';
@@ -1121,16 +1307,21 @@ export function bindLightboxEvents(container, store) {
       isPinching = false;
       isTouchPanning = false;
       gestureAxis = null;
+      setInteracting(false);
+      if (trackMoveRafId) {
+        cancelAnimationFrame(trackMoveRafId);
+        trackMoveRafId = 0;
+      }
       const trackEl = container.querySelector('[data-lb-track]');
       if (trackEl) {
-        trackEl.style.transition = 'transform 200ms ease';
+        trackEl.style.transition = 'transform 180ms ease';
         trackEl.style.transform = 'translate3d(0px, 0px, 0px)';
       }
       const curSlide = container.querySelector('.lightbox-slide.is-current');
       if (curSlide) {
         curSlide.style.transform = '';
       }
-      applyImageTransform(container, store.state.lightboxZoom || 1);
+      scheduleImageTransform(container, true);
     },
     { passive: true }
   );

@@ -25,7 +25,7 @@
 - **Document Shell Meta Tags ([`index.html`](index.html))**:
   - Includes `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />`, `<meta name="theme-color" content="#0b0e14" />`, `<meta name="apple-mobile-web-app-capable" content="yes" />`, `<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />`, `<meta name="apple-mobile-web-app-title" content="DriveLens" />`, `<link rel="manifest" href="./manifest.webmanifest" />`, and `<link rel="apple-touch-icon" href="./icons/icon-192.png" />`.
 - **Service Worker ([`sw.js`](sw.js))**:
-  - Maintains `CACHE_NAME = 'drivelens-shell-v8'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
+  - Maintains `CACHE_NAME = 'drivelens-shell-v9'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
   - Deletes older `drivelens-*` cache buckets during `activate` and calls `self.clients.claim()`.
   - Intercepts only same-origin `GET` requests excluding `/api/` paths (so `serve.py` `/api/meta`, Google Drive API calls, GIS scripts, and `googleusercontent.com` thumbnails always bypass the Service Worker cache). Uses a **Network-First** strategy that refreshes cached `response.type === 'basic'` assets online and falls back to `caches.match()` or `./index.html` (for navigations) when offline.
 - **Install Prompt Lifecycle (`src/main.js`, `src/state/store.js`, `src/ui/renderHeader.js`)**:
@@ -68,7 +68,7 @@ Browser / Installed PWA Startup (src/main.js)
 drivelens/
 ├── index.html                   # Single-page shell (<html lang="en">, viewport-fit=cover), PWA meta links, 14 mount IDs
 ├── manifest.webmanifest         # Web App Manifest (relative ./ scope, standalone display, icon references)
-├── sw.js                        # Service Worker (drivelens-shell-v8 precache, Network-First same-origin shell cache)
+├── sw.js                        # Service Worker (drivelens-shell-v9 precache, Network-First same-origin shell cache)
 ├── icons/
 │   ├── icon.svg                 # Scalable vector app icon (any maskable)
 │   ├── icon-192.png             # 192x192 RGBA PNG app icon & apple-touch-icon

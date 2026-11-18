@@ -1,15 +1,14 @@
 import { getLocaleTag, t } from '../i18n.js';
-import { escapeAttr, escapeHtml, icon } from './icons.js';
-import { previewGalleryRowHeight } from './renderGallery.js';
+import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 
 const objRefIds = new WeakMap();
 let nextObjRefId = 1;
 let lastSidebarSignature = '';
 
-const LAYOUT_INDEX_MAP = {
-  justified: 0,
-  waterfall: 1,
-  grid: 2,
+const SCOPE_INDEX_MAP = {
+  avg: 0,
+  mine: 1,
+  member: 2,
 };
 
 function getRefId(obj) {
@@ -28,13 +27,26 @@ function getInitial(name) {
   return s ? s[0].toUpperCase() : '?';
 }
 
+function parseSortParts(sortBy = 'dateDesc') {
+  if (sortBy.startsWith('rating')) return { field: 'rating', asc: sortBy.endsWith('Asc') };
+  if (sortBy.startsWith('name')) return { field: 'name', asc: !sortBy.endsWith('Desc') };
+  if (sortBy.startsWith('size')) return { field: 'size', asc: sortBy.endsWith('Asc') };
+  return { field: 'date', asc: sortBy === 'dateAsc' };
+}
+
+function buildSortValue(field, asc) {
+  if (field === 'rating') return asc ? 'ratingAsc' : 'ratingDesc';
+  if (field === 'name') return asc ? 'nameAsc' : 'nameDesc';
+  if (field === 'size') return asc ? 'sizeAsc' : 'sizeDesc';
+  return asc ? 'dateAsc' : 'dateDesc';
+}
+
 function renderFolderTree(store, state) {
   const { folders, activeFolderId, includeSubfolders } = state;
   if (!folders || folders.length === 0) {
     return `<div class="form-help" style="padding:4px 8px">${escapeHtml(t('sidebar.noFolders'))}</div>`;
   }
 
-  // Build ordered tree DFS
   const byParent = new Map();
   for (const f of folders) {
     const pid = f.parentId || '__root__';
@@ -56,7 +68,6 @@ function renderFolderTree(store, state) {
   }
   walk('__root__', 0);
 
-  // Precompute per-folder and subtree counts in O(N + F) instead of scanning all files per folder
   const directCounts = new Map();
   for (const file of state.files) {
     if (file.parentId) {
@@ -79,7 +90,7 @@ function renderFolderTree(store, state) {
       const count = includeChildren
         ? subtreeCounts.get(folder.id) || 0
         : directCounts.get(folder.id) || 0;
-      const padLeft = 8 + level * 14;
+      const padLeft = 10 + level * 14;
       return `
         <button
           type="button"
@@ -163,13 +174,6 @@ function renderTagManager(store, state) {
   return html;
 }
 
-function updateThumbnailSlider(slider) {
-  const min = Number(slider.min);
-  const max = Number(slider.max);
-  const progress = (slider.valueAsNumber - min) / (max - min);
-  slider.style.setProperty('--thumbnail-progress', `${progress * 100}%`);
-}
-
 export function renderSidebar(container, store) {
   if (!container) return;
   const state = store.state;
@@ -177,24 +181,6 @@ export function renderSidebar(container, store) {
   container.classList.toggle('collapsed', isCollapsed);
   container.inert = isCollapsed;
   if (isCollapsed && container.childElementCount > 0) return;
-
-  const sideRange = container.querySelector('#sidebarRowHeightRange');
-  if (sideRange) {
-    const hStr = String(state.rowHeight || 210);
-    if (sideRange.value !== hStr) sideRange.value = hStr;
-    updateThumbnailSlider(sideRange);
-  }
-
-  const layoutIndex = String(LAYOUT_INDEX_MAP[state.layoutMode] ?? 1);
-  const sideLayoutSeg = container.querySelector('[data-sidebar-layout-seg]');
-  if (sideLayoutSeg) {
-    sideLayoutSeg.style.setProperty('--seg-index', layoutIndex);
-    for (const btn of sideLayoutSeg.querySelectorAll('[data-action="set-layout"]')) {
-      const active = btn.dataset.layout === state.layoutMode;
-      btn.classList.toggle('active', active);
-      btn.setAttribute('aria-pressed', String(active));
-    }
-  }
 
   const selectedTagsKey =
     state.selectedTagIds && state.selectedTagIds.size > 0
@@ -208,6 +194,8 @@ export function renderSidebar(container, store) {
     state.activeFolderId || '',
     state.includeSubfolders ? 1 : 0,
     state.quickView,
+    state.mediaFilter || 'all',
+    state.aspectFilter || 'all',
     state.sortBy,
     state.minRating,
     state.ratingScope,
@@ -227,7 +215,6 @@ export function renderSidebar(container, store) {
   lastSidebarSignature = sig;
 
   const members = store.getMembersSummary();
-
   const totalCount = state.files.length;
   let favTotal = 0;
   let unratedTotal = 0;
@@ -237,19 +224,38 @@ export function renderSidebar(container, store) {
     if (m.ratingCount === 0) unratedTotal += 1;
   }
 
+  const hasActiveFilters =
+    state.quickView !== 'all' ||
+    (state.mediaFilter && state.mediaFilter !== 'all') ||
+    (state.aspectFilter && state.aspectFilter !== 'all') ||
+    state.minRating > 0 ||
+    Boolean(state.memberFilterId) ||
+    (state.selectedTagIds?.size || 0) > 0;
+
+  const scopeIndex = String(SCOPE_INDEX_MAP[state.ratingScope] ?? 0);
+  const { field: sortField, asc: sortAsc } = parseSortParts(state.sortBy);
+
   container.innerHTML = `
     <div class="mobile-drawer-header">
       <span>${escapeHtml(t('mobile.sidebarTitle'))}</span>
-      <button
-        type="button"
-        class="btn btn-ghost btn-icon btn-sm"
-        data-action="close-sidebar"
-        aria-label="${escapeAttr(t('mobile.closeDrawer'))}"
-      >${icon('x', 16)}</button>
+      <div class="sidebar-header-actions">
+        ${
+          hasActiveFilters
+            ? `<button type="button" class="filter-reset-pill" data-action="reset-filters">${icon('undo', 12)}<span>${escapeHtml(t('sidebar.reset'))}</span></button>`
+            : ''
+        }
+        <button
+          type="button"
+          class="btn btn-ghost btn-icon btn-sm"
+          data-action="close-sidebar"
+          aria-label="${escapeAttr(t('mobile.closeDrawer'))}"
+        >${icon('x', 16)}</button>
+      </div>
     </div>
+
     <div class="sidebar-scroll">
-      <!-- Quick Views -->
-      <div class="sidebar-section">
+      <!-- Quick Views & Media/Framing -->
+      <div class="sidebar-section filter-glass-card">
         <div class="sidebar-section-header">
           <span>${escapeHtml(t('sidebar.quickViews'))}</span>
         </div>
@@ -258,64 +264,79 @@ export function renderSidebar(container, store) {
           <span class="nav-count">${totalCount}</span>
         </button>
         <button type="button" class="nav-item ${state.quickView === 'favorites' ? 'active' : ''}" data-action="quick-view" data-view="favorites">
-          <span class="nav-item-main" style="color:${state.quickView === 'favorites' ? 'var(--heart-rose)' : 'inherit'}">${icon('heartFilled', 15)}<span class="nav-item-label">${escapeHtml(t('sidebar.favorites'))}</span></span>
+          <span class="nav-item-main">${icon(state.quickView === 'favorites' ? 'heartFilled' : 'heart', 15)}<span class="nav-item-label">${escapeHtml(t('sidebar.favorites'))}</span></span>
           <span class="nav-count">${favTotal}</span>
         </button>
         <button type="button" class="nav-item ${state.quickView === 'unrated' ? 'active' : ''}" data-action="quick-view" data-view="unrated">
-          <span class="nav-item-main">${icon('star', 15)}<span class="nav-item-label">${escapeHtml(t('sidebar.unrated'))}</span></span>
+          <span class="nav-item-main">${starSectorIcon(0, 15)}<span class="nav-item-label">${escapeHtml(t('sidebar.unrated'))}</span></span>
           <span class="nav-count">${unratedTotal}</span>
         </button>
+
+        <div class="sidebar-facet-pills">
+          <button type="button" class="omni-pill ${(state.mediaFilter || 'all') === 'photo' ? 'is-active' : ''}" data-action="set-media" data-media="photo">${icon('image', 12)}<span>${escapeHtml(t('search.mediaPhotos'))}</span></button>
+          <button type="button" class="omni-pill ${(state.mediaFilter || 'all') === 'video' ? 'is-active' : ''}" data-action="set-media" data-media="video">${icon('video', 12)}<span>${escapeHtml(t('search.mediaVideos'))}</span></button>
+          <button type="button" class="omni-pill ${(state.aspectFilter || 'all') === 'landscape' ? 'is-active' : ''}" data-action="set-aspect" data-aspect="landscape">${icon('landscape', 12)}<span>${escapeHtml(t('search.aspectLandscape'))}</span></button>
+          <button type="button" class="omni-pill ${(state.aspectFilter || 'all') === 'portrait' ? 'is-active' : ''}" data-action="set-aspect" data-aspect="portrait">${icon('portrait', 12)}<span>${escapeHtml(t('search.aspectPortrait'))}</span></button>
+          <button type="button" class="omni-pill ${(state.aspectFilter || 'all') === 'square' ? 'is-active' : ''}" data-action="set-aspect" data-aspect="square">${icon('square', 12)}<span>${escapeHtml(t('search.aspectSquare'))}</span></button>
+        </div>
       </div>
 
-      <!-- Gallery Views -->
-      <div class="sidebar-section">
+      <!-- Sort Order Pills -->
+      <div class="sidebar-section filter-glass-card">
         <div class="sidebar-section-header">
-          <span>${escapeHtml(t('sidebar.viewLayout'))}</span>
-        </div>
-        <div class="segmented segmented-sliding" data-sidebar-layout-seg role="group" aria-label="${escapeAttr(t('sidebar.viewLayout'))}" style="margin:0 4px;--seg-index:${layoutIndex}">
-          <button type="button" class="seg-btn ${state.layoutMode === 'justified' ? 'active' : ''}" data-action="set-layout" data-layout="justified" title="${escapeAttr(t('header.layoutJustified'))}" aria-label="${escapeAttr(t('sidebar.viewJustified'))}" aria-pressed="${state.layoutMode === 'justified'}">
-            ${icon('rows', 16)}
-          </button>
-          <button type="button" class="seg-btn ${state.layoutMode === 'waterfall' ? 'active' : ''}" data-action="set-layout" data-layout="waterfall" title="${escapeAttr(t('header.layoutWaterfall'))}" aria-label="${escapeAttr(t('sidebar.viewWaterfall'))}" aria-pressed="${state.layoutMode === 'waterfall'}">
-            ${icon('waterfall', 16)}
-          </button>
-          <button type="button" class="seg-btn ${state.layoutMode === 'grid' ? 'active' : ''}" data-action="set-layout" data-layout="grid" title="${escapeAttr(t('header.layoutGrid'))}" aria-label="${escapeAttr(t('sidebar.viewGrid'))}" aria-pressed="${state.layoutMode === 'grid'}">
-            ${icon('grid', 16)}
+          <span>${escapeHtml(t('sidebar.sortSection'))}</span>
+          <button
+            type="button"
+            class="sort-dir-pill"
+            data-action="toggle-sort-dir"
+            title="${escapeAttr(sortAsc ? t('sidebar.sortAsc') : t('sidebar.sortDesc'))}"
+          >
+            ${icon(sortAsc ? 'arrowUp' : 'arrowDown', 12)}
+            <span>${escapeHtml(sortAsc ? t('sidebar.sortAsc') : t('sidebar.sortDesc'))}</span>
           </button>
         </div>
-        <div class="sidebar-display-tools">
-          <label class="sidebar-control sidebar-thumbnail-control">
-            ${icon('image', 15)}
-            <input
-              id="sidebarRowHeightRange"
-              type="range"
-              min="130"
-              max="320"
-              step="4"
-              value="${escapeAttr(String(state.rowHeight || 210))}"
-              title="${escapeAttr(t('header.thumbSize'))}"
-              aria-label="${escapeAttr(t('header.thumbSize'))}"
-            />
-          </label>
-          <button type="button" class="btn btn-icon sidebar-control sidebar-export" data-action="open-export" title="${escapeAttr(t('header.exportTooltip'))}" aria-label="${escapeAttr(t('header.exportBtn'))}">
-            ${icon('shareUp', 18)}
-          </button>
+        <div class="sort-pill-grid" role="group" aria-label="${escapeAttr(t('gallery.sortTitle'))}">
+          <button type="button" class="sort-pill ${sortField === 'date' ? 'active' : ''}" data-action="set-sort-field" data-field="date">${escapeHtml(t('sidebar.sortDate'))}</button>
+          <button type="button" class="sort-pill ${sortField === 'rating' ? 'active' : ''}" data-action="set-sort-field" data-field="rating">${escapeHtml(t('sidebar.sortRating'))}</button>
+          <button type="button" class="sort-pill ${sortField === 'name' ? 'active' : ''}" data-action="set-sort-field" data-field="name">${escapeHtml(t('sidebar.sortName'))}</button>
+          <button type="button" class="sort-pill ${sortField === 'size' ? 'active' : ''}" data-action="set-sort-field" data-field="size">${escapeHtml(t('sidebar.sortSize'))}</button>
         </div>
-        <div class="sidebar-control sidebar-sort-control">
-          ${icon('sort', 15, 'sidebar-sort-icon')}
-          <select id="sidebarSortSelect" aria-label="${escapeAttr(t('gallery.sortTitle'))}">
-            <option value="dateDesc" ${state.sortBy === 'dateDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateDesc'))}</option>
-            <option value="dateAsc" ${state.sortBy === 'dateAsc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateAsc'))}</option>
-            <option value="ratingDesc" ${state.sortBy === 'ratingDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortRatingDesc'))}</option>
-            <option value="nameAsc" ${state.sortBy === 'nameAsc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortNameAsc'))}</option>
-            <option value="sizeDesc" ${state.sortBy === 'sizeDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortSizeDesc'))}</option>
-          </select>
-          ${icon('chevronDown', 14, 'sidebar-sort-chevron')}
+      </div>
+
+      <!-- Rating Filter -->
+      <div class="sidebar-section filter-glass-card">
+        <div class="sidebar-section-header">
+          <span>${escapeHtml(t('sidebar.ratingFilter'))}</span>
+          ${
+            state.minRating > 0
+              ? `<button type="button" class="filter-reset-pill" data-action="set-min-rating" data-rating="0">${escapeHtml(t('sidebar.reset'))}</button>`
+              : ''
+          }
+        </div>
+        <div class="segmented segmented-sliding" style="--seg-index:${scopeIndex}" role="group">
+          <button type="button" class="seg-btn ${state.ratingScope === 'avg' ? 'active' : ''}" data-action="set-rating-scope" data-scope="avg">${escapeHtml(t('sidebar.scopeAvg'))}</button>
+          <button type="button" class="seg-btn ${state.ratingScope === 'mine' ? 'active' : ''}" data-action="set-rating-scope" data-scope="mine">${escapeHtml(t('sidebar.scopeMine'))}</button>
+          <button type="button" class="seg-btn ${state.ratingScope === 'member' ? 'active' : ''}" data-action="set-rating-scope" data-scope="member">${escapeHtml(t('sidebar.scopeMember'))}</button>
+        </div>
+        <div class="star-filter-row">
+          ${[0, 1, 2, 3, 4, 5]
+            .map(
+              (r) => `
+            <button
+              type="button"
+              class="star-pill ${state.minRating === r ? 'active' : ''}"
+              data-action="set-min-rating"
+              data-rating="${r}"
+              title="${escapeAttr(r === 0 ? t('sidebar.allStarsTitle') : t('sidebar.minStarsTitle', { n: r }))}"
+            >${r === 0 ? escapeHtml(t('sidebar.allStars')) : `${starSectorIcon(r, 12)}<span>${r}</span>`}</button>
+          `
+            )
+            .join('')}
         </div>
       </div>
 
       <!-- Folder Tree -->
-      <div class="sidebar-section">
+      <div class="sidebar-section filter-glass-card">
         <div class="sidebar-section-header">
           <span>${escapeHtml(t('sidebar.folders'))}</span>
         </div>
@@ -330,40 +351,8 @@ export function renderSidebar(container, store) {
         </div>
       </div>
 
-      <!-- Rating Filter -->
-      <div class="sidebar-section">
-        <div class="sidebar-section-header">
-          <span>${escapeHtml(t('sidebar.ratingFilter'))}</span>
-          ${
-            state.minRating > 0
-              ? `<button type="button" class="btn btn-ghost btn-sm" style="height:20px;padding:0 6px" data-action="set-min-rating" data-rating="0">${escapeHtml(t('sidebar.reset'))}</button>`
-              : ''
-          }
-        </div>
-        <div class="segmented" style="margin:0 4px">
-          <button type="button" class="seg-btn ${state.ratingScope === 'avg' ? 'active' : ''}" data-action="set-rating-scope" data-scope="avg">${escapeHtml(t('sidebar.scopeAvg'))}</button>
-          <button type="button" class="seg-btn ${state.ratingScope === 'mine' ? 'active' : ''}" data-action="set-rating-scope" data-scope="mine">${escapeHtml(t('sidebar.scopeMine'))}</button>
-          <button type="button" class="seg-btn ${state.ratingScope === 'member' ? 'active' : ''}" data-action="set-rating-scope" data-scope="member">${escapeHtml(t('sidebar.scopeMember'))}</button>
-        </div>
-        <div class="star-filter-row" style="padding:2px 4px 0">
-          ${[0, 1, 2, 3, 4, 5]
-            .map(
-              (r) => `
-            <button
-              type="button"
-              class="star-pill ${state.minRating === r ? 'active' : ''}"
-              data-action="set-min-rating"
-              data-rating="${r}"
-              title="${escapeAttr(r === 0 ? t('sidebar.allStarsTitle') : t('sidebar.minStarsTitle', { n: r }))}"
-            >${r === 0 ? escapeHtml(t('sidebar.allStars')) : `${r}★`}</button>
-          `
-            )
-            .join('')}
-        </div>
-      </div>
-
       <!-- Collaborators Filter -->
-      <div class="sidebar-section">
+      <div class="sidebar-section filter-glass-card">
         <div class="sidebar-section-header">
           <span>${escapeHtml(t('sidebar.collaborators', { count: members.length }))}</span>
         </div>
@@ -385,7 +374,7 @@ export function renderSidebar(container, store) {
                 </span>
                 <span class="nav-item-label">${escapeHtml(m.name)}${isMe ? escapeHtml(t('sidebar.meSuffix')) : ''}</span>
               </span>
-              <span class="nav-count">${m.ratedCount}★</span>
+              <span class="nav-count member-stat-pill">${m.ratedCount}${starSectorIcon(5, 11)}</span>
             </button>
           `;
           })
@@ -393,14 +382,13 @@ export function renderSidebar(container, store) {
       </div>
 
       <!-- Grouped Tag Management System -->
-      <div class="sidebar-section">
+      <div class="sidebar-section filter-glass-card">
         <div class="sidebar-section-header">
           <span>${escapeHtml(t('sidebar.tagManager'))}</span>
           <span class="sidebar-section-actions">
             <button
               type="button"
-              class="btn btn-ghost btn-sm"
-              style="height:20px;padding:0 6px;font-size:10.5px"
+              class="filter-reset-pill"
               data-action="toggle-tag-mode"
               title="${escapeAttr(t('sidebar.tagModeTitle'))}"
             >${escapeHtml(state.tagMatchMode === 'AND' ? t('sidebar.tagModeAnd') : t('sidebar.tagModeOr'))}</button>
@@ -416,31 +404,14 @@ export function renderSidebar(container, store) {
       </div>
     </div>
   `;
-  updateThumbnailSlider(container.querySelector('#sidebarRowHeightRange'));
 }
 
 export function bindSidebarEvents(container, store) {
   if (!container) return;
 
-  container.addEventListener('input', (e) => {
-    if (e.target.id === 'sidebarRowHeightRange') {
-      updateThumbnailSlider(e.target);
-      previewGalleryRowHeight(
-        document.getElementById('galleryGrid'),
-        document.getElementById('galleryScroll'),
-        store,
-        Number(e.target.value)
-      );
-    }
-  });
-
   container.addEventListener('change', (e) => {
     if (e.target.id === 'toggleSubfoldersCheck') {
       store.setIncludeSubfolders(e.target.checked);
-    } else if (e.target.id === 'sidebarRowHeightRange') {
-      store.setRowHeight(Number(e.target.value));
-    } else if (e.target.id === 'sidebarSortSelect') {
-      store.setSortBy(e.target.value);
     }
   });
 
@@ -453,13 +424,8 @@ export function bindSidebarEvents(container, store) {
       store.setState({ sidebarOpen: false });
       return;
     }
-    if (action === 'open-export') {
-      store.setState({ sidebarOpen: false });
-      store.openModal('export');
-      return;
-    }
-    if (action === 'set-layout') {
-      store.setLayoutMode(target.dataset.layout);
+    if (action === 'reset-filters') {
+      store.clearAllFilters();
       return;
     }
     if (action === 'select-folder') {
@@ -468,6 +434,32 @@ export function bindSidebarEvents(container, store) {
     }
     if (action === 'quick-view') {
       store.setState({ quickView: target.dataset.view, sidebarOpen: false });
+      return;
+    }
+    if (action === 'set-media') {
+      const m = target.dataset.media;
+      store.setState({ mediaFilter: store.state.mediaFilter === m ? 'all' : m });
+      return;
+    }
+    if (action === 'set-aspect') {
+      const a = target.dataset.aspect;
+      store.setState({ aspectFilter: store.state.aspectFilter === a ? 'all' : a });
+      return;
+    }
+    if (action === 'set-sort-field') {
+      const nextField = target.dataset.field;
+      const cur = parseSortParts(store.state.sortBy);
+      if (cur.field === nextField) {
+        store.setSortBy(buildSortValue(nextField, !cur.asc));
+      } else {
+        const defaultAsc = nextField === 'name';
+        store.setSortBy(buildSortValue(nextField, defaultAsc));
+      }
+      return;
+    }
+    if (action === 'toggle-sort-dir') {
+      const cur = parseSortParts(store.state.sortBy);
+      store.setSortBy(buildSortValue(cur.field, !cur.asc));
       return;
     }
     if (action === 'set-rating-scope') {

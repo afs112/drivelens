@@ -46,13 +46,41 @@ const ICON_PATHS = {
   globe: '<circle cx="12" cy="12" r="10"/><path d="M12 2a14.5 14.5 0 0 0 0 20 14.5 14.5 0 0 0 0-20"/><path d="M2 12h20"/>',
   appWindow: '<rect width="20" height="16" x="2" y="4" rx="2"/><path d="M2 8h20"/><path d="M6 6h.01"/><path d="M10 6h.01"/>',
   arrowUp: '<path d="M12 19V5"/><path d="m5 12 7-7 7 7"/>',
+  arrowDown: '<path d="M12 5v14"/><path d="m19 12-7 7-7-7"/>',
+  landscape: '<rect width="18" height="12" x="3" y="6" rx="2"/>',
+  portrait: '<rect width="12" height="18" x="6" y="3" rx="2"/>',
+  square: '<rect width="15" height="15" x="4.5" y="4.5" rx="2"/>',
   moreHorizontal: '<circle cx="5" cy="12" r="1.8" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.8" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.8" fill="currentColor" stroke="none"/>',
 };
+
+const STAR_OUTLINE_POINTS =
+  '12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2';
+
+const STAR_SECTOR_POLYGONS = [
+  '12,12.51 8.91,8.26 12,2 15.09,8.26',
+  '12,12.51 15.09,8.26 22,9.27 17,14.14',
+  '12,12.51 17,14.14 18.18,21.02 12,17.77',
+  '12,12.51 12,17.77 5.82,21.02 7,14.14',
+  '12,12.51 7,14.14 2,9.27 8.91,8.26',
+];
 
 export function icon(name, size = 16, className = '') {
   const body = ICON_PATHS[name] || ICON_PATHS.image;
   const cls = className ? ` class="${escapeAttr(className)}"` : '';
   return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"${cls}>${body}</svg>`;
+}
+
+export function starSectorIcon(rating = 0, size = 18, className = '') {
+  const val = Math.max(0, Math.min(5, Number(rating) || 0));
+  const cls = className ? ` class="${escapeAttr(className)}"` : '';
+  let fills = '';
+  for (let i = 0; i < 5; i += 1) {
+    const portion = Math.max(0, Math.min(1, val - i));
+    if (portion <= 0.02) continue;
+    const opacityAttr = portion < 0.98 ? ` fill-opacity="${portion.toFixed(2)}"` : '';
+    fills += `<polygon points="${STAR_SECTOR_POLYGONS[i]}" fill="currentColor" stroke="none"${opacityAttr}/>`;
+  }
+  return `<svg width="${size}" height="${size}" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"${cls} data-star-fill="${val.toFixed(1)}">${fills}<polygon points="${STAR_OUTLINE_POINTS}" fill="none"/></svg>`;
 }
 
 export function escapeHtml(str) {

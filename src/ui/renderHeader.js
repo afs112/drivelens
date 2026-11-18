@@ -1,12 +1,8 @@
 import { getDemoPersonas } from '../demo/demoAlbum.js';
 import { SUPPORTED_LANGS, t } from '../i18n.js';
-import { escapeAttr, escapeHtml, icon } from './icons.js';
+import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 import { isCompareOpen, openCompare, closeCompare } from './renderCompare.js';
-import {
-  isGallerySelectModeActive,
-  previewGalleryRowHeight,
-  toggleGallerySelectMode,
-} from './renderGallery.js';
+import { previewGalleryRowHeight } from './renderGallery.js';
 
 const SIDEBAR_ICON_SVG =
   '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>';
@@ -19,8 +15,9 @@ const LAYOUT_INDEX_MAP = {
 
 let lastBannerSignature = '';
 let lastToastSignature = '';
+let lastPaletteSignature = '';
 let isSearchComposing = false;
-let searchOpen = false;
+let searchExpanded = false;
 let demoBannerExpanded = false;
 let moreMenuOpen = false;
 let headerDocBound = false;
@@ -38,35 +35,38 @@ function buildHeaderSkeleton(headerEl, state) {
         ${SIDEBAR_ICON_SVG}
       </button>
       <button type="button" class="album-pill" data-header="toggle-album" data-header-pill title="">
-        <span class="album-pill-dot"></span>
         <span class="album-pill-name"></span>
         <span class="album-pill-count"></span>
       </button>
     </div>
 
-    <div class="header-center">
-      <div class="search-box header-glass-pill">
-        <span class="search-icon">${icon('search', 14)}</span>
-        <input
-          id="searchInput"
-          type="text"
-          placeholder="${escapeAttr(t('header.searchPlaceholder'))}"
-          aria-label="${escapeAttr(t('header.searchPlaceholder'))}"
-          autocomplete="off"
-        />
-        <button
-          type="button"
-          id="searchClearBtn"
-          class="search-clear-btn"
-          data-header="clear-search"
-          title="${escapeAttr(t('header.clearSearch'))}"
-          aria-label="${escapeAttr(t('header.clearSearch'))}"
-        >${icon('x', 13)}</button>
+    <div class="header-center" data-search-shell>
+      <div class="search-omni-card">
+        <div class="search-box">
+          <span class="search-icon">${icon('search', 14)}</span>
+          <input
+            id="searchInput"
+            type="text"
+            placeholder="${escapeAttr(t('search.placeholderShort'))}"
+            aria-label="${escapeAttr(t('header.searchPlaceholder'))}"
+            autocomplete="off"
+          />
+          <span class="search-active-dot hidden" data-search-dot aria-hidden="true"></span>
+          <button
+            type="button"
+            id="searchClearBtn"
+            class="search-clear-btn hidden"
+            data-header="clear-search"
+            title="${escapeAttr(t('header.clearSearch'))}"
+            aria-label="${escapeAttr(t('header.clearSearch'))}"
+          >${icon('x', 13)}</button>
+        </div>
+        <div id="searchPalette" class="search-palette" data-search-palette aria-hidden="true"></div>
       </div>
     </div>
 
     <div class="header-right">
-      <div class="segmented segmented-sliding header-glass-pill header-layout-shortcuts header-desktop" data-layout-seg role="group" aria-label="${escapeAttr(t('header.layoutGroup'))}">
+      <div class="segmented segmented-sliding header-glass-pill header-layout-shortcuts" data-layout-seg role="group" aria-label="${escapeAttr(t('header.layoutGroup'))}">
         <button type="button" class="seg-btn" data-header="layout" data-layout="justified" title="${escapeAttr(t('header.layoutJustified'))}" aria-label="${escapeAttr(t('sidebar.viewJustified'))}">
           ${icon('rows', 16)}
         </button>
@@ -77,26 +77,6 @@ function buildHeaderSkeleton(headerEl, state) {
           ${icon('grid', 16)}
         </button>
       </div>
-
-      <button
-        type="button"
-        class="btn btn-icon header-glass-pill"
-        data-header="toggle-select"
-        title="${escapeAttr(t('header.toggleSelect'))}"
-        aria-label="${escapeAttr(t('header.toggleSelect'))}"
-      >
-        ${icon('checkCircle', 17)}
-      </button>
-
-      <button
-        type="button"
-        class="btn btn-icon header-glass-pill header-desktop"
-        data-header="toggle-search"
-        title="${escapeAttr(t('mobile.navSearch'))}"
-        aria-label="${escapeAttr(t('mobile.navSearch'))}"
-      >
-        ${icon('search', 16)}
-      </button>
 
       <button
         type="button"
@@ -123,21 +103,6 @@ function buildHeaderSkeleton(headerEl, state) {
     </div>
 
     <div id="headerMorePopover" class="header-more-popover" role="region" aria-label="${escapeAttr(t('header.moreMenu'))}" inert>
-      <div class="more-popover-section">
-        <div class="more-popover-label">${escapeHtml(t('header.layoutGroup'))}</div>
-        <div class="segmented segmented-sliding" data-more-layout-seg role="group" aria-label="${escapeAttr(t('header.layoutGroup'))}" style="width:100%">
-          <button type="button" class="seg-btn" data-more-layout="justified" title="${escapeAttr(t('header.layoutJustified'))}" aria-label="${escapeAttr(t('sidebar.viewJustified'))}">
-            ${icon('rows', 16)}
-          </button>
-          <button type="button" class="seg-btn" data-more-layout="waterfall" title="${escapeAttr(t('header.layoutWaterfall'))}" aria-label="${escapeAttr(t('sidebar.viewWaterfall'))}">
-            ${icon('waterfall', 16)}
-          </button>
-          <button type="button" class="seg-btn" data-more-layout="grid" title="${escapeAttr(t('header.layoutGrid'))}" aria-label="${escapeAttr(t('sidebar.viewGrid'))}">
-            ${icon('grid', 16)}
-          </button>
-        </div>
-      </div>
-
       <div class="more-popover-section">
         <div class="more-popover-label">
           <span>${escapeHtml(t('header.thumbSize'))}</span>
@@ -197,6 +162,119 @@ function buildHeaderSkeleton(headerEl, state) {
   `;
 }
 
+function renderMultimodalPalette(headerEl, state, store, visibleCount) {
+  const paletteEl = headerEl.querySelector('[data-search-palette]');
+  if (!paletteEl) return;
+
+  paletteEl.setAttribute('aria-hidden', String(!searchExpanded));
+  if (!searchExpanded) return;
+
+  const tags = store.getActiveTagList().slice(0, 10);
+  const members = store.getMembersSummary();
+  const tagKey = Array.from(state.selectedTagIds || []).sort().join(',');
+  const sig = [
+    state.lang,
+    visibleCount,
+    state.mediaFilter || 'all',
+    state.aspectFilter || 'all',
+    state.quickView,
+    state.minRating,
+    state.ratingScope,
+    state.memberFilterId || '',
+    tagKey,
+    tags.map((tg) => `${tg.id}:${tg.name}:${tg.color}`).join(','),
+    members.map((m) => `${m.id}:${m.name}`).join(','),
+  ].join('|');
+
+  if (sig === lastPaletteSignature && paletteEl.childElementCount > 0) {
+    return;
+  }
+  lastPaletteSignature = sig;
+
+  const hasAnyFilter =
+    Boolean(state.searchQuery.trim()) ||
+    state.quickView !== 'all' ||
+    (state.mediaFilter && state.mediaFilter !== 'all') ||
+    (state.aspectFilter && state.aspectFilter !== 'all') ||
+    state.minRating > 0 ||
+    Boolean(state.memberFilterId) ||
+    (state.selectedTagIds?.size || 0) > 0;
+
+  const tagsHtml =
+    tags.length > 0
+      ? `
+      <div class="omni-group">
+        <span class="omni-group-label">${escapeHtml(t('search.sectionTags'))}</span>
+        <div class="omni-pills">
+          ${tags
+            .map((tg) => {
+              const active = state.selectedTagIds.has(tg.id);
+              return `<button type="button" class="omni-pill ${active ? 'is-active' : ''}" data-omni="tag" data-val="${escapeAttr(tg.id)}">
+                <span class="tag-dot tag-color-${escapeAttr(tg.color || 'blue')}"></span>
+                <span>${escapeHtml(tg.name)}</span>
+              </button>`;
+            })
+            .join('')}
+        </div>
+      </div>
+    `
+      : '';
+
+  const membersHtml =
+    members.length > 1
+      ? `
+      <div class="omni-group">
+        <span class="omni-group-label">${escapeHtml(t('search.sectionMembers'))}</span>
+        <div class="omni-pills">
+          ${members
+            .map((m) => {
+              const active = state.ratingScope === 'member' && state.memberFilterId === m.id;
+              return `<button type="button" class="omni-pill ${active ? 'is-active' : ''}" data-omni="member" data-val="${escapeAttr(m.id)}">
+                <span class="omni-member-dot" style="background:${escapeAttr(m.color)}"></span>
+                <span>${escapeHtml(m.name)}</span>
+              </button>`;
+            })
+            .join('')}
+        </div>
+      </div>
+    `
+      : '';
+
+  paletteEl.innerHTML = `
+    <div class="omni-group">
+      <div class="omni-group-head">
+        <span class="omni-group-label">${escapeHtml(t('search.sectionMedia'))}</span>
+        <span class="omni-count-label">${escapeHtml(t('search.resultsCount', { count: visibleCount }))}</span>
+      </div>
+      <div class="omni-pills">
+        <button type="button" class="omni-pill ${(state.mediaFilter || 'all') === 'photo' ? 'is-active' : ''}" data-omni="media" data-val="photo">${icon('image', 13)}<span>${escapeHtml(t('search.mediaPhotos'))}</span></button>
+        <button type="button" class="omni-pill ${(state.mediaFilter || 'all') === 'video' ? 'is-active' : ''}" data-omni="media" data-val="video">${icon('video', 13)}<span>${escapeHtml(t('search.mediaVideos'))}</span></button>
+        <button type="button" class="omni-pill ${(state.aspectFilter || 'all') === 'landscape' ? 'is-active' : ''}" data-omni="aspect" data-val="landscape">${icon('landscape', 13)}<span>${escapeHtml(t('search.aspectLandscape'))}</span></button>
+        <button type="button" class="omni-pill ${(state.aspectFilter || 'all') === 'portrait' ? 'is-active' : ''}" data-omni="aspect" data-val="portrait">${icon('portrait', 13)}<span>${escapeHtml(t('search.aspectPortrait'))}</span></button>
+        <button type="button" class="omni-pill ${(state.aspectFilter || 'all') === 'square' ? 'is-active' : ''}" data-omni="aspect" data-val="square">${icon('square', 13)}<span>${escapeHtml(t('search.aspectSquare'))}</span></button>
+      </div>
+    </div>
+
+    <div class="omni-group">
+      <span class="omni-group-label">${escapeHtml(t('search.sectionPicks'))}</span>
+      <div class="omni-pills">
+        <button type="button" class="omni-pill ${state.quickView === 'favorites' ? 'is-active' : ''}" data-omni="quick" data-val="favorites">${icon('heartFilled', 12)}<span>${escapeHtml(t('sidebar.favorites'))}</span></button>
+        <button type="button" class="omni-pill ${state.minRating === 5 ? 'is-active' : ''}" data-omni="rating" data-val="5">${starSectorIcon(5, 13)}<span>5</span></button>
+        <button type="button" class="omni-pill ${state.minRating === 4 ? 'is-active' : ''}" data-omni="rating" data-val="4">${starSectorIcon(4, 13)}<span>4+</span></button>
+        <button type="button" class="omni-pill ${state.quickView === 'unrated' ? 'is-active' : ''}" data-omni="quick" data-val="unrated">${starSectorIcon(0, 13)}<span>${escapeHtml(t('sidebar.unrated'))}</span></button>
+        ${
+          hasAnyFilter
+            ? `<button type="button" class="omni-pill omni-pill-reset" data-omni="reset">${icon('undo', 12)}<span>${escapeHtml(t('sidebar.reset'))}</span></button>`
+            : ''
+        }
+      </div>
+    </div>
+
+    ${tagsHtml}
+    ${membersHtml}
+  `;
+}
+
 function updateHeaderElements(headerEl, state, store) {
   const sidebarBtn = headerEl.querySelector('[data-header="toggle-sidebar"]');
   if (sidebarBtn) {
@@ -204,6 +282,9 @@ function updateHeaderElements(headerEl, state, store) {
     sidebarBtn.setAttribute('aria-expanded', String(expanded));
     sidebarBtn.classList.toggle('is-active', expanded);
   }
+
+  const visiblePhotos = store.getVisiblePhotos();
+  const visibleCount = visiblePhotos.length;
 
   const pillEl = headerEl.querySelector('[data-header-pill]');
   const pillNameEl = headerEl.querySelector('.album-pill-name');
@@ -221,20 +302,14 @@ function updateHeaderElements(headerEl, state, store) {
     pillEl.setAttribute('aria-expanded', String(isGdrive ? state.sidebarOpen : demoBannerExpanded));
     pillNameEl.textContent = albumName;
     if (pillCountEl) {
-      pillCountEl.textContent = String(store.getVisiblePhotos().length);
+      pillCountEl.textContent = String(visibleCount);
     }
   }
 
   const selCount = state.selectedPhotoIds?.size || 0;
-  const selectBtn = headerEl.querySelector('[data-header="toggle-select"]');
-  if (selectBtn) {
-    const selecting = isGallerySelectModeActive(store);
-    selectBtn.classList.toggle('is-active', selecting);
-    selectBtn.setAttribute('aria-pressed', String(selecting));
-  }
   const searchInput = headerEl.querySelector('#searchInput');
+  const nextQuery = state.searchQuery || '';
   if (searchInput) {
-    const nextQuery = state.searchQuery || '';
     if (!isSearchComposing && searchInput.value !== nextQuery) {
       const wasFocused = document.activeElement === searchInput;
       const start = searchInput.selectionStart;
@@ -249,23 +324,28 @@ function updateHeaderElements(headerEl, state, store) {
     }
   }
 
-  const searchToggleBtn = headerEl.querySelector('[data-header="toggle-search"]');
-  if (searchToggleBtn) {
-    searchToggleBtn.classList.toggle('is-active', searchOpen || Boolean(state.searchQuery));
-    searchToggleBtn.setAttribute('aria-expanded', String(searchOpen));
+  const hasFacetFilter =
+    state.quickView !== 'all' ||
+    (state.mediaFilter && state.mediaFilter !== 'all') ||
+    (state.aspectFilter && state.aspectFilter !== 'all') ||
+    state.minRating > 0 ||
+    Boolean(state.memberFilterId) ||
+    (state.selectedTagIds?.size || 0) > 0;
+
+  const clearBtn = headerEl.querySelector('#searchClearBtn');
+  if (clearBtn) {
+    clearBtn.classList.toggle('hidden', !nextQuery && !searchExpanded);
+  }
+  const activeDot = headerEl.querySelector('[data-search-dot]');
+  if (activeDot) {
+    activeDot.classList.toggle('hidden', !hasFacetFilter || searchExpanded);
   }
 
   const segIndex = String(LAYOUT_INDEX_MAP[state.layoutMode] ?? 1);
   headerEl.querySelector('[data-layout-seg]')?.style.setProperty('--seg-index', segIndex);
-  headerEl.querySelector('[data-more-layout-seg]')?.style.setProperty('--seg-index', segIndex);
 
   for (const btn of headerEl.querySelectorAll('[data-header="layout"]')) {
     const active = btn.dataset.layout === state.layoutMode;
-    btn.classList.toggle('active', active);
-    btn.setAttribute('aria-pressed', String(active));
-  }
-  for (const btn of headerEl.querySelectorAll('[data-more-layout]')) {
-    const active = btn.dataset.moreLayout === state.layoutMode;
     btn.classList.toggle('active', active);
     btn.setAttribute('aria-pressed', String(active));
   }
@@ -371,41 +451,53 @@ function updateHeaderElements(headerEl, state, store) {
     themeBtn.title = labelText;
   }
 
-  headerEl.classList.toggle('mobile-search-open', searchOpen);
-  if (searchOpen || moreMenuOpen || demoBannerExpanded || state.sidebarOpen || state.inspectorOpen) {
+  headerEl.classList.toggle('search-expanded', searchExpanded);
+  headerEl.classList.toggle('mobile-search-open', searchExpanded);
+  renderMultimodalPalette(headerEl, state, store, visibleCount);
+
+  if (
+    searchExpanded ||
+    moreMenuOpen ||
+    demoBannerExpanded ||
+    state.sidebarOpen ||
+    state.inspectorOpen
+  ) {
     headerEl.classList.remove('is-hidden-scroll');
   }
 }
 
 export function dismissHeaderOverlay(headerEl, store) {
-  if (moreMenuOpen || demoBannerExpanded || searchOpen) {
-    const trigger = moreMenuOpen
-      ? headerEl.querySelector('[data-header="toggle-more"]')
-      : demoBannerExpanded
-        ? headerEl.querySelector('[data-header-pill]')
-        : headerEl.querySelector('[data-header="toggle-search"]');
+  if (moreMenuOpen || demoBannerExpanded || searchExpanded) {
+    const wasSearch = searchExpanded;
     moreMenuOpen = false;
     demoBannerExpanded = false;
-    searchOpen = false;
+    searchExpanded = false;
+    if (wasSearch) {
+      headerEl?.querySelector('#searchInput')?.blur();
+    }
     store.emit();
-    if (trigger?.offsetWidth) trigger.focus();
-    else document.querySelector('[data-mnav="search"]')?.focus();
     return true;
   }
   return false;
 }
 
-function toggleSearch(headerEl, store) {
-  searchOpen = !searchOpen;
+function expandSearchPalette(headerEl, store, toggleIfOpen = false) {
+  if (toggleIfOpen && searchExpanded) {
+    searchExpanded = false;
+    headerEl.querySelector('#searchInput')?.blur();
+    store.emit();
+    return;
+  }
+  searchExpanded = true;
   moreMenuOpen = false;
   demoBannerExpanded = false;
   headerEl.classList.remove('is-hidden-scroll');
-  if (searchOpen) {
+  if (store.state.sidebarOpen || store.state.inspectorOpen) {
     store.setState({ sidebarOpen: false, inspectorOpen: false });
-    headerEl.querySelector('#searchInput')?.focus();
   } else {
     store.emit();
   }
+  headerEl.querySelector('#searchInput')?.focus();
 }
 
 function renderDemoBanner(bannerEl, state) {
@@ -511,6 +603,7 @@ export function renderHeader(headerEl, bannerEl, toastEl, store) {
       const selEnd = prevSearch?.selectionEnd;
 
       headerEl.dataset.lang = currentLang;
+      lastPaletteSignature = '';
       buildHeaderSkeleton(headerEl, state);
 
       const nextSearch = headerEl.querySelector('#searchInput');
@@ -541,14 +634,42 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
     if (!headerDocBound) {
       headerDocBound = true;
       document.addEventListener('click', (e) => {
-        if ((!moreMenuOpen && !demoBannerExpanded) || headerEl.contains(e.target) || bannerEl?.contains(e.target)) {
+        if (!moreMenuOpen && !demoBannerExpanded && !searchExpanded) {
+          return;
+        }
+        const path = typeof e.composedPath === 'function' ? e.composedPath() : [];
+        const clickedMobileSearchOrb =
+          path.some((el) => el?.dataset?.mnav === 'search') ||
+          Boolean(e.target.closest?.('[data-mnav="search"]'));
+        if (clickedMobileSearchOrb) {
+          return;
+        }
+        const inHeader = path.includes(headerEl) || headerEl.contains(e.target);
+        const inBanner = Boolean(
+          bannerEl && (path.includes(bannerEl) || bannerEl.contains(e.target))
+        );
+        if (inHeader || inBanner) {
+          const inSearchShell =
+            path.some((el) => el?.dataset && 'searchShell' in el.dataset) ||
+            Boolean(e.target.closest?.('[data-search-shell]'));
+          if (searchExpanded && inHeader && !inSearchShell) {
+            searchExpanded = false;
+            store.emit();
+          }
           return;
         }
         moreMenuOpen = false;
         demoBannerExpanded = false;
+        searchExpanded = false;
         store.emit();
       });
     }
+
+    headerEl.addEventListener('focusin', (e) => {
+      if (e.target.id === 'searchInput' && !searchExpanded) {
+        expandSearchPalette(headerEl, store, false);
+      }
+    });
 
     headerEl.addEventListener('compositionstart', (e) => {
       if (e.target.id === 'searchInput') isSearchComposing = true;
@@ -587,11 +708,31 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
     });
 
     headerEl.addEventListener('click', (e) => {
-      const moreLayoutBtn = e.target.closest('[data-more-layout]');
-      if (moreLayoutBtn) {
-        const layoutMode = moreLayoutBtn.dataset.moreLayout;
-        if (layoutMode === 'justified' || layoutMode === 'waterfall' || layoutMode === 'grid') {
-          store.setLayoutMode(layoutMode);
+      const omniBtn = e.target.closest('[data-omni]');
+      if (omniBtn) {
+        const kind = omniBtn.dataset.omni;
+        const val = omniBtn.dataset.val;
+        const st = store.state;
+        if (kind === 'media') {
+          store.setState({ mediaFilter: st.mediaFilter === val ? 'all' : val });
+        } else if (kind === 'aspect') {
+          store.setState({ aspectFilter: st.aspectFilter === val ? 'all' : val });
+        } else if (kind === 'quick') {
+          store.setState({ quickView: st.quickView === val ? 'all' : val });
+        } else if (kind === 'rating') {
+          const r = Number(val || 0);
+          store.setState({ minRating: st.minRating === r ? 0 : r });
+        } else if (kind === 'tag') {
+          store.toggleTagFilter(val);
+        } else if (kind === 'member') {
+          const already = st.ratingScope === 'member' && st.memberFilterId === val;
+          store.setState(
+            already
+              ? { ratingScope: 'avg', memberFilterId: null }
+              : { ratingScope: 'member', memberFilterId: val }
+          );
+        } else if (kind === 'reset') {
+          store.clearAllFilters();
         }
         return;
       }
@@ -602,38 +743,37 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
 
       if (action === 'toggle-more') {
         moreMenuOpen = !moreMenuOpen;
-        searchOpen = false;
+        searchExpanded = false;
         demoBannerExpanded = false;
         if (moreMenuOpen) store.setState({ sidebarOpen: false, inspectorOpen: false });
         else store.emit();
-      } else if (action === 'toggle-select') {
-        moreMenuOpen = false;
-        demoBannerExpanded = false;
-        toggleGallerySelectMode(store);
       } else if (action === 'toggle-album') {
         moreMenuOpen = false;
-        searchOpen = false;
+        searchExpanded = false;
         if (store.state.mode === 'demo') {
           demoBannerExpanded = !demoBannerExpanded;
           store.setState({ sidebarOpen: false, inspectorOpen: false });
         } else {
           store.setState({ sidebarOpen: !store.state.sidebarOpen, inspectorOpen: false });
         }
-      } else if (action === 'toggle-search') {
-        toggleSearch(headerEl, store);
       } else if (action === 'toggle-sidebar') {
         moreMenuOpen = false;
-        searchOpen = false;
+        searchExpanded = false;
         demoBannerExpanded = false;
         store.setState({ sidebarOpen: !store.state.sidebarOpen, inspectorOpen: false });
       } else if (action === 'clear-search') {
-        searchOpen = false;
         const input = headerEl.querySelector('#searchInput');
-        if (input) input.value = '';
-        store.setState({ searchQuery: '' });
-        const trigger = headerEl.querySelector('[data-header="toggle-search"]');
-        if (trigger?.offsetWidth) trigger.focus();
-        else document.querySelector('[data-mnav="search"]')?.focus();
+        if (store.state.searchQuery) {
+          if (input) {
+            input.value = '';
+            input.focus();
+          }
+          store.setState({ searchQuery: '' });
+        } else {
+          searchExpanded = false;
+          input?.blur();
+          store.emit();
+        }
       } else if (action === 'layout') {
         const layoutMode = btn.dataset.layout;
         if (layoutMode === 'justified' || layoutMode === 'waterfall' || layoutMode === 'grid') {
@@ -655,7 +795,7 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
         store.promptInstallPwa();
       } else if (action === 'toggle-inspector') {
         moreMenuOpen = false;
-        searchOpen = false;
+        searchExpanded = false;
         demoBannerExpanded = false;
         store.setState({ inspectorOpen: !store.state.inspectorOpen, sidebarOpen: false });
       } else if (action === 'toggle-theme') {
@@ -762,6 +902,8 @@ export function renderMobileNav(navEl, store) {
 
   const filterBadgeCount =
     (state.quickView !== 'all' ? 1 : 0) +
+    ((state.mediaFilter && state.mediaFilter !== 'all') ? 1 : 0) +
+    ((state.aspectFilter && state.aspectFilter !== 'all') ? 1 : 0) +
     (state.minRating > 0 ? 1 : 0) +
     (state.selectedTagIds?.size || 0);
   const selectedCount = state.selectedPhotoIds?.size || 0;
@@ -772,7 +914,7 @@ export function renderMobileNav(navEl, store) {
     compare: compareOpen,
     details: Boolean(state.inspectorOpen),
     connect: state.mode === 'gdrive' && !state.sidebarOpen && !compareOpen && !state.inspectorOpen,
-    search: searchOpen || Boolean(state.searchQuery),
+    search: searchExpanded || Boolean(state.searchQuery),
   };
 
   for (const [key, isActive] of Object.entries(activeMap)) {
@@ -781,7 +923,7 @@ export function renderMobileNav(navEl, store) {
   }
   navEl.querySelector('[data-mnav="folders"]')?.setAttribute('aria-expanded', String(state.sidebarOpen));
   navEl.querySelector('[data-mnav="details"]')?.setAttribute('aria-expanded', String(state.inspectorOpen));
-  navEl.querySelector('[data-mnav="search"]')?.setAttribute('aria-expanded', String(searchOpen));
+  navEl.querySelector('[data-mnav="search"]')?.setAttribute('aria-expanded', String(searchExpanded));
 
   const foldersBadge = navEl.querySelector('[data-mnav-badge="folders"]');
   if (foldersBadge) {
@@ -817,12 +959,12 @@ export function bindMobileNavEvents(navEl, store) {
       return;
     }
     if (action === 'search') {
-      toggleSearch(headerEl, store);
+      expandSearchPalette(headerEl, store, true);
       return;
     }
 
     moreMenuOpen = false;
-    searchOpen = false;
+    searchExpanded = false;
     demoBannerExpanded = false;
 
     if (action === 'folders') {

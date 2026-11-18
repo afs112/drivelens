@@ -11,7 +11,7 @@ import {
 } from './ui/renderCompare.js';
 import {
   bindGalleryEvents,
-  getCurrentPageRatedPhotos,
+  getCurrentPageSmartTargets,
   relayoutGalleryOnResize,
   renderBatchBar,
   renderGalleryGrid,
@@ -26,7 +26,13 @@ import {
   renderMobileNav,
 } from './ui/renderHeader.js';
 import { bindInspectorEvents, renderInspector } from './ui/renderInspector.js';
-import { bindLightboxEvents, dismissLightboxPopover, renderLightbox, toggleLightboxInfo } from './ui/renderLightbox.js';
+import {
+  bindLightboxEvents,
+  closeLightboxWithAnimation,
+  dismissLightboxPopover,
+  renderLightbox,
+  toggleLightboxInfo,
+} from './ui/renderLightbox.js';
 import { bindModalEvents, renderModals } from './ui/renderModals.js';
 import { bindSidebarEvents, renderSidebar } from './ui/renderSidebar.js';
 
@@ -51,7 +57,7 @@ function syncSmartHdPipeline(visiblePhotos = store.getVisiblePhotos()) {
   const state = store.state;
   const albumKey = `${state.mode}:${state.folderId || 'demo'}`;
   if (state.loading) {
-    updateSmartHdSchedule({ albumKey, lightboxItems: [], ratedPageItems: [] });
+    updateSmartHdSchedule({ albumKey, lightboxItems: [], ratedPageItems: [], restPageItems: [] });
     return;
   }
 
@@ -66,11 +72,16 @@ function syncSmartHdPipeline(visiblePhotos = store.getVisiblePhotos()) {
     }
   }
 
-  const ratedPageItems = getCurrentPageRatedPhotos(galleryScroll, store, visiblePhotos);
+  const { ratedPageItems, restPageItems } = getCurrentPageSmartTargets(
+    galleryScroll,
+    store,
+    visiblePhotos
+  );
   updateSmartHdSchedule({
     albumKey,
     lightboxItems,
     ratedPageItems,
+    restPageItems,
     getAccessToken: () => store.state.accessToken,
     getApiKey: () => store.state.apiKey,
   });
@@ -262,7 +273,9 @@ window.addEventListener('keydown', (event) => {
     }
     if (store.state.lightboxPhotoId) {
       event.preventDefault();
-      if (!dismissLightboxPopover(lightboxRoot)) store.closeLightbox();
+      if (!dismissLightboxPopover(lightboxRoot)) {
+        closeLightboxWithAnimation(lightboxRoot, store);
+      }
       return;
     }
     if (dismissHeaderOverlay(topHeader, store)) {
@@ -373,7 +386,9 @@ window.addEventListener('keydown', (event) => {
     }
     event.preventDefault();
     if (store.state.lightboxPhotoId) {
-      store.closeLightbox();
+      if (!dismissLightboxPopover(lightboxRoot)) {
+        closeLightboxWithAnimation(lightboxRoot, store);
+      }
     } else {
       const targetId =
         store.state.focusedPhotoId ||

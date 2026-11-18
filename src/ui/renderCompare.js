@@ -1,6 +1,6 @@
 import { t } from '../i18n.js';
 import { loadPhotoIntoElement } from '../storage/imageLoader.js';
-import { escapeAttr, escapeHtml, icon } from './icons.js';
+import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 
 let compareActive = false;
 let compareIds = [];
@@ -72,7 +72,7 @@ function buildPaneHudHtml(file, store) {
 
   const avgHtml =
     meta.avgRating > 0
-      ? `<span class="compare-avg-badge">${escapeHtml(t('compare.avgBadge', { avg: meta.avgRating.toFixed(1) }))}</span>`
+      ? `<span class="compare-avg-badge">${starSectorIcon(meta.avgRating, 13)}<span>${escapeHtml(meta.avgRating.toFixed(1))}</span></span>`
       : `<span class="compare-avg-empty">${escapeHtml(t('compare.unrated'))}</span>`;
 
   const tagsHtml = meta.activeTagIds

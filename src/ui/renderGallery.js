@@ -1,9 +1,9 @@
 import { getLocaleTag, t } from '../i18n.js';
 import { resolvePhotoTimestamp } from '../state/store.js';
-import { loadPhotoIntoElement } from '../storage/imageLoader.js';
-import { escapeAttr, escapeHtml, icon } from './icons.js';
+import { loadPhotoIntoElement, quantizeThumbSize } from '../storage/imageLoader.js';
+import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
+import { openCompare } from './renderCompare.js';
 
-const GALLERY_THUMB_SIZE = 480;
 const PAGE_CHUNK = 80;
 
 const visiblePhotosIdSigCache = new WeakMap();
@@ -148,7 +148,7 @@ function buildOverlayData(file, store) {
       const avgText = Number.isInteger(meta.avgRating)
         ? `${meta.avgRating}.0`
         : meta.avgRating.toFixed(1);
-      starHtml = `<span class="photo-star-badge">${icon('starFilled', 11)}<span>${avgText}</span></span>`;
+      starHtml = `<span class="photo-star-badge">${starSectorIcon(meta.avgRating, 12)}<span>${avgText}</span></span>`;
     }
 
     const heartHtml =
@@ -178,7 +178,6 @@ function buildOverlayData(file, store) {
     };
   }
 
-  // Hover-only subtle EXIF line for unrated/untagged cards (never show filenames by default)
   const exif = file.imageMediaMetadata || {};
   const parts = [];
   if (exif.cameraModel) parts.push(String(exif.cameraModel).trim());
@@ -235,7 +234,20 @@ function patchCardMeta(card, file, store, selectTitle) {
   }
 }
 
-function acquirePhotoCard(file, store, styleAttr = '', isWaterfall = false, patchMeta = true) {
+function computeCardThumbTarget(cssBoxMaxPx) {
+  const dpr =
+    typeof window !== 'undefined' ? Math.min(2.25, Math.max(1, window.devicePixelRatio || 1)) : 1;
+  return quantizeThumbSize(Math.round((Number(cssBoxMaxPx) || 260) * dpr));
+}
+
+function acquirePhotoCard(
+  file,
+  store,
+  styleAttr = '',
+  isWaterfall = false,
+  patchMeta = true,
+  cssBoxMaxPx = 280
+) {
   let card = cardPool.get(file.id);
   if (!card) {
     const isVideo = file.mimeType && file.mimeType.startsWith('video/');
@@ -260,6 +272,7 @@ function acquirePhotoCard(file, store, styleAttr = '', isWaterfall = false, patc
     card._selectTitle = card._selectBtn?.title || '';
     card._styleAttr = null;
     card._loadedKey = '';
+    card._requestedThumbSize = 0;
     card._selected = false;
     card._focused = false;
     card._overlayMode = 'empty';
@@ -284,11 +297,18 @@ function acquirePhotoCard(file, store, styleAttr = '', isWaterfall = false, patc
     card._waterfall = isWaterfall;
   }
 
-  const loadKey = `${file.id}|${file.thumbnailLink || ''}|${Boolean(store.state.accessToken)}|${Boolean(store.state.apiKey)}`;
-  if (card._loadedKey !== loadKey && card._imgEl) {
+  // Upgrade thumbnail tier only on committed renders (patchMeta === true), never mid-slider drag
+  const desiredSize = patchMeta
+    ? Math.max(card._requestedThumbSize || 480, computeCardThumbTarget(cssBoxMaxPx))
+    : card._requestedThumbSize || 480;
+
+  const authSig = `${file.id}|${file.thumbnailLink || ''}|${Boolean(store.state.accessToken)}|${Boolean(store.state.apiKey)}`;
+  const loadKey = `${authSig}|${desiredSize}`;
+  if (card._imgEl && (card._loadedKey !== loadKey || (patchMeta && desiredSize > card._requestedThumbSize))) {
     card._loadedKey = loadKey;
+    card._requestedThumbSize = desiredSize;
     loadPhotoIntoElement(card._imgEl, file, {
-      size: GALLERY_THUMB_SIZE,
+      size: desiredSize,
       getAccessToken: () => store.state.accessToken,
       getApiKey: () => store.state.apiKey,
     });
@@ -326,8 +346,10 @@ export function setGalleryScrollSettleCallback(fn) {
   scrollSettleCallback = typeof fn === 'function' ? fn : null;
 }
 
-export function getCurrentPageRatedPhotos(scrollContainer, store, visiblePhotos) {
-  if (!store || !Array.isArray(visiblePhotos) || visiblePhotos.length === 0) return [];
+export function getCurrentPageSmartTargets(scrollContainer, store, visiblePhotos) {
+  if (!store || !Array.isArray(visiblePhotos) || visiblePhotos.length === 0) {
+    return { ratedPageItems: [], restPageItems: [] };
+  }
   const limit = Math.min(renderedLimit, visiblePhotos.length);
   const pageSlice = visiblePhotos.slice(0, limit);
   const maxScroll = scrollContainer
@@ -336,22 +358,26 @@ export function getCurrentPageRatedPhotos(scrollContainer, store, visiblePhotos)
   const ratio = scrollContainer ? Math.min(1, Math.max(0, scrollContainer.scrollTop / maxScroll)) : 0;
   const approxCenterIdx = Math.round(ratio * Math.max(0, pageSlice.length - 1));
 
-  const candidates = [];
+  const ratedCandidates = [];
+  const restCandidates = [];
   for (let i = 0; i < pageSlice.length; i += 1) {
     const file = pageSlice[i];
     if (!file || file.isDemo || (file.mimeType && file.mimeType.startsWith('video/'))) continue;
     const meta = store.getAggregatedItemMeta(file.id);
+    const dist = Math.abs(i - approxCenterIdx);
     if (meta.ratingCount > 0 || meta.favoriteCount > 0) {
-      candidates.push({
+      ratedCandidates.push({
         file,
-        dist: Math.abs(i - approxCenterIdx),
+        dist,
         fav: meta.favoriteCount > 0 ? 1 : 0,
         avg: meta.avgRating || 0,
       });
+    } else {
+      restCandidates.push({ file, dist });
     }
   }
 
-  candidates.sort((a, b) => {
+  ratedCandidates.sort((a, b) => {
     const bucketA = Math.floor(a.dist / 12);
     const bucketB = Math.floor(b.dist / 12);
     if (bucketA !== bucketB) return bucketA - bucketB;
@@ -360,7 +386,16 @@ export function getCurrentPageRatedPhotos(scrollContainer, store, visiblePhotos)
     return a.dist - b.dist;
   });
 
-  return candidates.map((c) => c.file);
+  restCandidates.sort((a, b) => a.dist - b.dist);
+
+  return {
+    ratedPageItems: ratedCandidates.map((c) => c.file),
+    restPageItems: restCandidates.map((c) => c.file),
+  };
+}
+
+export function getCurrentPageRatedPhotos(scrollContainer, store, visiblePhotos) {
+  return getCurrentPageSmartTargets(scrollContainer, store, visiblePhotos).ratedPageItems;
 }
 
 export function isGallerySelectModeActive(store) {
@@ -385,14 +420,25 @@ export function toggleGallerySelectMode(store) {
 export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
   if (!subbarEl) return;
   const state = store.state;
-  const activeFolder = state.folders.find((f) => f.id === state.activeFolderId);
   const schemaTags = state.tagSchema?.tags || {};
 
   const chips = [];
   if (state.quickView === 'favorites') {
-    chips.push({ label: t('gallery.chipFavorites'), clear: 'quickView' });
+    chips.push({ label: t('sidebar.favorites'), clear: 'quickView' });
   } else if (state.quickView === 'unrated') {
     chips.push({ label: t('gallery.chipUnrated'), clear: 'quickView' });
+  }
+  if (state.mediaFilter === 'photo') {
+    chips.push({ label: t('gallery.chipMediaPhoto'), clear: 'mediaFilter' });
+  } else if (state.mediaFilter === 'video') {
+    chips.push({ label: t('gallery.chipMediaVideo'), clear: 'mediaFilter' });
+  }
+  if (state.aspectFilter === 'landscape') {
+    chips.push({ label: t('gallery.chipLandscape'), clear: 'aspectFilter' });
+  } else if (state.aspectFilter === 'portrait') {
+    chips.push({ label: t('gallery.chipPortrait'), clear: 'aspectFilter' });
+  } else if (state.aspectFilter === 'square') {
+    chips.push({ label: t('gallery.chipSquare'), clear: 'aspectFilter' });
   }
   if (state.ratingScope === 'member' && state.memberFilterId) {
     const member = store.getMembersSummary().find((m) => m.id === state.memberFilterId);
@@ -408,7 +454,7 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
         : state.ratingScope === 'member'
           ? t('gallery.prefixMember')
           : t('gallery.prefixAvg');
-    chips.push({ label: `${prefix} ≥ ${state.minRating}★`, clear: 'minRating' });
+    chips.push({ label: `${prefix} ≥ ${state.minRating}`, clear: 'minRating' });
   }
   for (const tid of state.selectedTagIds) {
     const tag = schemaTags[tid];
@@ -418,7 +464,6 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
     chips.push({ label: t('gallery.chipSearch', { q: state.searchQuery.trim() }), clear: 'search' });
   }
 
-  // Maximize photo space: collapse subbar to 0px unless active filters exist
   if (chips.length === 0) {
     if (lastSubbarSignature !== '__hidden__') {
       lastSubbarSignature = '__hidden__';
@@ -431,8 +476,6 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
   subbarEl.classList.remove('hidden');
   const subbarSig = [
     state.lang,
-    activeFolder?.id || '',
-    activeFolder?.name || '',
     visiblePhotos.length,
     chips.map((c) => `${c.clear}:${c.label}`).join(','),
   ].join('|');
@@ -443,18 +486,20 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
   lastSubbarSignature = subbarSig;
 
   subbarEl.innerHTML = `
-    <div class="gallery-subbar-left">
-      <span class="breadcrumb-text">${escapeHtml(activeFolder?.name || t('gallery.allPhotos'))}</span>
-      <span class="photo-count-badge">${escapeHtml(t('gallery.itemCount', { count: visiblePhotos.length }))}</span>
-      <div class="active-filters-bar">
-        ${chips
-          .map(
-            (c) =>
-              `<button type="button" class="filter-chip" data-clear-filter="${escapeAttr(c.clear)}">${escapeHtml(c.label)} ${icon('x', 11)}</button>`
-          )
-          .join('')}
-        <button type="button" class="btn btn-ghost btn-sm" data-clear-filter="all">${escapeHtml(t('gallery.clearFilters'))}</button>
-      </div>
+    <div class="gallery-subbar-pill">
+      ${chips
+        .map(
+          (c) => `
+          <button type="button" class="filter-chip" data-clear-filter="${escapeAttr(c.clear)}">
+            <span>${escapeHtml(c.label)}</span>
+            ${icon('x', 11)}
+          </button>
+        `
+        )
+        .join('')}
+      <button type="button" class="filter-chip filter-chip-reset" data-clear-filter="all">
+        <span>${escapeHtml(t('gallery.clearFilters'))}</span>
+      </button>
     </div>
   `;
 }
@@ -462,6 +507,9 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
 export function renderBatchBar(batchBarEl, store, visiblePhotos) {
   if (!batchBarEl) return;
   const count = store.state.selectedPhotoIds.size;
+  if (count === 0 && mobileSelectMode) {
+    // Keep checkbox mode only if explicitly entered; batch bar floats only when >= 1 selected
+  }
   const batchSig = count === 0 ? '0' : `${store.state.lang}|${count}|${visiblePhotos.length}`;
   if (batchSig === lastBatchSignature && (count === 0 || batchBarEl.childElementCount > 0)) {
     return;
@@ -476,22 +524,31 @@ export function renderBatchBar(batchBarEl, store, visiblePhotos) {
 
   batchBarEl.classList.remove('hidden');
   batchBarEl.innerHTML = `
-    <div class="batch-bar-left">
-      <strong style="color:var(--accent)">${escapeHtml(t('gallery.batchSelected', { count }))}</strong>
-      <button type="button" class="btn btn-sm" data-batch="select-all">${escapeHtml(t('gallery.batchSelectAll', { count: visiblePhotos.length }))}</button>
-      <button type="button" class="btn btn-sm btn-ghost" data-batch="clear">${escapeHtml(t('gallery.batchClearSelect'))}</button>
-    </div>
-    <div class="batch-bar-right">
-      <span style="font-size:11.5px;color:var(--text-secondary)">${escapeHtml(t('gallery.batchRateLabel'))}</span>
-      ${[1, 2, 3, 4, 5]
-        .map(
-          (r) =>
-            `<button type="button" class="btn btn-sm" data-batch="rate" data-rating="${r}">${r}★</button>`
-        )
-        .join('')}
-      <button type="button" class="btn btn-sm btn-ghost" data-batch="rate" data-rating="0">${escapeHtml(t('gallery.batchResetRate'))}</button>
-      <button type="button" class="btn btn-sm" data-batch="fav">${icon('heart', 12)} ${escapeHtml(t('gallery.batchFav'))}</button>
-      <button type="button" class="btn btn-sm btn-primary" data-batch="quick-tag">${icon('tag', 12)} ${escapeHtml(t('gallery.batchTag'))}</button>
+    <div class="batch-glass-pill">
+      <span class="batch-count-pill">${escapeHtml(t('gallery.batchSelected', { count }))}</span>
+      <button type="button" class="batch-pill-btn" data-batch="select-all" title="${escapeAttr(t('gallery.batchSelectAll', { count: visiblePhotos.length }))}">
+        ${icon('checkCircle', 15)}
+        <span class="hide-xs">${escapeHtml(t('sidebar.allStars'))}</span>
+      </button>
+      <span class="batch-pill-sep" aria-hidden="true"></span>
+      <div class="batch-stars-group" role="group" aria-label="${escapeAttr(t('gallery.batchRateLabel'))}">
+        ${[1, 2, 3, 4, 5]
+          .map(
+            (r) =>
+              `<button type="button" class="batch-icon-btn" data-batch="rate" data-rating="${r}" title="${escapeAttr(t('inspector.batchRateTitle', { n: r }))}">${starSectorIcon(r, 15)}</button>`
+          )
+          .join('')}
+        <button type="button" class="batch-icon-btn" data-batch="rate" data-rating="0" title="${escapeAttr(t('gallery.batchResetRate'))}">${icon('undo', 14)}</button>
+      </div>
+      <span class="batch-pill-sep" aria-hidden="true"></span>
+      <button type="button" class="batch-icon-btn" data-batch="fav" title="${escapeAttr(t('gallery.batchFav'))}" aria-label="${escapeAttr(t('gallery.batchFav'))}">${icon('heart', 16)}</button>
+      <button type="button" class="batch-icon-btn" data-batch="quick-tag" title="${escapeAttr(t('gallery.batchTag'))}" aria-label="${escapeAttr(t('gallery.batchTag'))}">${icon('tag', 16)}</button>
+      ${
+        count >= 2
+          ? `<button type="button" class="batch-icon-btn" data-batch="compare" title="${escapeAttr(t('gallery.batchCompare'))}" aria-label="${escapeAttr(t('gallery.batchCompare'))}">${icon('compare', 16)}</button>`
+          : ''
+      }
+      <button type="button" class="batch-icon-btn batch-close-btn" data-batch="clear" title="${escapeAttr(t('gallery.batchClearSelect'))}" aria-label="${escapeAttr(t('gallery.batchClearSelect'))}">${icon('x', 16)}</button>
     </div>
   `;
 }
@@ -538,6 +595,8 @@ function buildFilterKey(state) {
     state.activeFolderId || '',
     state.includeSubfolders ? 1 : 0,
     state.quickView,
+    state.mediaFilter || 'all',
+    state.aspectFilter || 'all',
     state.ratingScope,
     state.minRating,
     state.memberFilterId || '',
@@ -665,10 +724,11 @@ function ensureGalleryFloatingUi(scrollContainer, store) {
         lastScrollTop = curTop;
 
         const topHeaderEl = document.getElementById('topHeader');
-        const overlayOpen =
-          Boolean(document.querySelector(
-            '#headerMorePopover.is-open, #topHeader.mobile-search-open, #demoBanner:not(.hidden), #drawerBackdrop.visible'
-          ));
+        const overlayOpen = Boolean(
+          document.querySelector(
+            '#headerMorePopover.is-open, #topHeader.search-expanded, #demoBanner:not(.hidden), #drawerBackdrop.visible'
+          )
+        );
 
         if (curTop <= 30 || delta < -5 || overlayOpen) {
           topHeaderEl?.classList.remove('is-hidden-scroll');
@@ -680,7 +740,7 @@ function ensureGalleryFloatingUi(scrollContainer, store) {
         clearTimeout(scrollContainer._dlSettleTimer);
         scrollContainer._dlSettleTimer = setTimeout(() => {
           if (scrollSettleCallback) scrollSettleCallback();
-        }, 300);
+        }, 280);
       });
     },
     { passive: true }
@@ -747,7 +807,8 @@ function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, tar
           store,
           `width:100%;height:${cell.height}px;`,
           true,
-          patchMeta
+          patchMeta,
+          Math.max(cell.width, cell.height)
         );
       }
       syncContainerChildren(colEl, colCards);
@@ -765,6 +826,8 @@ function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, tar
     const minCard = isMobile
       ? Math.max(98, Math.round(targetHeight * 0.5))
       : Math.max(130, targetHeight - 20);
+    const colEst = Math.max(1, Math.floor((containerWidth + gap) / (minCard + gap)));
+    const approxCellW = Math.round(containerWidth / colEst);
     const nextCols = `repeat(auto-fill, minmax(${minCard}px, 1fr))`;
     if (wrapperEl.style.gridTemplateColumns !== nextCols) {
       wrapperEl.style.gridTemplateColumns = nextCols;
@@ -772,7 +835,7 @@ function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, tar
 
     const cards = new Array(windowedPhotos.length);
     for (let i = 0; i < windowedPhotos.length; i += 1) {
-      cards[i] = acquirePhotoCard(windowedPhotos[i], store, '', false, patchMeta);
+      cards[i] = acquirePhotoCard(windowedPhotos[i], store, '', false, patchMeta, approxCellW);
     }
     syncContainerChildren(wrapperEl, cards);
   } else {
@@ -806,7 +869,8 @@ function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, tar
           store,
           `width:${cell.width}px;height:${row.height}px;`,
           false,
-          patchMeta
+          patchMeta,
+          Math.max(cell.width, row.height)
         );
       }
       syncContainerChildren(rowEl, rowCards);
@@ -868,6 +932,10 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
     lastGridSignature = '';
   }
 
+  if (store.state.selectedPhotoIds.size === 0 && mobileSelectMode) {
+    // Auto-exit multi-select once all selections are cleared
+    mobileSelectMode = false;
+  }
   const selectActive = mobileSelectMode || store.state.selectedPhotoIds.size > 0;
   gridEl.classList.toggle('gallery-select-active', selectActive);
 
@@ -930,7 +998,6 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
     renderedLimit
   );
 
-  // Fast path: patch selection, focus & overlays in-place without recalculating layout
   if (sig === lastGridSignature && lastRenderedMode) {
     const selectTitle = t('gallery.toggleSelect');
     const limit = Math.min(renderedLimit, visiblePhotos.length);
@@ -973,7 +1040,6 @@ export function relayoutGalleryOnResize(gridEl, scrollContainer, store) {
 
   const targetHeight = Math.max(130, Math.min(320, Number(store.state.rowHeight || 210)));
 
-  // CSS Grid tracks reflow natively on container width changes
   if (
     store.state.layoutMode === 'grid' &&
     lastRenderedMode === 'grid' &&
@@ -991,7 +1057,7 @@ export function relayoutGalleryOnResize(gridEl, scrollContainer, store) {
     return;
   }
 
-  applyGalleryGeometry(gridEl, scrollContainer, store, lastVisiblePhotos, targetHeight, false);
+  applyGalleryGeometry(gridEl, scrollContainer, store, lastVisiblePhotos, targetHeight, true);
 }
 
 export function resetGallerySignature() {
@@ -1002,19 +1068,7 @@ export function resetGallerySignature() {
 
 export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
   if (subbarEl) {
-    subbarEl.addEventListener('change', (e) => {
-      if (e.target.id === 'sortBySelect') {
-        store.setSortBy(e.target.value);
-      }
-    });
-
     subbarEl.addEventListener('click', (e) => {
-      const selectModeBtn = e.target.closest('[data-subbar="toggle-select-mode"]');
-      if (selectModeBtn) {
-        toggleGallerySelectMode(store);
-        return;
-      }
-
       const btn = e.target.closest('[data-clear-filter]');
       if (!btn) return;
       const key = btn.dataset.clearFilter;
@@ -1022,6 +1076,10 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
         store.clearAllFilters();
       } else if (key === 'quickView') {
         store.setState({ quickView: 'all' });
+      } else if (key === 'mediaFilter') {
+        store.setState({ mediaFilter: 'all' });
+      } else if (key === 'aspectFilter') {
+        store.setState({ aspectFilter: 'all' });
       } else if (key === 'member') {
         store.setState({ ratingScope: 'avg', memberFilterId: null });
       } else if (key === 'minRating') {
@@ -1042,6 +1100,7 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
       const ids = Array.from(store.state.selectedPhotoIds);
 
       if (act === 'select-all') {
+        mobileSelectMode = true;
         store.selectAllVisible();
       } else if (act === 'clear') {
         mobileSelectMode = false;
@@ -1052,6 +1111,8 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
         store.toggleFavorite(ids, true);
       } else if (act === 'quick-tag') {
         store.openModal('quickTag', { photoIds: ids });
+      } else if (act === 'compare') {
+        openCompare(ids, store);
       }
     });
   }
@@ -1061,10 +1122,28 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
     let touchStartX = 0;
     let touchStartY = 0;
     let suppressNextClickUntil = 0;
+    let suppressedClickPhotoId = '';
     let pinchStartDist = 0;
     let pinchStartHeight = 210;
     let pinchLiveHeight = null;
     let wheelCommitTimer = null;
+
+    // Desktop 2-second top-left hover timer for unobtrusive checkbox reveal
+    let hoverPeekTimer = 0;
+    let hoverCandidateCard = null;
+    let revealedPeekCard = null;
+
+    function clearHoverPeek(keepRevealed = false) {
+      if (hoverPeekTimer) {
+        clearTimeout(hoverPeekTimer);
+        hoverPeekTimer = 0;
+      }
+      hoverCandidateCard = null;
+      if (!keepRevealed && revealedPeekCard) {
+        revealedPeekCard.classList.remove('is-select-peek');
+        revealedPeekCard = null;
+      }
+    }
 
     function clearLongPress() {
       if (longPressTimer) {
@@ -1077,9 +1156,62 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
       const str = String(val);
       const topSlider = document.getElementById('rowHeightRange');
       if (topSlider && topSlider.value !== str) topSlider.value = str;
-      const sideSlider = document.getElementById('sidebarRowHeightRange');
-      if (sideSlider && sideSlider.value !== str) sideSlider.value = str;
+      const sizeBadge = document.querySelector('[data-more-size-px]');
+      if (sizeBadge) sizeBadge.textContent = `${str}px`;
     }
+
+    gridEl.addEventListener('mousemove', (e) => {
+      if (isTouchViewport() || isGallerySelectModeActive(store)) {
+        clearHoverPeek(false);
+        return;
+      }
+      const card = e.target.closest('.photo-card[data-photo-id]');
+      if (!card) {
+        clearHoverPeek(false);
+        return;
+      }
+      if (revealedPeekCard && revealedPeekCard !== card) {
+        revealedPeekCard.classList.remove('is-select-peek');
+        revealedPeekCard = null;
+      }
+      if (revealedPeekCard === card) {
+        return;
+      }
+
+      const rect = card.getBoundingClientRect();
+      const safeTopEdge = Math.max(rect.top, 56);
+      const inTopLeft =
+        e.clientX - rect.left <= Math.max(76, rect.width * 0.5) &&
+        e.clientY - safeTopEdge <= Math.max(76, rect.height * 0.5);
+
+      if (!inTopLeft) {
+        if (hoverCandidateCard === card) {
+          clearHoverPeek(false);
+        }
+        return;
+      }
+
+      if (hoverCandidateCard !== card) {
+        clearHoverPeek(false);
+        hoverCandidateCard = card;
+        hoverPeekTimer = setTimeout(() => {
+          hoverPeekTimer = 0;
+          if (hoverCandidateCard === card && card.isConnected) {
+            const curRect = card.getBoundingClientRect();
+            card.style.setProperty(
+              '--select-btn-top',
+              curRect.top < 54 ? `${Math.round(58 - curRect.top)}px` : '7px'
+            );
+            revealedPeekCard = card;
+            card.classList.add('is-select-peek');
+          }
+        }, 2000);
+      }
+    });
+
+    gridEl.addEventListener('mouseleave', () => {
+      clearHoverPeek(false);
+    });
 
     gridEl.addEventListener(
       'touchstart',
@@ -1110,6 +1242,7 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
           longPressTimer = null;
           mobileSelectMode = true;
           suppressNextClickUntil = Date.now() + 450;
+          suppressedClickPhotoId = photoId;
           store.toggleSelectCheckbox(photoId);
           navigator.vibrate?.(12);
         }, 420);
@@ -1154,6 +1287,7 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
         pinchLiveHeight = null;
         pinchStartDist = 0;
         suppressNextClickUntil = Date.now() + 350;
+        suppressedClickPhotoId = '__all__';
         store.setRowHeight(commitH);
       } else if (!e.touches || e.touches.length < 2) {
         pinchStartDist = 0;
@@ -1176,13 +1310,12 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
         clearTimeout(wheelCommitTimer);
         wheelCommitTimer = setTimeout(() => {
           store.setRowHeight(nextH);
-        }, 120);
+        }, 140);
       },
       { passive: false }
     );
 
     gridEl.addEventListener('click', (e) => {
-      if (Date.now() < suppressNextClickUntil) return;
       if (e.target.closest('[data-clear-empty]')) {
         store.clearAllFilters();
         return;
@@ -1191,37 +1324,52 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
       const card = e.target.closest('.photo-card[data-photo-id]');
       if (!card) return;
       const photoId = card.dataset.photoId;
+      if (
+        Date.now() < suppressNextClickUntil &&
+        (suppressedClickPhotoId === '__all__' || suppressedClickPhotoId === photoId)
+      ) {
+        suppressNextClickUntil = 0;
+        suppressedClickPhotoId = '';
+        return;
+      }
 
       if (selectBtn) {
         e.stopPropagation();
+        clearHoverPeek(false);
+        mobileSelectMode = true;
         store.toggleSelectCheckbox(photoId);
         return;
       }
 
-      if (isTouchViewport() || mobileSelectMode) {
-        if (mobileSelectMode || store.state.selectedPhotoIds.size > 0) {
-          store.toggleSelectCheckbox(photoId);
+      if (isGallerySelectModeActive(store)) {
+        if (e.shiftKey && store.state.lastClickedPhotoId) {
+          store.selectPhoto(photoId, { ctrl: true, shift: true });
         } else {
-          store.openLightbox(photoId);
+          store.toggleSelectCheckbox(photoId);
         }
         return;
       }
 
-      if (
-        !e.ctrlKey &&
-        !e.metaKey &&
-        !e.shiftKey &&
-        store.state.selectedPhotoIds.size === 0 &&
-        !store.state.inspectorOpen
-      ) {
+      if (isTouchViewport()) {
         store.openLightbox(photoId);
         return;
       }
 
-      store.selectPhoto(photoId, {
-        ctrl: e.ctrlKey || e.metaKey,
-        shift: e.shiftKey,
-      });
+      if (e.ctrlKey || e.metaKey || e.shiftKey) {
+        mobileSelectMode = true;
+        store.selectPhoto(photoId, {
+          ctrl: true,
+          shift: e.shiftKey,
+        });
+        return;
+      }
+
+      if (store.state.inspectorOpen) {
+        store.selectPhoto(photoId, { ctrl: false, shift: false });
+        return;
+      }
+
+      store.openLightbox(photoId);
     });
 
     gridEl.addEventListener('dblclick', (e) => {
