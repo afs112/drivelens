@@ -1,0 +1,318 @@
+# DriveLens · Architecture & Engineering Design
+
+> **Overview**: DriveLens is a zero-build, installable (PWA), pure client-side native ES Modules web application for browsing and collaboratively culling **Google Drive** shared photo albums. It supports **API Key Direct Connect** (with optional local `/api/meta` multiplayer sync via `serve.py`) and **OAuth 2.0 Account Sign-In** (with conflict-free cloud metadata sync inside `.drivelens/`), persistent credential auto-reconnect, and a strict-English-default bilingual (`en` / `zh`) runtime with all Chinese strings isolated solely inside [`src/i18n.js`](src/i18n.js).  
+> **Project Independence**: DriveLens draws UX inspiration from [julyx10/lap](https://github.com/julyx10/lap) for its darkroom layout, rapid rating shortcuts, and comparison flow, while remaining a completely independent browser-native architecture built from scratch for Google Drive collaboration.
+
+---
+
+## 1. Zero-Build & Installable PWA Architecture
+
+### 1.1 Native ES Modules + Python Static/Sync Server + Static Hosting
+
+- **Native Browser ES Modules (`<script type="module" src="./src/main.js">`)**: Eliminates Node.js, npm, bundlers, and transpilation steps while maintaining clean modular boundaries across API, storage, state, i18n, demo, and UI layers.
+- **Zero-Dependency Python Server ([`serve.py`](serve.py)) & Pure-ASCII Launcher ([`start.bat`](start.bat))**:
+  - `NoCacheStaticHandler` overrides Windows MIME registry quirks by explicitly mapping `.js`/`.mjs` to `application/javascript; charset=utf-8`, `.css` to `text/css; charset=utf-8`, `.webmanifest` to `application/manifest+json`, and `.png` to `image/png`, with `Cache-Control: no-cache, no-store, must-revalidate`.
+  - `serve.py` parses `--open` (opens `http://localhost:<port>` after socket bind, or attaches to an already-running instance on `EADDRINUSE` / `WinError 10048`) and `--dry-run` (verifies socket binding and prints `READY http://localhost:<actual_port>`).
+  - `start.bat` uses 100% pure ASCII with strict CRLF (`\r\n`) line endings (no `chcp`) to avoid `cmd.exe` seek/encoding failures on Windows.
+- **Static Host Compatibility**: The static asset tree deploys directly to GitHub Pages (with `.nojekyll`), Cloudflare Pages, or Netlify Drop. Relative `./` asset and PWA scope URLs prevent origin-root collisions on subpath hosts (such as `/drivelens/`). When `/api/meta` is absent on a static host, API Key mode smoothly falls back to `localStorage`, while OAuth mode syncs directly with Google Drive.
+
+### 1.2 Installable PWA & Service Worker (`manifest.webmanifest`, `sw.js`, `icons/`)
+
+- **Web App Manifest ([`manifest.webmanifest`](manifest.webmanifest))**:
+  - Declares `"name": "DriveLens · Shared Drive Photo Gallery"`, `"short_name": "DriveLens"`, `"display": "standalone"`, `"display_override": ["window-controls-overlay", "standalone"]`, `"background_color": "#0b0e14"`, and `"theme_color": "#0b0e14"`.
+  - Uses relative `"start_url": "./"` and `"scope": "./"` so the PWA installs cleanly at both root origins (`http://localhost:5173/`) and repository subpaths.
+  - References three dedicated icons in `icons/`: `./icons/icon-192.png` (`192x192` RGBA PNG), `./icons/icon-512.png` (`512x512` RGBA PNG), and `./icons/icon.svg` (scalable `any maskable` vector icon).
+- **Document Shell Meta Tags ([`index.html`](index.html))**:
+  - Includes `<meta name="theme-color" content="#0b0e14" />`, `<meta name="apple-mobile-web-app-capable" content="yes" />`, `<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />`, `<meta name="apple-mobile-web-app-title" content="DriveLens" />`, `<link rel="manifest" href="./manifest.webmanifest" />`, and `<link rel="apple-touch-icon" href="./icons/icon-192.png" />`.
+- **Service Worker ([`sw.js`](sw.js))**:
+  - Maintains `CACHE_NAME = 'drivelens-shell-v1'` and precaches `PRECACHE_ASSETS` (13 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, and `src/i18n.js`) during `install`, calling `self.skipWaiting()`.
+  - Deletes older `drivelens-*` cache buckets during `activate` and calls `self.clients.claim()`.
+  - Intercepts only same-origin `GET` requests excluding `/api/` paths (so `serve.py` `/api/meta`, Google Drive API calls, GIS scripts, and `googleusercontent.com` thumbnails always bypass the Service Worker cache). Uses a **Network-First** strategy that refreshes cached `response.type === 'basic'` assets online and falls back to `caches.match()` or `./index.html` (for navigations) when offline.
+- **Install Prompt Lifecycle (`src/main.js`, `src/state/store.js`, `src/ui/renderHeader.js`)**:
+  - On `window` `load`, `src/main.js` registers `./sw.js` with `{ scope: './' }` when running over `https:`, `localhost`, or `127.0.0.1`.
+  - Browser `beforeinstallprompt` events call `event.preventDefault()` and pass the deferred prompt to `store.setInstallPrompt(event)`, exposing the top-header `[data-header="install-app"]` button in `renderHeader.js` (`!state.canInstallPwa` toggles `.hidden`).
+  - Clicking **Install App** invokes `store.promptInstallPwa()`, and the browser's `appinstalled` event calls `store.onAppInstalled()` to clear the prompt state and display a toast confirmation.
+
+### 1.3 Dual-Mode Runtime & Startup Auto-Reconnect Data Flow
+
+```text
+Browser / Installed PWA Startup (src/main.js)
+  ├── Service Worker: register ./sw.js ({ scope: './' }) on https:/localhost/127.0.0.1
+  ├── URL Hash Check (#folder=..., #lang=...):
+  │     ├── Folder in hash -> connect via API Key (?key=...) or OAuth 2.0 (?client_id=...)
+  │     └── No folder in hash -> store.restoreSavedSession()
+  │           ├── Remember + autoConnect (API Key) -> silent connectWithApiKey()
+  │           ├── Remember + autoConnect (OAuth)
+  │           │     ├── Unexpired token in drivelens_session_v1 -> silent connectGoogleDrive({ reuseSession: true })
+  │           │     └── Expired token -> open Connect modal with drivelens_oauth_user_v1 email hint + toast
+  │           └── Otherwise -> stay in Offline Demo Album (src/demo/demoAlbum.js)
+  ├── Mode 1 — API Key Direct Connect (Zero-OAuth):
+  │     ├── Auth: Drive API Key (?key=AIzaSy...) + link-shared Drive folder + local nickname
+  │     ├── Media: Drive API v3 -> thumbnailLink / drive.google.com/thumbnail / lh3 / alt=media + IndexedDB
+  │     └── Sync: serve.py GET/POST /api/meta (.local-meta/<folder>.json) -> fallback localStorage
+  ├── Mode 2 — OAuth 2.0 Account Sign-In:
+  │     ├── Auth: Google Identity Services (GIS) -> Token Flow -> drivelens_session_v1 + drivelens_oauth_user_v1
+  │     ├── Media: Drive API v3 (Bearer Token, private/Shared Drives, authorized video stream)
+  │     └── Sync: Google Drive .drivelens/ (tags-schema.json + member-<key>.json) -> read-only localStorage
+  └── Offline Demo Layer (src/demo/demoAlbum.js):
+        └── Pure i18n.js-driven EN/ZH SVG dataset (5 folders, 16 media, 3 personas) + localStorage (drivelens_demo_state_v1)
+```
+
+---
+
+## 2. Directory Map & Module Dependency Graph
+
+### 2.1 Directory Structure
+
+```text
+drivelens/
+├── index.html                   # Single-page shell (<html lang="en">), PWA meta/manifest links, 13 mount IDs
+├── manifest.webmanifest         # Web App Manifest (relative ./ scope, standalone display, icon references)
+├── sw.js                        # Service Worker (drivelens-shell-v1 precache, Network-First same-origin shell cache)
+├── icons/
+│   ├── icon.svg                 # Scalable vector app icon (any maskable)
+│   ├── icon-192.png             # 192x192 RGBA PNG app icon & apple-touch-icon
+│   └── icon-512.png             # 512x512 RGBA PNG splash/install icon
+├── serve.py                     # Python 3 stdlib static server (incl. .webmanifest/.png) + /api/meta sync + --open/--dry-run
+├── start.bat                    # Pure ASCII + CRLF Windows launcher invoking serve.py 5173 --open
+├── .gitignore                   # Ignores __pycache__/, .local-meta/, config.js, .env*, *credentials*, *secret*, keys
+├── .nojekyll                    # Disables Jekyll processing on GitHub Pages
+├── .local-meta/                 # Runtime-only directory created by serve.py for API Key /api/meta JSON files
+├── README.md                    # English user, PWA install, persistent credential, and deployment guide (0 CJK chars)
+├── ARCHITECTURE.md              # System architecture documentation (this file, 0 CJK chars)
+├── verify_project.py            # Stdlib verification suite (HTTP, ES modules, DOM, docs, bat, api/meta, secrets, i18n)
+├── styles/
+│   ├── tokens.css               # Dark/light theme CSS variables, 8 tag palette colors, layout dimensions
+│   ├── layout.css               # Top header, demo banner, 3-column workspace, drawer backdrop, breakpoints
+│   ├── components.css           # Buttons, sync pills, sidebar nav, photo cards, inspector, lightbox, modals
+│   └── compare.css              # Fullscreen 2–4 photo side-by-side comparison overlay & grid rules
+└── src/
+    ├── main.js                  # Entry point, Store init, SW registration, beforeinstallprompt, auto-reconnect, shortcuts
+    ├── constants.js             # Empty runtime defaults (DEFAULT_API_KEY/CLIENT_ID/FOLDER_ID), concurrency/debounce
+    ├── i18n.js                  # Bilingual EN/ZH dictionary (405 mirrored keys); sole repository home for CJK strings
+    ├── api/
+    │   ├── gdrive.js            # GIS OAuth + hint/remember persistence, API Key & OAuth BFS crawlers, original download
+    │   └── metaSync.js          # Cloud .drivelens/ LWW+isolated member sync & non-throwing ./api/meta helpers
+    ├── storage/
+    │   └── imageLoader.js       # 6-concurrency queue, IntersectionObserver, multi-tier fallback & IndexedDB cache
+    ├── state/
+    │   └── store.js             # Pub/sub Store, language switch, session restore/forget, PWA prompt, aggregation, sync
+    ├── demo/
+    │   └── demoAlbum.js         # Zero-CJK bilingual demo builder reading MESSAGES[code] from src/i18n.js
+    └── ui/
+        ├── icons.js             # Inline SVG icons (incl. globe & appWindow) & escapeHtml/escapeAttr XSS helpers
+        ├── renderHeader.js      # Header skeleton, #langSelect, Install App button, search IME guard, demo banner, toasts
+        ├── renderSidebar.js     # Quick views, locale-sorted folder tree, 3-scope star filter, collaborators, tags
+        ├── renderGallery.js     # Subbar, batch bar, computeJustifiedRows, signature-patched photo grid
+        ├── renderInspector.js   # Single/batch inspector, collaborator scores, note auto-save, localized EXIF
+        ├── renderLightbox.js    # Fullscreen lightbox (2048px / video stream / Drive iframe), zoom/pan, filmstrip
+        ├── renderCompare.js     # 2–4 pane side-by-side compare with sync zoom/pan & inline HUD patching
+        └── renderModals.js      # 2-tab Connect (remember checkbox, saved account hint, forget btn), Tag, Export, Help
+```
+
+### 2.2 Module Dependency Graph
+
+```mermaid
+flowchart TD
+    HTML["index.html + manifest.webmanifest"] --> MAIN["src/main.js + sw.js"]
+    MAIN --> I18N["src/i18n.js"]
+    MAIN --> STORE["src/state/store.js (Store)"]
+    MAIN --> UI_HDR["src/ui/renderHeader.js"]
+    MAIN --> UI_SB["src/ui/renderSidebar.js"]
+    MAIN --> UI_GAL["src/ui/renderGallery.js"]
+    MAIN --> UI_INSP["src/ui/renderInspector.js"]
+    MAIN --> UI_LB["src/ui/renderLightbox.js"]
+    MAIN --> UI_CMP["src/ui/renderCompare.js"]
+    MAIN --> UI_MOD["src/ui/renderModals.js"]
+    MAIN --> API_GD["src/api/gdrive.js"]
+
+    STORE --> CFG["src/constants.js (APP_CONFIG)"]
+    STORE --> I18N
+    STORE --> DEMO["src/demo/demoAlbum.js"]
+    STORE --> API_GD
+    STORE --> API_SYNC["src/api/metaSync.js"]
+
+    DEMO --> I18N
+    API_GD --> I18N
+    API_SYNC --> I18N
+    IMG["src/storage/imageLoader.js"] --> CFG
+
+    UI_GAL --> IMG
+    UI_INSP --> IMG
+    UI_INSP --> API_GD
+    UI_LB --> IMG
+    UI_LB --> API_GD
+    UI_CMP --> IMG
+
+    UI_HDR --> ICONS["src/ui/icons.js"]
+    UI_HDR --> UI_CMP
+    UI_HDR --> DEMO
+    UI_HDR --> I18N
+    UI_SB --> ICONS
+    UI_SB --> I18N
+    UI_GAL --> ICONS
+    UI_GAL --> I18N
+    UI_INSP --> ICONS
+    UI_INSP --> I18N
+    UI_LB --> ICONS
+    UI_LB --> I18N
+    UI_CMP --> ICONS
+    UI_CMP --> I18N
+    UI_MOD --> ICONS
+    UI_MOD --> CFG
+    UI_MOD --> STORE
+    UI_MOD --> I18N
+```
+
+### 2.3 Module Exports Summary
+
+| Module | Key Exports | Responsibility |
+| --- | --- | --- |
+| `src/constants.js` | `APP_CONFIG` | Empty credential placeholders (`DEFAULT_API_KEY`, `DEFAULT_CLIENT_ID`, `DEFAULT_FOLDER_ID`), `APP_TITLE`, `THUMBNAIL_CONCURRENCY` (`6`), `SYNC_DEBOUNCE_MS` (`800`) |
+| `src/i18n.js` | `SUPPORTED_LANGS`, `MESSAGES`, `getLang`, `setLangCode`, `getLocaleTag`, `t` | Strict `'en'`-default localization runtime, 405-key EN/ZH parity, `{param}` interpolation, sole CJK string store |
+| `serve.py` | `create_server`, `NoCacheStaticHandler`, `ReusableThreadingHTTPServer` | Static serving with strict MIME types (`.js`/`.mjs`, `.css`, `.webmanifest`, `.png`), `--open`/`--dry-run`, thread-safe `GET/POST /api/meta` |
+| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 13 core shell files (`drivelens-shell-v1`), Network-First same-origin cache, excludes cross-origin & `/api/` |
+| `src/api/gdrive.js` | `parseDriveFolderId`, `ensureGoogleIdentityLoaded`, `getCachedSession`, `getSavedOAuthUser`, `clearSession`, `authenticateGoogle`, `loadSharedAlbum`, `loadSharedAlbumWithApiKey`, `downloadOriginalFile` | OAuth 2.0 GIS token & hint flow, dual-storage session cache, API Key album loader, shared BFS media crawler, file download |
+| `src/api/metaSync.js` | `META_FOLDER_NAME`, `TAGS_SCHEMA_FILENAME`, `sanitizeMemberKey`, `ensureMetaFolder`, `mergeTagSchemas`, `loadAlbumMetadata`, `saveMemberMetadata`, `saveTagSchema`, `loadLocalServerMeta`, `saveLocalServerMeta` | `.drivelens/` cloud JSON persistence, LWW tag schema merge, non-throwing `./api/meta` client |
+| `src/storage/imageLoader.js` | `buildDriveThumbUrl`, `loadPhotoIntoElement`, `fetchAuthorizedMediaBlobUrl` | 6-concurrency image queue, `IntersectionObserver` lazy loading, `lh3` & IndexedDB `alt=media` fallback |
+| `src/state/store.js` | `Store`, `getTagColors`, `TAG_COLORS`, `loadConnectPrefs` | Pub/sub store, `setLanguage`, `restoreSavedSession`, `forgetSavedCredentials`, PWA prompt handlers, dual Drive connectors, deterministic aggregation, debounced sync |
+| `src/demo/demoAlbum.js` | `DEMO_STORAGE_KEY`, `DEMO_PERSONAS`, `DEFAULT_TAG_SCHEMA`, `getDemoPersonas`, `localizeDemoState`, `createDemoDataset`, `saveDemoState`, `resetDemoState` | Zero-CJK offline demo album builder (`5` folders, `16` items, `3` personas, `8` default tags) reading `MESSAGES[code]` |
+| `src/ui/renderHeader.js` | `renderHeader`, `bindHeaderEvents` | Header skeleton, `#langSelect`, conditional `[data-header="install-app"]` button, search IME/cursor preservation, demo banner, toasts |
+| `src/ui/renderSidebar.js` | `renderSidebar`, `bindSidebarEvents` | Quick views, locale-aware folder tree, 3-scope star filter, collaborators, grouped tag manager |
+| `src/ui/renderGallery.js` | `computeJustifiedRows`, `renderGallerySubbar`, `renderBatchBar`, `renderGalleryGrid`, `resetGallerySignature`, `bindGalleryEvents` | Justified layout algorithm & language-aware signature patching |
+| `src/ui/renderInspector.js` | `renderInspector`, `bindInspectorEvents` | Preview preservation, active note focus guard, collaborator scores, localized EXIF |
+| `src/ui/renderLightbox.js` | `renderLightbox`, `bindLightboxEvents` | 2048px image / Drive video stream or API Key iframe preview, zoom/pan, filmstrip |
+| `src/ui/renderCompare.js` | `openCompare`, `closeCompare`, `isCompareOpen`, `renderCompare`, `bindCompareEvents` | 2–4 pane side-by-side view with sync zoom/pan & inline HUD patching |
+| `src/ui/renderModals.js` | `renderModals`, `bindModalEvents` | 2-tab Connect (`#rememberApiKeyCheck`, `#rememberOAuthCheck`, saved OAuth account badge, `[data-action="forget-creds"]`), Tag, Export, Shortcuts modals |
+| `src/ui/icons.js` | `icon`, `escapeHtml`, `escapeAttr` | Inline SVG icon registry (`globe`, `appWindow`, etc.) & XSS-safe HTML/attribute escaping |
+
+---
+
+## 3. Pure-`src/i18n.js` Internationalization Architecture
+
+### 3.1 Strict Default-English Runtime & Single-File CJK Isolation (`src/i18n.js`)
+
+- **Supported Languages**: `SUPPORTED_LANGS` registers `'en'` (`'English'`) and `'zh'` (localized Chinese endonym defined inside [`src/i18n.js`](src/i18n.js)).
+- **Single-File CJK Isolation**: All Chinese strings in the entire repository—including UI labels, error messages, demo persona names/emails, demo folder names, SVG media filenames/labels, default tag definitions/groups, and initial demo collaborator notes—reside exclusively inside `MESSAGES.zh` in [`src/i18n.js`](src/i18n.js). All HTML, CSS, batch, Markdown, and remaining JS files contain **zero** CJK characters (`[\u3400-\u9fff\u3000-\u303f\uff00-\uffef]`).
+- **Strict `'en'` Default**: `getLang()` reads `localStorage.getItem('drivelens_lang_v1')` and returns `'zh'` **only** when that exact key equals `'zh'`. It deliberately **never inspects `navigator.language`**, guaranteeing deterministic English startup on any OS locale unless explicitly toggled by the user or URL hash `#lang=zh`.
+- **DOM & Document Sync**: `setLangCode(lang)` normalizes input (`'zh'` or `'en'`), persists to `drivelens_lang_v1`, updates `document.documentElement.lang` (`'zh-CN'` vs `'en'`), and updates `document.title = t('app.title')`.
+- **Locale-Aware Formatting**: `getLocaleTag()` returns `'zh-CN'` or `'en-US'`, consumed by `Store.getActiveTagList()`, `Store.getVisiblePhotos()` (`nameAsc` sorting), `renderSidebar.js` folder sorting, and `renderInspector.js` `formatDate()`.
+- **Translation Helper**: `t(key, params = {})` resolves `MESSAGES[currentLang]?.[key] ?? MESSAGES.en[key] ?? key` and substitutes `{param}` placeholders across all 405 mirrored keys in `MESSAGES.en` and `MESSAGES.zh`.
+
+### 3.2 Language Switching & Non-Destructive Demo Localization
+
+Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or `#lang=en|zh` hash in `src/main.js`):
+
+1. Updates `state.lang` via `setLangCode()` and switches uncustomized default nicknames (`store.defaultNickname` / `store.guestNickname`) between the previous and target locales.
+2. Re-resolves `state.syncMessage` from `state.syncMessageKey` so header sync tooltips localize immediately.
+3. In demo mode, invokes `localizeDemoState(state, lang)` (`src/demo/demoAlbum.js`), which resolves `MESSAGES[code]` entries (`demo.folder.*`, `demo.file.*`, `demo.persona.*`, `demo.tag.*`, `demo.note.*`) to update unedited folder names, photo filenames/SVG labels, persona names (`Me (Alex)`, `Lin`, `Jay` in `en`, and their localized `zh` equivalents), built-in tag names/groups, and initial collaborator notes—while **preserving any custom tags, renamed tags, or edited notes** created by the user.
+4. Invalidates language-dependent UI signatures (`headerEl.dataset.lang`, `demo|<lang>|...` in `renderHeader.js`; `${lang}|...` in `renderGallery.js` and `renderCompare.js`; `activeLightboxLang` in `renderLightbox.js`) so open overlays and cards re-render into the new language immediately without breaking same-language fast paths.
+
+---
+
+## 4. Google Drive Integration, Persistent Sessions & Pitfall Mitigations
+
+### 4.1 Mode 1: API Key Direct Connect (`loadSharedAlbumWithApiKey`)
+
+- Appends `&key=${encodeURIComponent(apiKey)}` to Drive API v3 calls without loading GIS or requesting OAuth tokens, completely bypassing the 100-user OAuth Testing Mode allowlist when folders are set to "Anyone with the link can view".
+- Assigns deterministic virtual collaborator identities (`nick_${sanitizeMemberKey(cleanNick)}`).
+- `driveJsonFetch` maps HTTP `400` (`API_KEY_INVALID`/`keyInvalid`), `403` (`accessNotConfigured`/`SERVICE_DISABLED` vs link-sharing permission), and `404` into actionable localized errors via `t('gdrive.*')`.
+- Video playback in Lightbox uses `<iframe class="lightbox-video" src="https://drive.google.com/file/d/<id>/preview">` when `authType === 'apikey' && !accessToken`, avoiding unauthenticated CORS media stream blocks.
+- Original file downloads (`downloadOriginalFile`) try `?alt=media&supportsAllDrives=true&key=...` and fall back to opening `webContentLink` or `https://drive.google.com/uc?export=download&id=<id>`.
+
+### 4.2 Mode 2: OAuth 2.0 GIS Flow & Credential Persistence (`authenticateGoogle` & `loadSharedAlbum`)
+
+- Dynamically injects `https://accounts.google.com/gsi/client` (`ensureGoogleIdentityLoaded`, 10s timeout) only when OAuth sign-in is triggered.
+- Uses `initTokenClient` with `drive`, `userinfo.profile`, and `userinfo.email` scopes, and allows up to **100 Test Users** under External + Testing mode on Google Auth Platform at zero cost and without Google app verification.
+- **Persistent vs Ephemeral Session Storage (`remember` flag)**:
+  - When `remember !== false` (default), `authenticateGoogle` stores `{ clientId, accessToken, expiresAt, user }` in `localStorage` under `drivelens_session_v1` (removing any stale copy in `sessionStorage`) and persists the user hint profile (`{ clientId, id, email, name, picture, color }`) in `localStorage` under `drivelens_oauth_user_v1`.
+  - When `remember === false`, `authenticateGoogle` calls `clearSession({ forgetUser: true })`, wipes saved credentials in `drivelens_connect_prefs_v1`, and stores the active session strictly inside ephemeral `sessionStorage` (`drivelens_session_v1`).
+  - `getCachedSession(clientId)` checks `localStorage` first and `sessionStorage` second, accepting sessions with more than 60 seconds left (`expiresAt > Date.now() + 60 * 1000`).
+  - `authenticateGoogle(clientId, { prompt, loginHint, remember })` resolves `hintVal` from `loginHint || getSavedOAuthUser(trimmedClientId)?.email` and forwards `hint: hintVal` to both `initTokenClient(...)` and `client.requestAccessToken(...)` to skip manual account typing on re-authentication.
+
+### 4.3 Startup Auto-Reconnect & Credential Reset Lifecycle
+
+- **Startup Dispatch (`handleInitialUrlHash` in `src/main.js`)**: When the URL hash has no `#folder=...` parameter (including clean launches or `#lang=zh` language-only hashes), `main.js` invokes `store.restoreSavedSession()`.
+- **`store.restoreSavedSession()` (`src/state/store.js`)**: Reads `loadConnectPrefs()` from `drivelens_connect_prefs_v1`. If `rememberCredentials && autoConnect && folderId` are true:
+  - **API Key mode (`authType === 'apikey' && apiKey`)**: Silently invokes `connectWithApiKey(...)`.
+  - **OAuth mode (`authType === 'oauth' && clientId`)**:
+    - If `getCachedSession(clientId)` returns a valid unexpired token, silently calls `connectGoogleDrive({ ..., reuseSession: true })`.
+    - If the 1-hour OAuth token has expired, loads `savedUser = getSavedOAuthUser(clientId)`, restores `authType`, `clientId`, `folderId`, and `savedOAuthUser` into state, opens the Connect modal (`openModal('connect')`), displays the saved account badge (`modal.savedAccountBadge`), and emits `store.sessionExpiredReconnect` so the user can re-consent in one click.
+- **Pausing Auto-Reconnect**: Switching back via `loadDemoMode(true, true)` (**Back to Demo**) or `disconnectGoogleDrive()` clears the active token and writes `autoConnect: false` to `drivelens_connect_prefs_v1` so refreshing stays in Demo Mode until the user reconnects.
+- **Wiping Saved Credentials (`forgetSavedCredentials`)**: Triggered by clicking `[data-action="forget-creds"]` in `renderModals.js`. Calls `clearSession({ forgetUser: true })`, removes `drivelens_connect_prefs_v1` and `drivelens_recent_v1`, clears in-memory credentials/recent albums/saved OAuth profile, returns to Demo Mode if currently connected, and displays `store.credsClearedToast`.
+
+### 4.4 Shared Recursive BFS Media Crawler (`crawlAlbumTree`)
+
+- Traverses nested subfolders via breadth-first queue (`MAX_DEPTH = 6`, `BATCH_SIZE = 4`, cycle-guarded via `visited` `Set`).
+- Queries `'${folderId}' in parents and trashed = false and (mimeType = 'application/vnd.google-apps.folder' or mimeType contains 'image/' or mimeType contains 'video/')` with `pageSize=200`, `supportsAllDrives=true`, and `includeItemsFromAllDrives=true`.
+- Requests `thumbnailLink`, `webViewLink`, `webContentLink`, `imageMediaMetadata`, and `videoMediaMetadata` upfront so EXIF and justified aspect ratios render without downloading full files.
+- Captures `.drivelens` (`META_FOLDER_NAME`) under the root folder in OAuth mode (`captureMetaFolder: true`) and skips all dot-prefixed hidden directories (`entry.name.startsWith('.')`).
+
+### 4.5 6-Concurrency Image Queue, `no-referrer` & IndexedDB Fallback (`src/storage/imageLoader.js`)
+
+1. **Global Concurrency Cap**: `ImageLoadQueue` limits simultaneous image resolutions to `APP_CONFIG.THUMBNAIL_CONCURRENCY` (`6`) to avoid HTTP 429/403 rate limiting.
+2. **Viewport Lazy Loading**: Gallery cards use `IntersectionObserver` (`rootMargin: '260px 0px'`, tracked via `WeakMap` `activeObservers`), while Inspector/Compare/Lightbox use `eager: true`.
+3. **URL Sizing (`buildDriveThumbUrl`)**: Rewrites `=s\d+` on `thumbnailLink` (`220` filmstrip, `600` gallery/inspector, `1600` compare, `2048` lightbox) or falls back to `https://drive.google.com/thumbnail?id=<id>&sz=w<targetSize>` when `thumbnailLink` is absent.
+4. **Referer Bypass & Multi-Tier Fallback (`resolveImageSrc`)**:
+   - Sets `referrerPolicy = 'no-referrer'` on both probe `Image()` and DOM `<img>` elements to avoid `googleusercontent.com` Referer rejections.
+   - If `thumbnailLink` is missing and the `drive.google.com/thumbnail` probe fails, tries `https://lh3.googleusercontent.com/d/<id>=s<size>`.
+   - Finally checks in-memory `objectUrlCache` and IndexedDB **`drivelens-img-cache`** (object store `blobs`, indexed by `createdAt`, capped at `MAX_CACHE_ENTRIES = 120` oldest-evicted) before calling `fetchMediaBlobWithRetry` (`alt=media&supportsAllDrives=true` with Bearer token or `&key=`, single 1200ms retry on `429`/`503`).
+
+---
+
+## 5. Conflict-Free Multiplayer Metadata Schema & Storage Keys
+
+### 5.1 OAuth Cloud Sync (`.drivelens/` on Google Drive)
+
+- **`.drivelens/tags-schema.json` (LWW + Tombstones)**: `saveTagSchema` fetches remote JSON and runs `mergeTagSchemas(localSchema, remoteSchema)` per tag ID (`Number(l.updatedAt || 0) >= Number(r.updatedAt || 0)`). Deleted tags retain `deleted: true` tombstones so deletions propagate cleanly across concurrent clients.
+- **`.drivelens/member-<key>.json` (Per-User Isolation)**: Each collaborator writes exclusively to `member-${sanitizeMemberKey(memberId)}.json` (`[a-z0-9_-]` truncated to 42 chars + 5-char base-36 hash), preventing concurrent overwrite conflicts. `loadAlbumMetadata` fetches up to 6 JSON files in parallel and skips single corrupted files gracefully.
+- **Read-Only Fallback**: When Drive folder permissions are Viewer-only (`!canWrite`), personal edits persist to `localStorage` (`drivelens_readonly_<folderId>_<myId>`).
+
+### 5.2 API Key Local Server Sync (`serve.py` `/api/meta`)
+
+- `GET /api/meta?folder=<id>` and `POST /api/meta` (10MB payload limit) sanitize folder keys (`[a-zA-Z0-9_-]{1,128}`), acquire module-level `_META_LOCK`, merge `tagSchema.tags` via `_merge_tag_schemas` (LWW + tombstones), update `membersData[memberId]`, and write atomically to `.local-meta/<safeFolder>.json` using `tempfile.mkstemp` + `os.replace`.
+- `loadLocalServerMeta` / `saveLocalServerMeta` return `null` on static hosts without throwing, seamlessly falling back to `localStorage` (`drivelens_apikey_meta_<folderId>`).
+
+### 5.3 Deterministic Aggregation & Browser Storage Keys
+
+`Store.getAggregatedItemMeta(fileId)` computes `myRating`, `myFavorite`, `myNote`, `avgRating` (across `rating > 0`), `ratingCount`, `favoriteCount`, `ratingsByMember`, `notesByMember`, and `activeTagIds` (latest `updatedAt` per `(fileId, tagId)` across all members, filtered by `!def.deleted`).
+
+| Storage | Key / DB Name | Purpose |
+| --- | --- | --- |
+| `localStorage` / `sessionStorage` | `drivelens_session_v1` | OAuth `clientId`, `accessToken`, `expiresAt`, and Google `user` profile (`localStorage` when Remember is enabled; `sessionStorage` otherwise) |
+| `localStorage` | `drivelens_oauth_user_v1` | Persistent OAuth account profile & email hint (`clientId`, `id`, `email`, `name`, `picture`, `color`) for one-click re-consent |
+| `localStorage` | `drivelens_connect_prefs_v1` | Saved `authType`, `apiKey`, `clientId`, `folderId`, `nickname`, `rememberCredentials`, `autoConnect` |
+| `localStorage` | `drivelens_lang_v1` | Explicit UI language preference (`'en'` or `'zh'`) |
+| `localStorage` | `drivelens_theme` | UI theme (`'dark'` or `'light'`) |
+| `localStorage` | `drivelens_recent_v1` | Up to 6 recently opened albums |
+| `localStorage` | `drivelens_demo_state_v1` | Offline demo album state (`tagSchema`, `membersData`, `activePersonaId`) |
+| `localStorage` | `drivelens_apikey_meta_<folderId>` | Local mirror/fallback for API Key mode |
+| `localStorage` | `drivelens_readonly_<folderId>_<myId>` | Local fallback for OAuth Viewer-only folders |
+| `IndexedDB` | `drivelens-img-cache` (`blobs`) | Cached `alt=media` image/video Blobs (max 120 entries) |
+| `Cache Storage` | `drivelens-shell-v1` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
+
+---
+
+## 6. State Management, Performance & Verification
+
+### 6.1 0ms Optimistic Updates & 800ms Debounced Sync
+
+`Store` updates in-memory state and calls `emit()` synchronously (`0ms` UI feedback) on every rating, favorite, tag, or note edit, while `_persistChanges` batches cloud or `/api/meta` writes using independent 800ms timers (`APP_CONFIG.SYNC_DEBOUNCE_MS`).
+
+### 6.2 Signature-Patched DOM & Justified Row Layout
+
+- **No-Flicker In-Place Patching**: `renderGalleryGrid` checks `sig = "${lang}|${layoutMode}|${rowHeight}|${Math.round(containerWidth)}|${visibleIds}"` to patch `.is-selected`, `.is-focused`, and `.photo-overlay` without recreating `<img>` nodes; `renderInspector` guards `#myNoteInput` focus and reuses `.inspector-preview img`; `renderLightbox` patches HUD/filmstrip when `activeLightboxPhotoId` and `activeLightboxLang` match; `renderCompare` patches `.compare-pane-hud` and zoom/pan transforms when `activeCompareKey` matches; `renderHeader` preserves `#searchInput` focus/cursor, `isSearchComposing` IME composition, `lang` dropdown rebuilds, and `[data-header="install-app"]` visibility.
+- **Justified Rows (`computeJustifiedRows`)**: Clamps aspect ratio to `[0.45, 2.6]` (fallback `1.5`), breaks rows once `sumRatios * targetHeight + gap * (n - 1) >= safeWidth`, solves exact row height `(safeWidth - gap * (n - 1)) / sumRatios`, and caps the final incomplete row height at `Math.min(naturalHeight, targetHeight * 1.15)`.
+
+### 6.3 Verification Suite (`verify_project.py`)
+
+Run `python verify_project.py` (Python 3 stdlib only) to run the automated project verification suite:
+
+- **`[a]` HTTP Server Crawl (`verify_http_server`)**: Binds `serve.create_server('127.0.0.1', 0)` (with in-process `NoCacheStaticHandler` fallback if loopback TCP is sandbox-blocked) and fetches `/index.html`, stylesheets, and all transitive ES module imports from `/src/main.js`, asserting HTTP `200`, `no-cache`, and strict MIME types.
+- **`[b]` Static ES Module Graph (`verify_static_modules`)**: Tokenizes all JS files, validates balanced `{}/()/[]`, resolves relative import paths case-sensitively, and verifies every imported symbol exists in the target module's exports.
+- **`[c]` HTML / CSS / DOM IDs (`verify_html_css_and_dom_ids`)**: Validates balanced HTML tags, CSS braces, and that every `#id` queried in `src/main.js` exists in `index.html`.
+- **`[d]` Documentation Presence (`verify_docs`)**: Confirms `README.md` and `ARCHITECTURE.md` exist and are non-empty.
+- **`[e]` `start.bat` Hygiene (`verify_start_bat`)**: Verifies 100% pure ASCII bytes and strict CRLF (`\r\n`) line endings.
+- **`[f]` `/api/meta` In-Process Sync (`verify_api_meta`)**: Exercises `GET`/`POST /api/meta`, LWW tag merging, tombstone retention, `400` validation, and `.local-meta/` cleanup.
+- **`[g]` Credential & Secret Hygiene (`verify_no_credentials_or_secrets`)**: Ensures zero credential config files (`config.js`, `.env*`, etc.) and zero API keys, Client IDs, personal emails, or local user paths appear anywhere in the repository.
+- **`[h]` i18n Integrity (`verify_i18n`)**: Validates `<html lang="en">`, strict `'en'` default, 100% key parity between `MESSAGES.en` and `MESSAGES.zh`, existence of all literal `t(...)` keys, and zero CJK characters in non-`i18n.js` repository files (including documentation and source modules).

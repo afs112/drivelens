@@ -1,0 +1,24 @@
+# Python & OS
+__pycache__/
+*.py[cod]
+.DS_Store
+Thumbs.db
+
+# Local collaboration metadata cache
+.local-meta/
+
+# Credentials & local config files (NEVER commit)
+config.js
+config.*.js
+config*.json
+.env
+.env.*
+*credentials*
+*credential*
+client_secret*
+*secret*
+*token*.json
+*.pem
+*.key
+*.p12
+*.pfx
