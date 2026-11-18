@@ -4,9 +4,8 @@ import {
   fetchAuthorizedMediaBlobUrl,
   getInstantCachedSrc,
   hasCachedHdSrc,
-  loadHdPhoto,
   loadPhotoIntoElement,
-  preloadPhoto,
+  subscribeHdStatus,
 } from '../storage/imageLoader.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
 
@@ -26,7 +25,80 @@ let dragStartX = 0;
 let dragStartY = 0;
 
 const slideCache = new Map();
+const slideProgressById = new Map();
 let hdHideTimer = 0;
+let activeLightboxContainer = null;
+let activeStoreRef = null;
+
+function trimSlideCache(keepIds) {
+  if (slideCache.size <= 7) return;
+  for (const key of slideCache.keys()) {
+    if (!keepIds.has(key)) {
+      slideCache.delete(key);
+      slideProgressById.delete(key);
+      if (slideCache.size <= 7) break;
+    }
+  }
+}
+
+function clearAllSlideLoads() {
+  clearTimeout(hdHideTimer);
+  hdHideTimer = 0;
+  slideProgressById.clear();
+  slideCache.clear();
+}
+
+function updateHdFloatIndicator(container, visible, progress = 0) {
+  const floatEl = container?.querySelector('[data-lb-hd-float]');
+  if (!floatEl) return;
+  const clamped = Math.max(0, Math.min(1, Number(progress) || 0));
+  floatEl.style.setProperty('--hd-progress', clamped.toFixed(3));
+  floatEl.setAttribute('aria-valuenow', String(Math.round(clamped * 100)));
+  floatEl.classList.toggle('is-visible', Boolean(visible));
+  floatEl.setAttribute('aria-hidden', String(!visible));
+}
+
+subscribeHdStatus(({ itemId, status, progress, src, fromMemory }) => {
+  if (status === 'loading' || status === 'queued') {
+    slideProgressById.set(itemId, progress);
+  } else {
+    slideProgressById.delete(itemId);
+  }
+
+  const slide = slideCache.get(itemId);
+  if (slide && status === 'ready' && src && slide._imgEl) {
+    slide._imgEl.referrerPolicy = 'no-referrer';
+    slide._imgEl.dataset.hdLoaded = 'true';
+    slide._imgEl.src = src;
+    slide._imgEl.classList.add('is-loaded');
+    slide._hdReady = true;
+  }
+
+  if (!activeLightboxContainer || activeStoreRef?.state?.lightboxPhotoId !== itemId) {
+    return;
+  }
+
+  if (status === 'queued' || status === 'loading') {
+    clearTimeout(hdHideTimer);
+    updateHdFloatIndicator(activeLightboxContainer, true, Math.max(0.06, progress));
+  } else if (status === 'ready') {
+    clearTimeout(hdHideTimer);
+    if (fromMemory) {
+      updateHdFloatIndicator(activeLightboxContainer, false, 1);
+    } else {
+      updateHdFloatIndicator(activeLightboxContainer, true, 1);
+      hdHideTimer = setTimeout(() => {
+        hdHideTimer = 0;
+        if (activeLightboxContainer && activeStoreRef?.state?.lightboxPhotoId === itemId) {
+          updateHdFloatIndicator(activeLightboxContainer, false, 1);
+        }
+      }, 180);
+    }
+  } else {
+    clearTimeout(hdHideTimer);
+    updateHdFloatIndicator(activeLightboxContainer, false, 0);
+  }
+});
 
 function getTouchDistance(t1, t2) {
   return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
@@ -65,36 +137,6 @@ function computeFlipFromGridCard(container, fileId) {
   const dy = Math.round(cardRect.top + cardRect.height / 2 - (stageRect.top + stageRect.height / 2));
   const scale = Math.max(0.18, Math.min(0.92, cardRect.width / (stageRect.width * 0.88)));
   return { dx, dy, scale: Number(scale.toFixed(3)) };
-}
-
-function trimSlideCache(keepIds) {
-  if (slideCache.size <= 7) return;
-  for (const [key, slide] of slideCache.entries()) {
-    if (!keepIds.has(key)) {
-      slide?._hdAbort?.abort();
-      slideCache.delete(key);
-      if (slideCache.size <= 7) break;
-    }
-  }
-}
-
-function clearAllSlideLoads() {
-  clearTimeout(hdHideTimer);
-  hdHideTimer = 0;
-  for (const slide of slideCache.values()) {
-    slide?._hdAbort?.abort();
-  }
-  slideCache.clear();
-}
-
-function updateHdFloatIndicator(container, visible, progress = 0) {
-  const floatEl = container?.querySelector('[data-lb-hd-float]');
-  if (!floatEl) return;
-  const clamped = Math.max(0, Math.min(1, Number(progress) || 0));
-  floatEl.style.setProperty('--hd-progress', clamped.toFixed(3));
-  floatEl.setAttribute('aria-valuenow', String(Math.round(clamped * 100)));
-  floatEl.classList.toggle('is-visible', Boolean(visible));
-  floatEl.setAttribute('aria-hidden', String(!visible));
 }
 
 function acquireSlideElement(item, role, state, store) {
@@ -210,109 +252,15 @@ function ensureSlidePreview(slide, store) {
   }
 }
 
-function ensureSlideHd(slide, container, store, onDone = null) {
-  const imgEl = slide?._imgEl;
-  const item = slide?._itemRef;
-  if (!imgEl || !item) {
-    if (onDone) onDone();
+function syncCurrentSlideHdIndicator(container, item) {
+  clearTimeout(hdHideTimer);
+  const isVideo = Boolean(item?.mimeType && item.mimeType.startsWith('video/'));
+  if (!item || item.isDemo || isVideo || hasCachedHdSrc(item)) {
+    updateHdFloatIndicator(container, false, 1);
     return;
   }
-
-  const isVideo = Boolean(item.mimeType && item.mimeType.startsWith('video/'));
-  if (isVideo || item.isDemo) {
-    slide._hdReady = true;
-    slide._hdProgress = 1;
-    if (store.state.lightboxPhotoId === item.id) {
-      clearTimeout(hdHideTimer);
-      updateHdFloatIndicator(container, false, 1);
-    }
-    if (onDone) onDone();
-    return;
-  }
-
-  const memHd = hasCachedHdSrc(item);
-  if (slide._hdReady || memHd) {
-    if (memHd && imgEl.getAttribute('src') !== memHd) {
-      imgEl.referrerPolicy = 'no-referrer';
-      imgEl.src = memHd;
-    }
-    imgEl.dataset.hdLoaded = 'true';
-    imgEl.classList.add('is-loaded');
-    slide._hdReady = true;
-    slide._hdProgress = 1;
-    if (store.state.lightboxPhotoId === item.id) {
-      clearTimeout(hdHideTimer);
-      updateHdFloatIndicator(container, false, 1);
-    }
-    if (onDone) onDone();
-    return;
-  }
-
-  if (slide._hdLoading) {
-    if (store.state.lightboxPhotoId === item.id) {
-      clearTimeout(hdHideTimer);
-      updateHdFloatIndicator(container, true, Math.max(0.08, slide._hdProgress));
-    }
-    return;
-  }
-
-  slide._hdLoading = true;
-  slide._hdProgress = 0.08;
-  const abortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
-  slide._hdAbort = abortCtrl;
-
-  if (store.state.lightboxPhotoId === item.id) {
-    clearTimeout(hdHideTimer);
-    updateHdFloatIndicator(container, true, 0.08);
-  }
-
-  loadHdPhoto(item, {
-    getAccessToken: () => store.state.accessToken,
-    getApiKey: () => store.state.apiKey,
-    signal: abortCtrl?.signal || null,
-    onProgress: (p) => {
-      slide._hdProgress = p;
-      if (store.state.lightboxPhotoId === item.id) {
-        updateHdFloatIndicator(container, true, p);
-      }
-    },
-  })
-    .then(({ src, fromMemory }) => {
-      slide._hdLoading = false;
-      slide._hdAbort = null;
-      slide._hdReady = true;
-      slide._hdProgress = 1;
-      if (src && imgEl) {
-        imgEl.referrerPolicy = 'no-referrer';
-        imgEl.dataset.hdLoaded = 'true';
-        imgEl.src = src;
-        imgEl.classList.add('is-loaded');
-      }
-      if (store.state.lightboxPhotoId === item.id) {
-        clearTimeout(hdHideTimer);
-        if (fromMemory) {
-          updateHdFloatIndicator(container, false, 1);
-        } else {
-          updateHdFloatIndicator(container, true, 1);
-          hdHideTimer = setTimeout(() => {
-            hdHideTimer = 0;
-            if (store.state.lightboxPhotoId === item.id) {
-              updateHdFloatIndicator(container, false, 1);
-            }
-          }, 180);
-        }
-      }
-      if (onDone) onDone();
-    })
-    .catch(() => {
-      slide._hdLoading = false;
-      slide._hdAbort = null;
-      if (store.state.lightboxPhotoId === item.id) {
-        clearTimeout(hdHideTimer);
-        updateHdFloatIndicator(container, false, 0);
-      }
-      if (onDone) onDone();
-    });
+  const activeProg = slideProgressById.get(item.id);
+  updateHdFloatIndicator(container, true, activeProg !== undefined ? Math.max(0.06, activeProg) : 0.06);
 }
 
 function buildLightboxRatingOptions() {
@@ -421,10 +369,13 @@ function buildLightboxShell(container, store, zoom) {
 
 export function renderLightbox(container, store, visiblePhotos) {
   if (!container) return;
+  activeLightboxContainer = container;
+  activeStoreRef = store;
   const state = store.state;
   const photoId = state.lightboxPhotoId;
 
   if (!photoId) {
+    activeLightboxContainer = null;
     activeLightboxPhotoId = null;
     activeLightboxLang = '';
     lightboxChromeHidden = true;
@@ -567,22 +518,16 @@ export function renderLightbox(container, store, visiblePhotos) {
     for (const sl of slides) {
       ensureSlidePreview(sl, store);
     }
-
-    // Upgrade current slide to full HD first (driving top-down progress ring), then preload adjacent HD slides
-    ensureSlideHd(curSlideEl, container, store, () => {
-      if (nextSlideEl?.isConnected) ensureSlideHd(nextSlideEl, container, store);
-      if (prevSlideEl?.isConnected) ensureSlideHd(prevSlideEl, container, store);
-      if (lookaheadNext) {
-        preloadPhoto(lookaheadNext, {
-          size: 2048,
-          getAccessToken: () => store.state.accessToken,
-          getApiKey: () => store.state.apiKey,
-        });
-      }
-    });
+    syncCurrentSlideHdIndicator(container, file);
 
     const keepIds = new Set(
-      [prevItem?.id, file.id, nextItem?.id, lookaheadNext?.id].filter(Boolean)
+      [
+        prevItem?.id,
+        file.id,
+        nextItem?.id,
+        lookaheadNext?.id,
+        idx >= 0 && idx + 3 < total ? visiblePhotos[idx + 3]?.id : null,
+      ].filter(Boolean)
     );
     trimSlideCache(keepIds);
 

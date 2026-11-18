@@ -320,6 +320,48 @@ let loadMoreObserver = null;
 let previewRafId = 0;
 let pendingPreviewHeight = null;
 let mobileSelectMode = false;
+let scrollSettleCallback = null;
+
+export function setGalleryScrollSettleCallback(fn) {
+  scrollSettleCallback = typeof fn === 'function' ? fn : null;
+}
+
+export function getCurrentPageRatedPhotos(scrollContainer, store, visiblePhotos) {
+  if (!store || !Array.isArray(visiblePhotos) || visiblePhotos.length === 0) return [];
+  const limit = Math.min(renderedLimit, visiblePhotos.length);
+  const pageSlice = visiblePhotos.slice(0, limit);
+  const maxScroll = scrollContainer
+    ? Math.max(1, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+    : 1;
+  const ratio = scrollContainer ? Math.min(1, Math.max(0, scrollContainer.scrollTop / maxScroll)) : 0;
+  const approxCenterIdx = Math.round(ratio * Math.max(0, pageSlice.length - 1));
+
+  const candidates = [];
+  for (let i = 0; i < pageSlice.length; i += 1) {
+    const file = pageSlice[i];
+    if (!file || file.isDemo || (file.mimeType && file.mimeType.startsWith('video/'))) continue;
+    const meta = store.getAggregatedItemMeta(file.id);
+    if (meta.ratingCount > 0 || meta.favoriteCount > 0) {
+      candidates.push({
+        file,
+        dist: Math.abs(i - approxCenterIdx),
+        fav: meta.favoriteCount > 0 ? 1 : 0,
+        avg: meta.avgRating || 0,
+      });
+    }
+  }
+
+  candidates.sort((a, b) => {
+    const bucketA = Math.floor(a.dist / 12);
+    const bucketB = Math.floor(b.dist / 12);
+    if (bucketA !== bucketB) return bucketA - bucketB;
+    if (b.fav !== a.fav) return b.fav - a.fav;
+    if (b.avg !== a.avg) return b.avg - a.avg;
+    return a.dist - b.dist;
+  });
+
+  return candidates.map((c) => c.file);
+}
 
 export function isGallerySelectModeActive(store) {
   return Boolean(mobileSelectMode || store?.state?.selectedPhotoIds?.size > 0);
@@ -635,6 +677,10 @@ function ensureGalleryFloatingUi(scrollContainer, store) {
         }
 
         updateFloatingScrollState(scrollContainer, scrollContainer._dlStoreRef, true);
+        clearTimeout(scrollContainer._dlSettleTimer);
+        scrollContainer._dlSettleTimer = setTimeout(() => {
+          if (scrollSettleCallback) scrollSettleCallback();
+        }, 300);
       });
     },
     { passive: true }
@@ -797,6 +843,7 @@ function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, tar
           if (renderedLimit >= lastVisiblePhotos.length) return;
           renderedLimit = Math.min(lastVisiblePhotos.length, renderedLimit + PAGE_CHUNK);
           renderGalleryGrid(gridEl, scrollContainer, store, lastVisiblePhotos);
+          if (scrollSettleCallback) scrollSettleCallback();
         },
         { root: scrollContainer, rootMargin: '600px 0px', threshold: 0 }
       );

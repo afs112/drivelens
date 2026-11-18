@@ -25,7 +25,7 @@
 - **Document Shell Meta Tags ([`index.html`](index.html))**:
   - Includes `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />`, `<meta name="theme-color" content="#0b0e14" />`, `<meta name="apple-mobile-web-app-capable" content="yes" />`, `<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />`, `<meta name="apple-mobile-web-app-title" content="DriveLens" />`, `<link rel="manifest" href="./manifest.webmanifest" />`, and `<link rel="apple-touch-icon" href="./icons/icon-192.png" />`.
 - **Service Worker ([`sw.js`](sw.js))**:
-  - Maintains `CACHE_NAME = 'drivelens-shell-v6'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
+  - Maintains `CACHE_NAME = 'drivelens-shell-v7'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
   - Deletes older `drivelens-*` cache buckets during `activate` and calls `self.clients.claim()`.
   - Intercepts only same-origin `GET` requests excluding `/api/` paths (so `serve.py` `/api/meta`, Google Drive API calls, GIS scripts, and `googleusercontent.com` thumbnails always bypass the Service Worker cache). Uses a **Network-First** strategy that refreshes cached `response.type === 'basic'` assets online and falls back to `caches.match()` or `./index.html` (for navigations) when offline.
 - **Install Prompt Lifecycle (`src/main.js`, `src/state/store.js`, `src/ui/renderHeader.js`)**:
@@ -68,7 +68,7 @@ Browser / Installed PWA Startup (src/main.js)
 drivelens/
 ├── index.html                   # Single-page shell (<html lang="en">, viewport-fit=cover), PWA meta links, 14 mount IDs
 ├── manifest.webmanifest         # Web App Manifest (relative ./ scope, standalone display, icon references)
-├── sw.js                        # Service Worker (drivelens-shell-v6 precache, Network-First same-origin shell cache)
+├── sw.js                        # Service Worker (drivelens-shell-v7 precache, Network-First same-origin shell cache)
 ├── icons/
 │   ├── icon.svg                 # Scalable vector app icon (any maskable)
 │   ├── icon-192.png             # 192x192 RGBA PNG app icon & apple-touch-icon
@@ -175,11 +175,11 @@ flowchart TD
 | `src/constants.js` | `APP_CONFIG` | Empty credential placeholders (`DEFAULT_API_KEY`, `DEFAULT_CLIENT_ID`, `DEFAULT_FOLDER_ID`), `APP_TITLE`, `THUMBNAIL_CONCURRENCY` (`6`), `SYNC_DEBOUNCE_MS` (`800`) |
 | `src/i18n.js` | `SUPPORTED_LANGS`, `MESSAGES`, `getLang`, `setLangCode`, `getLocaleTag`, `t` | Strict `'en'`-default localization runtime, 444-key EN/ZH parity, `{param}` interpolation, sole CJK string store |
 | `serve.py` | `create_server`, `NoCacheStaticHandler`, `ReusableThreadingHTTPServer` | Static serving with strict MIME types (`.js`/`.mjs`, `.css`, `.webmanifest`, `.png`), `--open`/`--dry-run`, thread-safe `GET/POST /api/meta` |
-| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 14 core shell files (`drivelens-shell-v6`), Network-First same-origin cache, excludes cross-origin & `/api/` |
+| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 14 core shell files (`drivelens-shell-v7`), Network-First same-origin cache, excludes cross-origin & `/api/` |
 | `src/api/gdrive.js` | `parseDriveFolderId`, `ensureGoogleIdentityLoaded`, `getCachedSession`, `getSavedOAuthUser`, `clearSession`, `authenticateGoogle`, `loadSharedAlbum`, `loadSharedAlbumWithApiKey`, `downloadOriginalFile` | OAuth 2.0 GIS token & hint flow, dual-storage session cache, API Key album loader, shared BFS media crawler (`onBatch` streaming), file download |
 | `src/api/metaSync.js` | `META_FOLDER_NAME`, `TAGS_SCHEMA_FILENAME`, `sanitizeMemberKey`, `ensureMetaFolder`, `mergeTagSchemas`, `loadAlbumMetadata`, `saveMemberMetadata`, `saveTagSchema`, `loadLocalServerMeta`, `saveLocalServerMeta` | `.drivelens/` cloud JSON persistence, LWW tag schema merge, non-throwing `./api/meta` client |
 | `src/storage/albumCache.js` | `buildAlbumCacheKey`, `getCachedAlbum`, `setCachedAlbum`, `removeCachedAlbum`, `clearAllAlbumCaches` | IndexedDB + `localStorage` fallback cache-first (`30 min` TTL) directory/metadata cache (max 12 albums; excludes secrets) |
-| `src/storage/imageLoader.js` | `buildDriveThumbUrl`, `hasCachedHdSrc`, `loadHdPhoto`, `getInstantCachedSrc`, `preloadPhoto`, `loadPhotoIntoElement`, `fetchAuthorizedMediaBlobUrl`, `clearImageCache` | Priority image queue, `alt=media` streaming HD loader with live byte progress + `4096px` fallback, `0ms` cached-thumb upgrade, & 400-blob IDB cache |
+| `src/storage/imageLoader.js` | `buildDriveThumbUrl`, `isPreviewQueueIdle`, `hasCachedHdSrc`, `isPhotoHdCached`, `loadHdPhoto`, `subscribeHdStatus`, `getSmartHdDebugState`, `updateSmartHdSchedule`, `getInstantCachedSrc`, `preloadPhoto`, `loadPhotoIntoElement`, `fetchAuthorizedMediaBlobUrl`, `clearImageCache` | 3-tier preview-first + Lightbox `current + 3` + rated/favorited page HD scheduler, `alt=media` byte-progress stream, & 400-blob IDB cache |
 | `src/state/store.js` | `Store`, `getTagColors`, `TAG_COLORS`, `loadConnectPrefs`, `resolvePhotoTimestamp` | Pub/sub store, EXIF + filename + mtime timestamp resolver, memoized selectors, 30-min cache-first hydration, UI prefs (`drivelens_ui_prefs_v1`) |
 | `src/demo/demoAlbum.js` | `DEMO_STORAGE_KEY`, `DEMO_PERSONAS`, `DEFAULT_TAG_SCHEMA`, `getDemoPersonas`, `localizeDemoState`, `createDemoDataset`, `saveDemoState`, `resetDemoState` | Zero-CJK offline demo album builder (`5` folders, `16` items, `3` personas, `8` default tags) reading `MESSAGES[code]` |
 | `src/ui/renderHeader.js` | `dismissHeaderOverlay`, `renderHeader`, `bindHeaderEvents`, `syncMobileNavSlidingPill`, `renderMobileNav`, `bindMobileNavEvents` | Floating Liquid Glass top islands, icon-only sliding layout pills, `#headerMorePopover`, `#langSelect`, `[data-header="install-app"]`, Split Liquid Glass icon-only `#mobileNavBar` |
@@ -294,7 +294,7 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 | `localStorage` | `drivelens_apikey_meta_<folderId>` | Local mirror/fallback for API Key mode |
 | `localStorage` | `drivelens_readonly_<folderId>_<myId>` | Local fallback for OAuth Viewer-only folders |
 | `IndexedDB` | `drivelens-img-cache` (`blobs`) | Cached `alt=media` image/video Blobs (max 400 entries) |
-| `Cache Storage` | `drivelens-shell-v6` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
+| `Cache Storage` | `drivelens-shell-v7` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
 
 ---
 
@@ -339,4 +339,4 @@ Run `python verify_project.py` (Python 3 stdlib only) to execute all 10 automate
 - **`[g]` Credential & Secret Hygiene (`verify_no_credentials_or_secrets`)**: Ensures zero credential config files (`config.js`, `.env*`, etc.) and zero API keys, Client IDs, personal emails, or local user paths appear anywhere in the repository.
 - **`[h]` i18n Integrity (`verify_i18n`)**: Validates `<html lang="en">`, strict `'en'` default, 100% key parity between `MESSAGES.en` and `MESSAGES.zh`, existence of all literal `t(...)` keys, and zero CJK characters in non-`i18n.js` repository files (including documentation, CSS, HTML, and source modules).
 - **`[i]` PWA Integrity (`verify_pwa`)**: Validates `manifest.webmanifest` (`display: 'standalone'`, `start_url: './'`), binary PNG dimensions (`192x192` and `512x512`) + SVG icon existence, `sw.js` syntax + `PRECACHE_ASSETS` disk resolution, and live `serve.py` MIME headers for `.webmanifest`, `sw.js`, and `.png`.
-- **`[j]` Mobile & Touch UX (`verify_mobile_ux`)**: Verifies `viewport-fit=cover` and `<nav id="mobileNavBar"` in `index.html`, safe-area CSS tokens and mobile/input rules across all 4 stylesheets, `touchstart`/`touchmove`/`touchend` handlers in `renderGallery.js`/`renderLightbox.js`/`renderCompare.js`, `'drivelens-shell-v6'` in `sw.js`, gallery exports, and preservation of the `README.md` `## Design Inspiration & Independence` section.
+- **`[j]` Mobile & Touch UX (`verify_mobile_ux`)**: Verifies `viewport-fit=cover` and `<nav id="mobileNavBar"` in `index.html`, safe-area CSS tokens and mobile/input rules across all 4 stylesheets, `touchstart`/`touchmove`/`touchend` handlers in `renderGallery.js`/`renderLightbox.js`/`renderCompare.js`, `'drivelens-shell-v7'` in `sw.js`, gallery exports, and preservation of the `README.md` `## Design Inspiration & Independence` section.

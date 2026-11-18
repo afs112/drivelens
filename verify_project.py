@@ -1894,24 +1894,24 @@ def verify_mobile_ux(parsed_js):
         if missing:
             errors.append(f"{rel_js} missing touch handler(s): {missing}")
 
-    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v6'
+    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v7'
     checks += 1
     sw_path = ROOT_DIR / "sw.js"
     if not sw_path.is_file():
         errors.append("Missing sw.js")
     else:
         sw_toks = tokenize_js(sw_path.read_text(encoding="utf-8"), filename="sw.js")
-        has_v6 = any(
+        has_v7 = any(
             sw_toks[i].kind == "IDENT"
             and sw_toks[i].value == "CACHE_NAME"
             and sw_toks[i + 1].kind == "PUNCT"
             and sw_toks[i + 1].value == "="
             and sw_toks[i + 2].kind == "STRING"
-            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v6"
+            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v7"
             for i in range(len(sw_toks) - 2)
         )
-        if not has_v6:
-            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v6'")
+        if not has_v7:
+            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v7'")
 
     # 5. albumCache.js and renderGallery.js exports
     checks += 1

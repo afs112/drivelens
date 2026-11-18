@@ -1,6 +1,7 @@
 import { getCachedSession } from './api/gdrive.js';
 import { t } from './i18n.js';
 import { loadConnectPrefs, Store } from './state/store.js';
+import { updateSmartHdSchedule } from './storage/imageLoader.js';
 import {
   bindCompareEvents,
   closeCompare,
@@ -10,10 +11,12 @@ import {
 } from './ui/renderCompare.js';
 import {
   bindGalleryEvents,
+  getCurrentPageRatedPhotos,
   relayoutGalleryOnResize,
   renderBatchBar,
   renderGalleryGrid,
   renderGallerySubbar,
+  setGalleryScrollSettleCallback,
 } from './ui/renderGallery.js';
 import {
   bindHeaderEvents,
@@ -44,6 +47,35 @@ const mobileNavBar = document.getElementById('mobileNavBar');
 
 const store = new Store();
 
+function syncSmartHdPipeline(visiblePhotos = store.getVisiblePhotos()) {
+  const state = store.state;
+  const albumKey = `${state.mode}:${state.folderId || 'demo'}`;
+  if (state.loading) {
+    updateSmartHdSchedule({ albumKey, lightboxItems: [], ratedPageItems: [] });
+    return;
+  }
+
+  let lightboxItems = [];
+  if (state.lightboxPhotoId) {
+    const idx = visiblePhotos.findIndex((p) => p.id === state.lightboxPhotoId);
+    if (idx >= 0) {
+      lightboxItems = visiblePhotos.slice(idx, idx + 4);
+    } else {
+      const single = state.files.find((f) => f.id === state.lightboxPhotoId);
+      if (single) lightboxItems = [single];
+    }
+  }
+
+  const ratedPageItems = getCurrentPageRatedPhotos(galleryScroll, store, visiblePhotos);
+  updateSmartHdSchedule({
+    albumKey,
+    lightboxItems,
+    ratedPageItems,
+    getAccessToken: () => store.state.accessToken,
+    getApiKey: () => store.state.apiKey,
+  });
+}
+
 function renderAll() {
   const visiblePhotos = store.getVisiblePhotos();
   renderHeader(topHeader, demoBanner, toastContainer, store);
@@ -56,12 +88,17 @@ function renderAll() {
   renderCompare(compareRoot, store);
   renderModals(modalRoot, store);
   renderMobileNav(mobileNavBar, store);
+  syncSmartHdPipeline(visiblePhotos);
 
   if (drawerBackdrop) {
     const showBackdrop = store.state.sidebarOpen || store.state.inspectorOpen;
     drawerBackdrop.classList.toggle('visible', showBackdrop);
   }
 }
+
+setGalleryScrollSettleCallback(() => {
+  syncSmartHdPipeline();
+});
 
 bindHeaderEvents(topHeader, demoBanner, store);
 bindMobileNavEvents(mobileNavBar, store);
