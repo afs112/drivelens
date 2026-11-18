@@ -99,22 +99,27 @@ export function computeWaterfallColumns(
   items,
   containerWidth,
   targetSize = 210,
-  gap = 10,
+  gap = 3,
   isMobile = false
 ) {
   if (!items || items.length === 0) return [];
   const safeWidth = Math.max(220, containerWidth);
-  const colCount = isMobile
-    ? safeWidth < 260
-      ? 1
-      : targetSize <= 155
-        ? 3
-        : 2
-    : Math.max(
-        2,
-        Math.min(7, Math.round((safeWidth + gap) / (Math.max(150, Math.round(targetSize * 0.85)) + gap)))
-      );
-  const colWidth = Math.max(96, Math.floor((safeWidth - gap * (colCount - 1)) / colCount));
+  const clampedSize = Math.max(130, Math.min(320, Number(targetSize) || 210));
+  let colCount;
+  if (isMobile) {
+    if (safeWidth < 260 || clampedSize >= 275) colCount = 1;
+    else if (clampedSize >= 190) colCount = 2;
+    else if (clampedSize >= 152) colCount = 3;
+    else colCount = 4;
+  } else {
+    const tNorm = (clampedSize - 130) / 190;
+    const desiredColWidth = Math.round(135 + tNorm * 340);
+    colCount = Math.max(
+      2,
+      Math.min(9, Math.round((safeWidth + gap) / (desiredColWidth + gap)))
+    );
+  }
+  const colWidth = Math.max(80, Math.floor((safeWidth - gap * (colCount - 1)) / colCount));
   const columns = Array.from({ length: colCount }, () => []);
   const colHeights = new Array(colCount).fill(0);
 
@@ -154,16 +159,12 @@ function buildOverlayData(file, store) {
       const avgText = Number.isInteger(meta.avgRating)
         ? `${meta.avgRating}.0`
         : meta.avgRating.toFixed(1);
-      const myPart =
-        meta.myRating > 0
-          ? `<span style="opacity:0.75;font-weight:400">${escapeHtml(t('gallery.meBadge', { n: meta.myRating }))}</span>`
-          : '';
-      starHtml = `<span class="photo-star-badge">${icon('starFilled', 12)}<span>${avgText}</span>${myPart}</span>`;
+      starHtml = `<span class="photo-star-badge">${icon('starFilled', 11)}<span>${avgText}</span></span>`;
     }
 
     const heartHtml =
       meta.favoriteCount > 0
-        ? `<span class="photo-heart-badge">${icon('heartFilled', 12)}${meta.favoriteCount > 1 ? `<span>${meta.favoriteCount}</span>` : ''}</span>`
+        ? `<span class="photo-heart-badge">${icon('heartFilled', 11)}${meta.favoriteCount > 1 ? `<span>${meta.favoriteCount}</span>` : ''}</span>`
         : '';
 
     const tagParts = [];
@@ -183,7 +184,7 @@ function buildOverlayData(file, store) {
   `;
     return {
       mode: 'persistent',
-      sig: `p|${store.state.lang}|${meta.avgRating}|${meta.myRating}|${meta.favoriteCount}|${tagParts.join(',')}`,
+      sig: `p|${meta.avgRating}|${meta.favoriteCount}|${tagParts.join(',')}`,
       html,
     };
   }
@@ -331,6 +332,25 @@ let previewRafId = 0;
 let pendingPreviewHeight = null;
 let mobileSelectMode = false;
 
+export function isGallerySelectModeActive(store) {
+  return Boolean(mobileSelectMode || store?.state?.selectedPhotoIds?.size > 0);
+}
+
+export function toggleGallerySelectMode(store) {
+  if (!store) return;
+  if (isGallerySelectModeActive(store)) {
+    mobileSelectMode = false;
+    if (store.state.selectedPhotoIds.size > 0) {
+      store.clearSelection();
+    } else {
+      store.emit();
+    }
+  } else {
+    mobileSelectMode = true;
+    store.emit();
+  }
+}
+
 export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
   if (!subbarEl) return;
   const state = store.state;
@@ -367,15 +387,23 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
     chips.push({ label: t('gallery.chipSearch', { q: state.searchQuery.trim() }), clear: 'search' });
   }
 
-  const selectActive = mobileSelectMode || state.selectedPhotoIds.size > 0;
+  // Maximize photo space: collapse subbar to 0px unless active filters exist
+  if (chips.length === 0) {
+    if (lastSubbarSignature !== '__hidden__') {
+      lastSubbarSignature = '__hidden__';
+      subbarEl.classList.add('hidden');
+      subbarEl.innerHTML = '';
+    }
+    return;
+  }
+
+  subbarEl.classList.remove('hidden');
   const subbarSig = [
     state.lang,
     activeFolder?.id || '',
     activeFolder?.name || '',
     visiblePhotos.length,
     chips.map((c) => `${c.clear}:${c.label}`).join(','),
-    selectActive ? 1 : 0,
-    state.sortBy,
   ].join('|');
 
   if (subbarSig === lastSubbarSignature && subbarEl.childElementCount > 0) {
@@ -387,33 +415,15 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
     <div class="gallery-subbar-left">
       <span class="breadcrumb-text">${escapeHtml(activeFolder?.name || t('gallery.allPhotos'))}</span>
       <span class="photo-count-badge">${escapeHtml(t('gallery.itemCount', { count: visiblePhotos.length }))}</span>
-      ${
-        chips.length > 0
-          ? `<div class="active-filters-bar">
-              ${chips
-                .map(
-                  (c) =>
-                    `<button type="button" class="filter-chip" data-clear-filter="${escapeAttr(c.clear)}">${escapeHtml(c.label)} ${icon('x', 11)}</button>`
-                )
-                .join('')}
-              <button type="button" class="btn btn-ghost btn-sm" data-clear-filter="all">${escapeHtml(t('gallery.clearFilters'))}</button>
-            </div>`
-          : ''
-      }
-    </div>
-    <div class="gallery-subbar-right">
-      <button
-        type="button"
-        class="btn btn-sm mobile-only-inline ${selectActive ? 'is-active' : ''}"
-        data-subbar="toggle-select-mode"
-      >${icon('check', 12)} <span>${escapeHtml(selectActive ? t('mobile.doneSelect') : t('mobile.selectMode'))}</span></button>
-      <select class="select-sm" id="sortBySelect" title="${escapeAttr(t('gallery.sortTitle'))}">
-        <option value="dateDesc" ${state.sortBy === 'dateDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateDesc'))}</option>
-        <option value="dateAsc" ${state.sortBy === 'dateAsc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateAsc'))}</option>
-        <option value="ratingDesc" ${state.sortBy === 'ratingDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortRatingDesc'))}</option>
-        <option value="nameAsc" ${state.sortBy === 'nameAsc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortNameAsc'))}</option>
-        <option value="sizeDesc" ${state.sortBy === 'sizeDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortSizeDesc'))}</option>
-      </select>
+      <div class="active-filters-bar">
+        ${chips
+          .map(
+            (c) =>
+              `<button type="button" class="filter-chip" data-clear-filter="${escapeAttr(c.clear)}">${escapeHtml(c.label)} ${icon('x', 11)}</button>`
+          )
+          .join('')}
+        <button type="button" class="btn btn-ghost btn-sm" data-clear-filter="all">${escapeHtml(t('gallery.clearFilters'))}</button>
+      </div>
     </div>
   `;
 }
@@ -573,12 +583,32 @@ function ensureGalleryFloatingUi(scrollContainer) {
   scrollContainer._dlFloatingAttached = true;
 
   let scrollRafId = 0;
+  let lastScrollTop = scrollContainer.scrollTop || 0;
   scrollContainer.addEventListener(
     'scroll',
     () => {
       if (scrollRafId) return;
       scrollRafId = requestAnimationFrame(() => {
         scrollRafId = 0;
+        const curTop = scrollContainer.scrollTop;
+        const delta = curTop - lastScrollTop;
+        lastScrollTop = curTop;
+
+        const topHeaderEl = document.getElementById('topHeader');
+        const mobileNav = document.getElementById('mobileNavBar');
+        const overlayOpen =
+          Boolean(document.querySelector(
+            '#headerMorePopover.is-open, #topHeader.mobile-search-open, #demoBanner:not(.hidden), #drawerBackdrop.visible'
+          ));
+
+        if (curTop <= 30 || delta < -5 || overlayOpen) {
+          topHeaderEl?.classList.remove('is-hidden-scroll');
+          mobileNav?.classList.remove('is-condensed');
+        } else if (curTop > 50 && delta > 4) {
+          topHeaderEl?.classList.add('is-hidden-scroll');
+          mobileNav?.classList.add('is-condensed');
+        }
+
         updateFloatingScrollState(scrollContainer);
       });
     },
@@ -598,9 +628,9 @@ function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, tar
   const state = store.state;
   const { layoutMode, lang } = state;
   const isMobile = scrollContainer.clientWidth <= 600;
-  const containerWidth = Math.max(240, scrollContainer.clientWidth - (isMobile ? 6 : 16));
+  const containerWidth = Math.max(240, gridEl.clientWidth);
   const roundedWidth = Math.round(containerWidth);
-  const gap = isMobile ? 3 : 4;
+  const gap = window.innerWidth <= 860 ? 2 : 3;
   const effectiveRowHeight = isMobile
     ? Math.round(Math.max(105, targetHeight * 0.62))
     : targetHeight;
@@ -815,7 +845,7 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
 
   const { rowHeight } = store.state;
   const isMobile = scrollContainer.clientWidth <= 600;
-  const containerWidth = Math.max(240, scrollContainer.clientWidth - (isMobile ? 6 : 16));
+  const containerWidth = Math.max(240, gridEl.clientWidth);
   const roundedWidth = Math.round(containerWidth);
   const sig = buildGridSignature(
     store.state,
@@ -863,7 +893,7 @@ export function relayoutGalleryOnResize(gridEl, scrollContainer, store) {
   if (store.state.loading || lastVisiblePhotos.length === 0) return;
 
   const isMobile = scrollContainer.clientWidth <= 600;
-  const containerWidth = Math.max(240, scrollContainer.clientWidth - (isMobile ? 6 : 16));
+  const containerWidth = Math.max(240, gridEl.clientWidth);
   const roundedWidth = Math.round(containerWidth);
   if (roundedWidth === lastContainerWidth && isMobile === lastIsMobile) return;
 
@@ -907,17 +937,7 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
     subbarEl.addEventListener('click', (e) => {
       const selectModeBtn = e.target.closest('[data-subbar="toggle-select-mode"]');
       if (selectModeBtn) {
-        if (mobileSelectMode || store.state.selectedPhotoIds.size > 0) {
-          mobileSelectMode = false;
-          if (store.state.selectedPhotoIds.size > 0) {
-            store.clearSelection();
-          } else {
-            store.emit();
-          }
-        } else {
-          mobileSelectMode = true;
-          store.emit();
-        }
+        toggleGallerySelectMode(store);
         return;
       }
 
@@ -967,6 +987,10 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
     let touchStartX = 0;
     let touchStartY = 0;
     let suppressNextClickUntil = 0;
+    let pinchStartDist = 0;
+    let pinchStartHeight = 210;
+    let pinchLiveHeight = null;
+    let wheelCommitTimer = null;
 
     function clearLongPress() {
       if (longPressTimer) {
@@ -975,9 +999,27 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
       }
     }
 
+    function syncRangeSliders(val) {
+      const str = String(val);
+      const topSlider = document.getElementById('rowHeightRange');
+      if (topSlider && topSlider.value !== str) topSlider.value = str;
+      const sideSlider = document.getElementById('sidebarRowHeightRange');
+      if (sideSlider && sideSlider.value !== str) sideSlider.value = str;
+    }
+
     gridEl.addEventListener(
       'touchstart',
       (e) => {
+        if (e.touches.length === 2) {
+          clearLongPress();
+          pinchStartDist = Math.hypot(
+            e.touches[1].clientX - e.touches[0].clientX,
+            e.touches[1].clientY - e.touches[0].clientY
+          );
+          pinchStartHeight = store.state.rowHeight || 210;
+          pinchLiveHeight = null;
+          return;
+        }
         if (e.touches.length !== 1) {
           clearLongPress();
           return;
@@ -1004,6 +1046,21 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
     gridEl.addEventListener(
       'touchmove',
       (e) => {
+        if (e.touches.length === 2 && pinchStartDist > 0) {
+          e.preventDefault();
+          const dist = Math.hypot(
+            e.touches[1].clientX - e.touches[0].clientX,
+            e.touches[1].clientY - e.touches[0].clientY
+          );
+          const nextH = Math.max(
+            130,
+            Math.min(320, Math.round(pinchStartHeight * (dist / pinchStartDist)))
+          );
+          pinchLiveHeight = nextH;
+          syncRangeSliders(nextH);
+          previewGalleryRowHeight(gridEl, document.getElementById('galleryScroll'), store, nextH);
+          return;
+        }
         if (!longPressTimer || e.touches.length !== 1) return;
         const touch = e.touches[0];
         if (
@@ -1013,11 +1070,42 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
           clearLongPress();
         }
       },
-      { passive: true }
+      { passive: false }
     );
 
-    gridEl.addEventListener('touchend', clearLongPress, { passive: true });
-    gridEl.addEventListener('touchcancel', clearLongPress, { passive: true });
+    function finishPinchOrTouch(e) {
+      clearLongPress();
+      if (pinchLiveHeight !== null && (!e.touches || e.touches.length < 2)) {
+        const commitH = pinchLiveHeight;
+        pinchLiveHeight = null;
+        pinchStartDist = 0;
+        suppressNextClickUntil = Date.now() + 350;
+        store.setRowHeight(commitH);
+      } else if (!e.touches || e.touches.length < 2) {
+        pinchStartDist = 0;
+      }
+    }
+
+    gridEl.addEventListener('touchend', finishPinchOrTouch, { passive: true });
+    gridEl.addEventListener('touchcancel', finishPinchOrTouch, { passive: true });
+
+    gridEl.addEventListener(
+      'wheel',
+      (e) => {
+        if (!(e.ctrlKey || e.metaKey)) return;
+        e.preventDefault();
+        const base =
+          pendingPreviewHeight !== null ? pendingPreviewHeight : store.state.rowHeight || 210;
+        const nextH = Math.max(130, Math.min(320, Math.round(base + (e.deltaY < 0 ? 18 : -18))));
+        syncRangeSliders(nextH);
+        previewGalleryRowHeight(gridEl, document.getElementById('galleryScroll'), store, nextH);
+        clearTimeout(wheelCommitTimer);
+        wheelCommitTimer = setTimeout(() => {
+          store.setRowHeight(nextH);
+        }, 120);
+      },
+      { passive: false }
+    );
 
     gridEl.addEventListener('click', (e) => {
       if (Date.now() < suppressNextClickUntil) return;
@@ -1036,12 +1124,23 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
         return;
       }
 
-      if (isTouchViewport()) {
+      if (isTouchViewport() || mobileSelectMode) {
         if (mobileSelectMode || store.state.selectedPhotoIds.size > 0) {
           store.toggleSelectCheckbox(photoId);
         } else {
           store.openLightbox(photoId);
         }
+        return;
+      }
+
+      if (
+        !e.ctrlKey &&
+        !e.metaKey &&
+        !e.shiftKey &&
+        store.state.selectedPhotoIds.size === 0 &&
+        !store.state.inspectorOpen
+      ) {
+        store.openLightbox(photoId);
         return;
       }
 

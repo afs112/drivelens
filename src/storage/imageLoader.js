@@ -212,6 +212,22 @@ async function resolveImageSrc(item, size, getAccessToken, getApiKey) {
 
 const activeObservers = new WeakMap();
 
+export function getInstantCachedSrc(item, sizes = [2048, 600, 480]) {
+  if (!item) return '';
+  if (item.isDemo) return item.demoDataUrl || '';
+  for (const sz of sizes) {
+    const url = objectUrlCache.get(`${item.id}:${sz}`);
+    if (url) return url;
+  }
+  return objectUrlCache.get(`${item.id}:media`) || '';
+}
+
+export function preloadPhoto(item, { size = 2048, getAccessToken = null, getApiKey = null } = {}) {
+  if (!item || item.isDemo || (item.mimeType && item.mimeType.startsWith('video/'))) return;
+  if (objectUrlCache.has(`${item.id}:${size}`)) return;
+  loadQueue.enqueue(() => resolveImageSrc(item, size, getAccessToken, getApiKey)).catch(() => {});
+}
+
 export function loadPhotoIntoElement(imgEl, item, options = {}) {
   const {
     size = 600,
@@ -229,6 +245,15 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
     imgEl.closest('.photo-card')?.classList.add('has-img');
     if (onLoaded) onLoaded();
     return;
+  }
+
+  if (!imgEl.getAttribute('src')) {
+    const instant = getInstantCachedSrc(item, [size, 480, 600]);
+    if (instant) {
+      imgEl.referrerPolicy = 'no-referrer';
+      imgEl.src = instant;
+      imgEl.classList.add('is-loaded');
+    }
   }
 
   const runLoad = () => {

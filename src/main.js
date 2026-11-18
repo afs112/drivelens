@@ -18,11 +18,12 @@ import {
 import {
   bindHeaderEvents,
   bindMobileNavEvents,
+  dismissHeaderOverlay,
   renderHeader,
   renderMobileNav,
 } from './ui/renderHeader.js';
 import { bindInspectorEvents, renderInspector } from './ui/renderInspector.js';
-import { bindLightboxEvents, renderLightbox } from './ui/renderLightbox.js';
+import { bindLightboxEvents, dismissLightboxPopover, renderLightbox, toggleLightboxInfo } from './ui/renderLightbox.js';
 import { bindModalEvents, renderModals } from './ui/renderModals.js';
 import { bindSidebarEvents, renderSidebar } from './ui/renderSidebar.js';
 
@@ -43,20 +44,6 @@ const mobileNavBar = document.getElementById('mobileNavBar');
 
 const store = new Store();
 
-// Collapse side drawers initially on compact viewports so they don't cover the gallery
-if (window.innerWidth <= 860) {
-  store.state = {
-    ...store.state,
-    sidebarCollapsed: true,
-    inspectorOpen: false,
-  };
-} else if (window.innerWidth <= 1120) {
-  store.state = {
-    ...store.state,
-    inspectorOpen: false,
-  };
-}
-
 function renderAll() {
   const visiblePhotos = store.getVisiblePhotos();
   renderHeader(topHeader, demoBanner, toastContainer, store);
@@ -71,9 +58,7 @@ function renderAll() {
   renderMobileNav(mobileNavBar, store);
 
   if (drawerBackdrop) {
-    const showBackdrop =
-      Boolean(store.state.sidebarOpen) ||
-      (window.innerWidth <= 1120 && Boolean(store.state.inspectorOpen));
+    const showBackdrop = store.state.sidebarOpen || store.state.inspectorOpen;
     drawerBackdrop.classList.toggle('visible', showBackdrop);
   }
 }
@@ -89,10 +74,7 @@ bindModalEvents(modalRoot, store);
 
 if (drawerBackdrop) {
   drawerBackdrop.addEventListener('click', () => {
-    store.setState({
-      sidebarOpen: false,
-      ...(window.innerWidth <= 1120 ? { inspectorOpen: false } : {}),
-    });
+    store.setState({ sidebarOpen: false, inspectorOpen: false });
   });
 }
 
@@ -235,9 +217,7 @@ window.addEventListener('keydown', (event) => {
       store.closeModal();
       return;
     }
-    if (isEditableTarget(event.target)) {
-      return;
-    }
+    if (event.isComposing) return;
     if (isCompareOpen()) {
       event.preventDefault();
       closeCompare(store);
@@ -245,15 +225,20 @@ window.addEventListener('keydown', (event) => {
     }
     if (store.state.lightboxPhotoId) {
       event.preventDefault();
-      store.closeLightbox();
+      if (!dismissLightboxPopover(lightboxRoot)) store.closeLightbox();
       return;
     }
+    if (dismissHeaderOverlay(topHeader, store)) {
+      event.preventDefault();
+      return;
+    }
+    if (isEditableTarget(event.target)) return;
     if (store.state.sidebarOpen) {
       event.preventDefault();
       store.setState({ sidebarOpen: false });
       return;
     }
-    if (window.innerWidth <= 1120 && store.state.inspectorOpen) {
+    if (store.state.inspectorOpen) {
       event.preventDefault();
       store.setState({ inspectorOpen: false });
       return;
@@ -317,7 +302,11 @@ window.addEventListener('keydown', (event) => {
 
   if (lower === 'i') {
     event.preventDefault();
-    store.setState({ inspectorOpen: !store.state.inspectorOpen });
+    if (store.state.lightboxPhotoId) {
+      toggleLightboxInfo(lightboxRoot);
+    } else {
+      store.setState({ inspectorOpen: !store.state.inspectorOpen, sidebarOpen: false });
+    }
     return;
   }
 

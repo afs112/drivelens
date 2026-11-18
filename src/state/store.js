@@ -150,7 +150,7 @@ function loadUiPrefs() {
     const parsed = raw ? JSON.parse(raw) : {};
     const layoutMode = VALID_LAYOUT_MODES.includes(parsed?.layoutMode)
       ? parsed.layoutMode
-      : 'justified';
+      : 'waterfall';
     const rawHeight = Number(parsed?.rowHeight || 210);
     const rowHeight = Number.isFinite(rawHeight)
       ? Math.max(130, Math.min(320, Math.round(rawHeight)))
@@ -160,7 +160,7 @@ function loadUiPrefs() {
     return { layoutMode, rowHeight, sortBy, includeSubfolders };
   } catch {
     return {
-      layoutMode: 'justified',
+      layoutMode: 'waterfall',
       rowHeight: 210,
       sortBy: 'dateDesc',
       includeSubfolders: true,
@@ -265,9 +265,8 @@ export class Store {
       focusedPhotoId: null,
       lightboxPhotoId: null,
       lightboxZoom: 1,
-      inspectorOpen: true,
+      inspectorOpen: false,
       sidebarOpen: false,
-      sidebarCollapsed: false,
       theme: getInitialTheme(),
       recentAlbums: loadRecentAlbums(),
       modal: null,

@@ -57,6 +57,7 @@ export function renderInspector(container, store) {
   if (!container) return;
   const state = store.state;
   container.classList.toggle('collapsed', !state.inspectorOpen);
+  container.inert = !state.inspectorOpen;
   if (!state.inspectorOpen) return;
 
   // Preserve typing focus if user is actively editing #myNoteInput for the same photo

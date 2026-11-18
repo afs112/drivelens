@@ -1,9 +1,16 @@
 import { getLocaleTag, t } from '../i18n.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
+import { previewGalleryRowHeight } from './renderGallery.js';
 
 const objRefIds = new WeakMap();
 let nextObjRefId = 1;
 let lastSidebarSignature = '';
+
+const LAYOUT_INDEX_MAP = {
+  justified: 0,
+  waterfall: 1,
+  grid: 2,
+};
 
 function getRefId(obj) {
   if (!obj || typeof obj !== 'object') return 0;
@@ -156,12 +163,38 @@ function renderTagManager(store, state) {
   return html;
 }
 
+function updateThumbnailSlider(slider) {
+  const min = Number(slider.min);
+  const max = Number(slider.max);
+  const progress = (slider.valueAsNumber - min) / (max - min);
+  slider.style.setProperty('--thumbnail-progress', `${progress * 100}%`);
+}
+
 export function renderSidebar(container, store) {
   if (!container) return;
   const state = store.state;
-  const isCollapsed = Boolean(state.sidebarCollapsed) && !state.sidebarOpen;
+  const isCollapsed = !state.sidebarOpen;
   container.classList.toggle('collapsed', isCollapsed);
+  container.inert = isCollapsed;
   if (isCollapsed && container.childElementCount > 0) return;
+
+  const sideRange = container.querySelector('#sidebarRowHeightRange');
+  if (sideRange) {
+    const hStr = String(state.rowHeight || 210);
+    if (sideRange.value !== hStr) sideRange.value = hStr;
+    updateThumbnailSlider(sideRange);
+  }
+
+  const layoutIndex = String(LAYOUT_INDEX_MAP[state.layoutMode] ?? 1);
+  const sideLayoutSeg = container.querySelector('[data-sidebar-layout-seg]');
+  if (sideLayoutSeg) {
+    sideLayoutSeg.style.setProperty('--seg-index', layoutIndex);
+    for (const btn of sideLayoutSeg.querySelectorAll('[data-action="set-layout"]')) {
+      const active = btn.dataset.layout === state.layoutMode;
+      btn.classList.toggle('active', active);
+      btn.setAttribute('aria-pressed', String(active));
+    }
+  }
 
   const selectedTagsKey =
     state.selectedTagIds && state.selectedTagIds.size > 0
@@ -175,7 +208,7 @@ export function renderSidebar(container, store) {
     state.activeFolderId || '',
     state.includeSubfolders ? 1 : 0,
     state.quickView,
-    state.layoutMode,
+    state.sortBy,
     state.minRating,
     state.ratingScope,
     state.memberFilterId || '',
@@ -239,16 +272,45 @@ export function renderSidebar(container, store) {
         <div class="sidebar-section-header">
           <span>${escapeHtml(t('sidebar.viewLayout'))}</span>
         </div>
-        <div class="segmented" style="margin:0 4px">
-          <button type="button" class="seg-btn ${state.layoutMode === 'justified' ? 'active' : ''}" data-action="set-layout" data-layout="justified">
-            ${icon('rows', 12)} <span>${escapeHtml(t('sidebar.viewJustified'))}</span>
+        <div class="segmented segmented-sliding" data-sidebar-layout-seg role="group" aria-label="${escapeAttr(t('sidebar.viewLayout'))}" style="margin:0 4px;--seg-index:${layoutIndex}">
+          <button type="button" class="seg-btn ${state.layoutMode === 'justified' ? 'active' : ''}" data-action="set-layout" data-layout="justified" title="${escapeAttr(t('header.layoutJustified'))}" aria-label="${escapeAttr(t('sidebar.viewJustified'))}" aria-pressed="${state.layoutMode === 'justified'}">
+            ${icon('rows', 16)}
           </button>
-          <button type="button" class="seg-btn ${state.layoutMode === 'waterfall' ? 'active' : ''}" data-action="set-layout" data-layout="waterfall">
-            ${icon('waterfall', 12)} <span>${escapeHtml(t('sidebar.viewWaterfall'))}</span>
+          <button type="button" class="seg-btn ${state.layoutMode === 'waterfall' ? 'active' : ''}" data-action="set-layout" data-layout="waterfall" title="${escapeAttr(t('header.layoutWaterfall'))}" aria-label="${escapeAttr(t('sidebar.viewWaterfall'))}" aria-pressed="${state.layoutMode === 'waterfall'}">
+            ${icon('waterfall', 16)}
           </button>
-          <button type="button" class="seg-btn ${state.layoutMode === 'grid' ? 'active' : ''}" data-action="set-layout" data-layout="grid">
-            ${icon('grid', 12)} <span>${escapeHtml(t('sidebar.viewGrid'))}</span>
+          <button type="button" class="seg-btn ${state.layoutMode === 'grid' ? 'active' : ''}" data-action="set-layout" data-layout="grid" title="${escapeAttr(t('header.layoutGrid'))}" aria-label="${escapeAttr(t('sidebar.viewGrid'))}" aria-pressed="${state.layoutMode === 'grid'}">
+            ${icon('grid', 16)}
           </button>
+        </div>
+        <div class="sidebar-display-tools">
+          <label class="sidebar-control sidebar-thumbnail-control">
+            ${icon('image', 15)}
+            <input
+              id="sidebarRowHeightRange"
+              type="range"
+              min="130"
+              max="320"
+              step="4"
+              value="${escapeAttr(String(state.rowHeight || 210))}"
+              title="${escapeAttr(t('header.thumbSize'))}"
+              aria-label="${escapeAttr(t('header.thumbSize'))}"
+            />
+          </label>
+          <button type="button" class="btn btn-icon sidebar-control sidebar-export" data-action="open-export" title="${escapeAttr(t('header.exportTooltip'))}" aria-label="${escapeAttr(t('header.exportBtn'))}">
+            ${icon('shareUp', 18)}
+          </button>
+        </div>
+        <div class="sidebar-control sidebar-sort-control">
+          ${icon('sort', 15, 'sidebar-sort-icon')}
+          <select id="sidebarSortSelect" aria-label="${escapeAttr(t('gallery.sortTitle'))}">
+            <option value="dateDesc" ${state.sortBy === 'dateDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateDesc'))}</option>
+            <option value="dateAsc" ${state.sortBy === 'dateAsc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortDateAsc'))}</option>
+            <option value="ratingDesc" ${state.sortBy === 'ratingDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortRatingDesc'))}</option>
+            <option value="nameAsc" ${state.sortBy === 'nameAsc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortNameAsc'))}</option>
+            <option value="sizeDesc" ${state.sortBy === 'sizeDesc' ? 'selected' : ''}>${escapeHtml(t('gallery.sortSizeDesc'))}</option>
+          </select>
+          ${icon('chevronDown', 14, 'sidebar-sort-chevron')}
         </div>
       </div>
 
@@ -257,12 +319,12 @@ export function renderSidebar(container, store) {
         <div class="sidebar-section-header">
           <span>${escapeHtml(t('sidebar.folders'))}</span>
         </div>
-        <div class="subfolder-toggle">
-          <label class="switch-label">
-            <input type="checkbox" id="toggleSubfoldersCheck" ${state.includeSubfolders ? 'checked' : ''} />
-            <span>${escapeHtml(t('sidebar.includeSubfolders'))}</span>
-          </label>
-        </div>
+        <label class="sidebar-control subfolder-toggle">
+          ${icon('folderOpen', 15)}
+          <span class="subfolder-label">${escapeHtml(t('sidebar.includeSubfolders'))}</span>
+          <input type="checkbox" role="switch" class="sr-only" id="toggleSubfoldersCheck" ${state.includeSubfolders ? 'checked' : ''} />
+          <span class="subfolder-switch" aria-hidden="true"></span>
+        </label>
         <div class="folder-tree">
           ${renderFolderTree(store, state)}
         </div>
@@ -354,14 +416,31 @@ export function renderSidebar(container, store) {
       </div>
     </div>
   `;
+  updateThumbnailSlider(container.querySelector('#sidebarRowHeightRange'));
 }
 
 export function bindSidebarEvents(container, store) {
   if (!container) return;
 
+  container.addEventListener('input', (e) => {
+    if (e.target.id === 'sidebarRowHeightRange') {
+      updateThumbnailSlider(e.target);
+      previewGalleryRowHeight(
+        document.getElementById('galleryGrid'),
+        document.getElementById('galleryScroll'),
+        store,
+        Number(e.target.value)
+      );
+    }
+  });
+
   container.addEventListener('change', (e) => {
     if (e.target.id === 'toggleSubfoldersCheck') {
       store.setIncludeSubfolders(e.target.checked);
+    } else if (e.target.id === 'sidebarRowHeightRange') {
+      store.setRowHeight(Number(e.target.value));
+    } else if (e.target.id === 'sidebarSortSelect') {
+      store.setSortBy(e.target.value);
     }
   });
 
@@ -374,11 +453,13 @@ export function bindSidebarEvents(container, store) {
       store.setState({ sidebarOpen: false });
       return;
     }
+    if (action === 'open-export') {
+      store.setState({ sidebarOpen: false });
+      store.openModal('export');
+      return;
+    }
     if (action === 'set-layout') {
       store.setLayoutMode(target.dataset.layout);
-      if (window.innerWidth <= 860 && store.state.sidebarOpen) {
-        store.setState({ sidebarOpen: false });
-      }
       return;
     }
     if (action === 'select-folder') {
