@@ -1265,6 +1265,46 @@
   }
 }
 
+@media (max-width: 768px) {
+  .app-shell {
+    width: 100%;
+    min-height: 100dvh;
+  }
+}
+
+/* Native Document Scroll Mode for iOS/iPadOS Safari Browser Tabs */
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .app-shell {
+  height: auto;
+  min-height: 100vh;
+  min-height: 100lvh;
+  width: 100%;
+}
+
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .workspace,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .gallery-stage,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .gallery-scroll {
+  height: auto;
+  min-height: 100vh;
+  min-height: 100lvh;
+  overflow: visible;
+  contain: none;
+}
+
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .top-header,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .gallery-subbar,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .batch-bar,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .sidebar,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .inspector,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .drawer-backdrop,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .demo-banner {
+  position: fixed;
+}
+
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .mobile-nav-bar {
+  position: fixed;
+  bottom: calc(10px + var(--safe-bottom));
+}
+
 @media (prefers-reduced-motion: reduce) {
   .top-header,
   .header-more-popover,

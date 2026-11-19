@@ -58,6 +58,7 @@ Best when photos must stay private to invited Google accounts, or when multiple 
      https://afs112.github.io
      ```
      *(Origin only—do **not** include `/drivelens` or a trailing `/`!)*
+   - **Mobile / iOS PWA / In-App Browsers**: DriveLens opens Google OAuth synchronously on tap for mobile Safari/Chrome; if your mobile browser, installed PWA, or in-app WebView blocks popups completely, tap **Redirect Sign-In (No Popup)** in the Connect modal. To enable **Redirect Sign-In**, also add your exact app page URL (e.g. `https://afs112.github.io/drivelens/` — with trailing `/`) under **Authorized redirect URIs** in Google Cloud Console (and if using a Cloudflare Renewal Worker, ensure your Worker uses the latest [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js)).
 4. **Connect & share 1-click album link**:
    - Copy the generated **Client ID** (`<YOUR_CLIENT_ID>.apps.googleusercontent.com`).
    - Open **[https://afs112.github.io/drivelens/](https://afs112.github.io/drivelens/)**, switch to the **OAuth Account Sign-In** tab, paste your **Folder Link/ID** and **Client ID**, and click **Authorize & Open Album**.
@@ -91,7 +92,7 @@ For users who want native-app-style **sign in once for months** with zero popups
 #### Step 1: Google Cloud Console Setup
 
 1. Open your Web OAuth Client in [Google Cloud Console](https://console.cloud.google.com/) (**APIs & Services → Credentials**) and copy its **Client Secret** (`<YOUR_OAUTH_CLIENT_SECRET>` — **keep it strictly private and NEVER commit it to GitHub!**).
-2. Ensure your site origin (`https://afs112.github.io` or `https://<your-username>.github.io`) is listed under **Authorized JavaScript origins**. Google's popup code flow automatically uses `postmessage`, so no extra redirect URI is needed (you can leave **Authorized redirect URIs** empty).
+2. Ensure your site origin (`https://afs112.github.io` or `https://<your-username>.github.io`) is listed under **Authorized JavaScript origins**. Google's popup code flow automatically uses `postmessage`, so no extra redirect URI is needed for popup mode (you can leave **Authorized redirect URIs** empty). *(For **Mobile / iOS PWA / In-App Browsers**: DriveLens opens Google OAuth synchronously on tap for mobile Safari/Chrome; if your browser, installed PWA, or in-app WebView blocks popups completely, tap **Redirect Sign-In (No Popup)** in the Connect modal, add your exact app page URL such as `https://afs112.github.io/drivelens/` — with trailing `/` — under **Authorized redirect URIs**, and ensure your Worker uses the latest [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js).)*
 3. *(Important Google Tip)*: Under **OAuth consent screen / Audience**, if **Publishing status** is **Testing**, Google forces refresh tokens to expire every **7 days**. Click **Publish App** (free; for personal or small-group unverified apps, users simply click *"Advanced → Go to ... (unsafe)"* once on first sign-in, and the refresh token lasts for months instead of 7 days!).
 
 #### Step 2: Deploy [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js) to Cloudflare Workers (Free Tier: 100k req/day)
@@ -105,7 +106,8 @@ For users who want native-app-style **sign in once for months** with zero popups
    - Add **Text Variable**: Name = `ALLOWED_ORIGINS`, Value = `https://afs112.github.io` *(comma-separated if adding `http://localhost:5173` or your own fork origin)*.
    - *(Optional Extra Security)* Add **Secret**: Name = `TICKET_ENC_KEY`, Value = `<ANY_RANDOM_32_CHAR_PASSPHRASE>` *(encrypts the Google refresh token with `AES-256-GCM` so the browser only ever holds an opaque encrypted ticket!)*.
    - *(Optional)* Add **Text Variable**: Name = `ALLOWED_CLIENT_IDS`, Value = `<YOUR_CLIENT_ID>.apps.googleusercontent.com`.
-4. Test your Worker by opening `https://<your-worker>.<your-subdomain>.workers.dev/health` in your browser—it should return `{"ok":true,"service":"drivelens-oauth-renewal",...}`.
+   - **Important**: Remember to click **Deploy** after saving Variables and Secrets in Cloudflare Dashboard so the new secret bindings take effect!
+4. Test your Worker by opening `https://<your-worker>.workers.dev/health` (or `https://<your-worker>.<your-subdomain>.workers.dev/health`) in your browser—it should return `"hasClientSecret": true` (e.g. `{"ok":true,"service":"drivelens-oauth-renewal","hasClientSecret":true,...}`) once `GOOGLE_CLIENT_SECRET` is properly saved **and deployed**. *(`server_misconfigured` troubleshooting tip: if sign-in fails with `server_misconfigured` or `/health` shows `"hasClientSecret": false`, check that `GOOGLE_CLIENT_SECRET` is saved as a Secret and click **Deploy** in Cloudflare Dashboard.)*
 
 #### Step 3: Connect in DriveLens
 

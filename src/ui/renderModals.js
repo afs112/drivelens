@@ -1,3 +1,4 @@
+import { ensureGoogleIdentityLoaded, getCleanOAuthRedirectUri } from '../api/gdrive.js';
 import { APP_CONFIG } from '../constants.js';
 import { t } from '../i18n.js';
 import { getTagColors } from '../state/store.js';
@@ -59,6 +60,8 @@ export function renderModals(container, store) {
   }
 
   if (modal.type === 'connect') {
+    ensureGoogleIdentityLoaded().catch(() => {});
+    const redirectUriPreview = getCleanOAuthRedirectUri();
     if (!connectTab) {
       connectTab = store.state.authType === 'oauth' ? 'oauth' : 'apikey';
     }
@@ -217,6 +220,7 @@ export function renderModals(container, store) {
               </div>
               <div style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
                 <button type="button" class="btn btn-ghost" data-modal-close="true">${escapeHtml(t('modal.cancel'))}</button>
+                <button type="button" class="btn" data-action="oauth-redirect" title="${escapeAttr(t('modal.redirectAuthHint', { uri: redirectUriPreview }))}">${icon('externalLink', 13)} ${escapeHtml(t('modal.redirectAuthBtn'))}</button>
                 <button type="submit" class="btn btn-primary">${icon('cloud', 14)} ${escapeHtml(t('modal.connectOAuthSubmit'))}</button>
               </div>
             </div>
@@ -558,6 +562,22 @@ export function bindModalEvents(container, store) {
       if (cInput && cid) cInput.value = cid;
       if (apiFolderInput) apiFolderInput.value = fid;
       if (apiKeyInput && akey) apiKeyInput.value = akey;
+      return;
+    }
+
+    if (e.target.closest('[data-action="oauth-redirect"]')) {
+      const clientId = container.querySelector('#clientIdInput')?.value || '';
+      const folderInput = container.querySelector('#folderUrlInput')?.value || '';
+      const tokenRenewalUrl = container.querySelector('#tokenRenewalUrlInput')?.value || '';
+      const rememberCredentials = Boolean(
+        container.querySelector('#rememberOAuthCheck')?.checked
+      );
+      store.startRedirectGoogleDrive({
+        clientId,
+        folderInput,
+        tokenRenewalUrl,
+        rememberCredentials,
+      });
       return;
     }
 

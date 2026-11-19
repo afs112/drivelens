@@ -9,6 +9,8 @@ const DRIVE_API = 'https://www.googleapis.com/drive/v3';
 const SESSION_KEY = 'drivelens_session_v1';
 const SAVED_USER_KEY = 'drivelens_oauth_user_v1';
 const RENEWAL_TICKET_KEY = 'drivelens_oauth_renewal_v1';
+const REDIRECT_PENDING_KEY = 'drivelens_oauth_redirect_pending_v1';
+const REDIRECT_PENDING_TTL_MS = 15 * 60 * 1000;
 const SCOPES = [
   'https://www.googleapis.com/auth/drive',
   'https://www.googleapis.com/auth/userinfo.profile',
@@ -466,6 +468,23 @@ export async function renewOAuthSessionSilently(
   return inFlightRenewalPromise;
 }
 
+function buildGisPopupError(err) {
+  const errType = String(err?.type || '');
+  const isClosed = errType === 'popup_closed';
+  const msg = isClosed
+    ? t('gdrive.popupClosed')
+    : errType === 'popup_failed_to_open'
+      ? t('gdrive.popupBlocked')
+      : err?.message || t('gdrive.popupBlocked');
+  const customErr = new Error(msg);
+  if (errType) customErr.oauthError = errType;
+  customErr.isPopupBlocked =
+    !isClosed &&
+    (errType === 'popup_failed_to_open' ||
+      /popup/i.test(String(err?.type || err?.message || '')));
+  return customErr;
+}
+
 function requestTokenViaGis(trimmedClientId, promptMode, hintVal) {
   return new Promise((resolve, reject) => {
     try {
@@ -489,7 +508,7 @@ function requestTokenViaGis(trimmedClientId, promptMode, hintVal) {
           resolve(response);
         },
         error_callback: (err) => {
-          reject(new Error(err?.message || t('gdrive.popupBlocked')));
+          reject(buildGisPopupError(err));
         },
       });
       client.requestAccessToken({
@@ -513,17 +532,17 @@ function requestCodeViaGis(trimmedClientId, promptMode, hintVal) {
         ...(hintVal ? { hint: hintVal } : {}),
         callback: (response) => {
           if (!response || response.error || !response.code) {
-            reject(
-              new Error(
-                response?.error_description || response?.error || t('gdrive.authFailed')
-              )
+            const err = new Error(
+              response?.error_description || response?.error || t('gdrive.authFailed')
             );
+            if (response?.error) err.oauthError = response.error;
+            reject(err);
             return;
           }
           resolve(response);
         },
         error_callback: (err) => {
-          reject(new Error(err?.message || t('gdrive.popupBlocked')));
+          reject(buildGisPopupError(err));
         },
       });
       codeClient.requestCode();
@@ -533,114 +552,379 @@ function requestCodeViaGis(trimmedClientId, promptMode, hintVal) {
   });
 }
 
-export async function authenticateGoogle(clientId, options = {}) {
+async function finalizeTokenSession({
+  clientId,
+  accessToken,
+  expiresInSec,
+  remember = true,
+  hasSilentRenewal = false,
+  clearRenewal = false,
+}) {
+  const expiresAt = Date.now() + Number(expiresInSec || 3600) * 1000;
+  const user = await fetchUserProfile(accessToken);
+  const session = { clientId, accessToken, expiresAt, user };
+  if (remember === false) {
+    clearSession({ forgetUser: true, clearRenewal });
+  }
+  persistOAuthSession(session, remember);
+  return {
+    ...session,
+    hasSilentRenewal,
+  };
+}
+
+async function exchangeCodeForSession({
+  code,
+  clientId,
+  renewalUrl,
+  redirectUri = 'postmessage',
+  remember = true,
+}) {
+  const exchangeResp = await fetch(`${renewalUrl}/exchange`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      code,
+      client_id: clientId,
+      redirect_uri: redirectUri,
+    }),
+  });
+  const exchangeData = await exchangeResp.json().catch(() => null);
+  if (!exchangeResp.ok || !exchangeData?.access_token) {
+    throw new Error(
+      exchangeData?.error_description || exchangeData?.error || t('gdrive.authFailed')
+    );
+  }
+
+  const incomingTicket = String(
+    exchangeData.refresh_ticket || exchangeData.refresh_token || ''
+  ).trim();
+  const existingTicket =
+    getStoredRenewalTicketRecord(clientId, renewalUrl)?.refreshTicket || '';
+  const savedTicket = incomingTicket || existingTicket;
+
+  const session = await finalizeTokenSession({
+    clientId,
+    accessToken: exchangeData.access_token,
+    expiresInSec: exchangeData.expires_in,
+    remember,
+    hasSilentRenewal: Boolean(savedTicket),
+    clearRenewal: true,
+  });
+
+  if (savedTicket) {
+    saveRenewalTicketRecord(
+      {
+        clientId,
+        renewalUrl,
+        refreshTicket: savedTicket,
+      },
+      remember
+    );
+  }
+  return session;
+}
+
+export function authenticateGoogle(clientId, options = {}) {
   const {
     prompt = 'select_account',
     loginHint = '',
     remember = true,
     tokenRenewalUrl = '',
+    allowSilentFirst = false,
   } = options;
+  const trimmedClientId = String(clientId || '').trim();
+  if (!trimmedClientId) {
+    return Promise.reject(new Error(t('gdrive.missingClientId')));
+  }
+
+  const cleanRenewalUrl = normalizeRenewalEndpoint(tokenRenewalUrl);
+  const hintVal = String(loginHint || getSavedOAuthUser(trimmedClientId)?.email || '').trim();
+
+  const launchGisSync = () => {
+    if (
+      cleanRenewalUrl &&
+      typeof window.google?.accounts?.oauth2?.initCodeClient === 'function'
+    ) {
+      return requestCodeViaGis(trimmedClientId, prompt, hintVal).then((codeResp) =>
+        exchangeCodeForSession({
+          code: codeResp.code,
+          clientId: trimmedClientId,
+          renewalUrl: cleanRenewalUrl,
+          redirectUri: 'postmessage',
+          remember,
+        })
+      );
+    }
+
+    // Path A: Pure-Static Page (or fallback when only initTokenClient is mocked)
+    return requestTokenViaGis(trimmedClientId, prompt, hintVal)
+      .catch((err) => {
+        const canRetryPopup =
+          typeof navigator === 'undefined' ||
+          !navigator.userActivation ||
+          navigator.userActivation.isActive;
+        if (prompt === '' && FALLBACK_OAUTH_PROMPTS.has(err?.oauthError)) {
+          if (canRetryPopup) {
+            return requestTokenViaGis(trimmedClientId, 'select_account', hintVal);
+          }
+          const retryErr = new Error(t('toast.reauthToSync'));
+          retryErr.oauthError = err.oauthError;
+          throw retryErr;
+        }
+        throw err;
+      })
+      .then((tokenResult) =>
+        finalizeTokenSession({
+          clientId: trimmedClientId,
+          accessToken: tokenResult.access_token,
+          expiresInSec: tokenResult.expires_in,
+          remember,
+          hasSilentRenewal: false,
+          clearRenewal: false,
+        })
+      );
+  };
+
+  // Synchronous zero-await path: preserve Transient User Activation on mobile browsers
+  if (!allowSilentFirst && window.google?.accounts?.oauth2) {
+    return launchGisSync();
+  }
+
+  return (async () => {
+    // Path B: Optional Renewal Endpoint (silent refresh first when allowed)
+    if (
+      allowSilentFirst &&
+      cleanRenewalUrl &&
+      prompt !== 'select_account' &&
+      prompt !== 'consent' &&
+      hasStoredRenewalTicket(trimmedClientId, cleanRenewalUrl)
+    ) {
+      const silent = await renewOAuthSessionSilently(trimmedClientId, cleanRenewalUrl, {
+        remember,
+      });
+      if (silent) return silent;
+    }
+
+    await ensureGoogleIdentityLoaded();
+    return launchGisSync();
+  })();
+}
+
+export function getCleanOAuthRedirectUri() {
+  if (typeof window === 'undefined' || !window.location) return '';
+  return `${window.location.origin}${window.location.pathname}`;
+}
+
+function generateOAuthState() {
+  try {
+    if (typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+    }
+  } catch {
+    // Fallback below
+  }
+  return `${Math.random().toString(36).slice(2)}${Date.now().toString(36)}`;
+}
+
+function writePendingRedirectRecord(payload) {
+  const raw = JSON.stringify(payload);
+  for (const storage of [
+    typeof sessionStorage !== 'undefined' ? sessionStorage : null,
+    typeof localStorage !== 'undefined' ? localStorage : null,
+  ]) {
+    try {
+      storage?.setItem(REDIRECT_PENDING_KEY, raw);
+    } catch {
+      // Ignore storage restrictions
+    }
+  }
+}
+
+function clearPendingRedirectRecord() {
+  for (const storage of [
+    typeof sessionStorage !== 'undefined' ? sessionStorage : null,
+    typeof localStorage !== 'undefined' ? localStorage : null,
+  ]) {
+    try {
+      storage?.removeItem(REDIRECT_PENDING_KEY);
+    } catch {
+      // Ignore storage restrictions
+    }
+  }
+}
+
+function readPendingRedirectRecord(expectedState) {
+  const now = Date.now();
+  for (const storage of [
+    typeof sessionStorage !== 'undefined' ? sessionStorage : null,
+    typeof localStorage !== 'undefined' ? localStorage : null,
+  ]) {
+    try {
+      const raw = storage?.getItem(REDIRECT_PENDING_KEY);
+      if (!raw) continue;
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== 'object') continue;
+      const age = now - Number(parsed.savedAt || 0);
+      if (age < 0 || age > REDIRECT_PENDING_TTL_MS) {
+        clearPendingRedirectRecord();
+        continue;
+      }
+      if (expectedState && parsed.state === expectedState && parsed.clientId) {
+        return parsed;
+      }
+    } catch {
+      // Ignore malformed storage
+    }
+  }
+  return null;
+}
+
+export function startOAuthRedirectFlow({
+  clientId,
+  folderId,
+  tokenRenewalUrl = '',
+  remember = true,
+  loginHint = '',
+}) {
   const trimmedClientId = String(clientId || '').trim();
   if (!trimmedClientId) {
     throw new Error(t('gdrive.missingClientId'));
   }
-
+  const cleanFolderId = parseDriveFolderId(folderId) || String(folderId || '').trim();
   const cleanRenewalUrl = normalizeRenewalEndpoint(tokenRenewalUrl);
+  const redirectUri = getCleanOAuthRedirectUri();
+  const state = generateOAuthState();
 
-  // Path B: Optional Renewal Endpoint (silent refresh first, else auth code exchange)
-  if (
-    cleanRenewalUrl &&
-    prompt !== 'select_account' &&
-    prompt !== 'consent' &&
-    hasStoredRenewalTicket(trimmedClientId, cleanRenewalUrl)
-  ) {
-    const silent = await renewOAuthSessionSilently(trimmedClientId, cleanRenewalUrl, {
-      remember,
-    });
-    if (silent) return silent;
-  }
-
-  await ensureGoogleIdentityLoaded();
+  writePendingRedirectRecord({
+    state,
+    clientId: trimmedClientId,
+    folderId: cleanFolderId,
+    tokenRenewalUrl: cleanRenewalUrl,
+    remember: remember !== false,
+    savedAt: Date.now(),
+  });
 
   const hintVal = String(loginHint || getSavedOAuthUser(trimmedClientId)?.email || '').trim();
+  const params = new URLSearchParams({
+    client_id: trimmedClientId,
+    redirect_uri: redirectUri,
+    scope: SCOPES,
+    include_granted_scopes: 'true',
+    state,
+  });
+  if (cleanRenewalUrl) {
+    params.set('response_type', 'code');
+    params.set('access_type', 'offline');
+    params.set('prompt', 'consent');
+  } else {
+    params.set('response_type', 'token');
+  }
+  if (hintVal) {
+    params.set('login_hint', hintVal);
+  }
 
-  if (
-    cleanRenewalUrl &&
-    typeof window.google?.accounts?.oauth2?.initCodeClient === 'function'
-  ) {
-    const codeResp = await requestCodeViaGis(trimmedClientId, prompt, hintVal);
-    const exchangeResp = await fetch(`${cleanRenewalUrl}/exchange`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        code: codeResp.code,
-        client_id: trimmedClientId,
-      }),
+  window.location.assign(`https://accounts.google.com/o/oauth2/v2/auth?${params.toString()}`);
+}
+
+export async function consumeOAuthRedirectCallback() {
+  if (typeof window === 'undefined' || !window.location) return null;
+
+  const searchParams = new URLSearchParams(window.location.search || '');
+  const rawHash = window.location.hash || '';
+  const hashBody = rawHash.startsWith('#') ? rawHash.slice(1) : rawHash;
+  const hashParams = new URLSearchParams(hashBody);
+
+  const code = (searchParams.get('code') || '').trim();
+  const accessToken = (hashParams.get('access_token') || '').trim();
+  const oauthError = (searchParams.get('error') || hashParams.get('error') || '').trim();
+  const oauthErrorDesc = (
+    searchParams.get('error_description') ||
+    hashParams.get('error_description') ||
+    ''
+  ).trim();
+  const incomingState = (searchParams.get('state') || hashParams.get('state') || '').trim();
+
+  if ((!code && !accessToken && !oauthError) || !incomingState) {
+    return null;
+  }
+
+  const pending = readPendingRedirectRecord(incomingState);
+  if (!pending) {
+    return null;
+  }
+
+  clearPendingRedirectRecord();
+
+  const oauthParamKeys = [
+    'code',
+    'scope',
+    'authuser',
+    'prompt',
+    'state',
+    'access_token',
+    'token_type',
+    'expires_in',
+    'error',
+    'error_description',
+    'hd',
+  ];
+  for (const key of oauthParamKeys) {
+    searchParams.delete(key);
+    hashParams.delete(key);
+  }
+  const cleanSearch = searchParams.toString();
+  const cleanHash = hashParams.toString();
+  const cleanUrl = `${window.location.pathname}${cleanSearch ? `?${cleanSearch}` : ''}${cleanHash ? `#${cleanHash}` : ''}`;
+  try {
+    window.history.replaceState(null, '', cleanUrl);
+  } catch {
+    // Ignore history restrictions
+  }
+
+  if (oauthError) {
+    const err = new Error(oauthErrorDesc || oauthError || t('gdrive.authFailed'));
+    err.oauthError = oauthError;
+    throw err;
+  }
+
+  const remember = pending.remember !== false;
+  if (code) {
+    if (!pending.tokenRenewalUrl) {
+      throw new Error(t('gdrive.authFailed'));
+    }
+    const session = await exchangeCodeForSession({
+      code,
+      clientId: pending.clientId,
+      renewalUrl: pending.tokenRenewalUrl,
+      redirectUri: getCleanOAuthRedirectUri(),
+      remember,
     });
-    const exchangeData = await exchangeResp.json().catch(() => null);
-    if (!exchangeResp.ok || !exchangeData?.access_token) {
-      throw new Error(
-        exchangeData?.error_description || exchangeData?.error || t('gdrive.authFailed')
-      );
-    }
-
-    const accessToken = exchangeData.access_token;
-    const expiresInSec = Number(exchangeData.expires_in || 3600);
-    const expiresAt = Date.now() + expiresInSec * 1000;
-    const incomingTicket = String(
-      exchangeData.refresh_ticket || exchangeData.refresh_token || ''
-    ).trim();
-    const existingTicket =
-      getStoredRenewalTicketRecord(trimmedClientId, cleanRenewalUrl)?.refreshTicket || '';
-    const savedTicket = incomingTicket || existingTicket;
-    const user = await fetchUserProfile(accessToken);
-
-    const session = { clientId: trimmedClientId, accessToken, expiresAt, user };
-    if (remember === false) {
-      clearSession({ forgetUser: true, clearRenewal: true });
-    }
-    persistOAuthSession(session, remember);
-    if (savedTicket) {
-      saveRenewalTicketRecord(
-        {
-          clientId: trimmedClientId,
-          renewalUrl: cleanRenewalUrl,
-          refreshTicket: savedTicket,
-        },
-        remember
-      );
-    }
     return {
-      ...session,
-      hasSilentRenewal: Boolean(savedTicket),
+      session,
+      folderId: pending.folderId,
+      clientId: pending.clientId,
+      tokenRenewalUrl: pending.tokenRenewalUrl,
+      remember,
     };
   }
 
-  // Path A: Pure-Static Page (or fallback when only initTokenClient is mocked)
-  let tokenResult;
-  try {
-    tokenResult = await requestTokenViaGis(trimmedClientId, prompt, hintVal);
-  } catch (err) {
-    if (prompt === '' && FALLBACK_OAUTH_PROMPTS.has(err?.oauthError)) {
-      tokenResult = await requestTokenViaGis(trimmedClientId, 'select_account', hintVal);
-    } else {
-      throw err;
-    }
-  }
-
-  const accessToken = tokenResult.access_token;
-  const expiresInSec = Number(tokenResult.expires_in || 3600);
-  const expiresAt = Date.now() + expiresInSec * 1000;
-  const user = await fetchUserProfile(accessToken);
-
-  const session = { clientId: trimmedClientId, accessToken, expiresAt, user };
-  if (remember === false) {
-    clearSession({ forgetUser: true });
-  }
-  persistOAuthSession(session, remember);
-  return {
-    ...session,
+  const session = await finalizeTokenSession({
+    clientId: pending.clientId,
+    accessToken,
+    expiresInSec: hashParams.get('expires_in'),
+    remember,
     hasSilentRenewal: false,
+    clearRenewal: false,
+  });
+  return {
+    session,
+    folderId: pending.folderId,
+    clientId: pending.clientId,
+    tokenRenewalUrl: '',
+    remember,
   };
 }
 

@@ -11,6 +11,7 @@ import {
   authenticateGoogle,
   buildDriveWebViewLink,
   clearSession,
+  consumeOAuthRedirectCallback,
   getCachedSession,
   getSavedOAuthUser,
   hasStoredRenewalTicket,
@@ -19,6 +20,7 @@ import {
   normalizeRenewalEndpoint,
   parseDriveFolderId,
   renewOAuthSessionSilently,
+  startOAuthRedirectFlow,
   syncAlbumIncremental,
 } from '../api/gdrive.js';
 import {
@@ -342,6 +344,7 @@ export class Store {
     this._unsyncedSchemaDirty = false;
     this._sessionExpiresAt = 0;
     this._sessionTimer = 0;
+    this._silentRenewalExhausted = false;
 
     const initialLang = setLangCode(getLang());
     const prefs = loadConnectPrefs();
@@ -719,6 +722,7 @@ export class Store {
         return false;
       }
       if (renewed?.accessToken) {
+        this._silentRenewalExhausted = false;
         this.setState(
           {
             accessToken: renewed.accessToken,
@@ -735,6 +739,7 @@ export class Store {
         }
         return true;
       }
+      this._silentRenewalExhausted = true;
     }
 
     if (Date.now() >= this._sessionExpiresAt - 30_000) {
@@ -1174,6 +1179,29 @@ export class Store {
     }, 300);
   }
 
+  _persistOAuthConnectPrefs({ remember, clientId, folderId, tokenRenewalUrl }) {
+    if (remember) {
+      saveConnectPrefs({
+        authType: 'oauth',
+        clientId,
+        folderId,
+        tokenRenewalUrl,
+        rememberCredentials: true,
+        autoConnect: true,
+      });
+    } else {
+      saveConnectPrefs({
+        authType: 'oauth',
+        rememberCredentials: false,
+        autoConnect: false,
+        apiKey: '',
+        clientId: '',
+        folderId: '',
+        tokenRenewalUrl: '',
+      });
+    }
+  }
+
   async connectGoogleDrive({
     clientId,
     folderInput,
@@ -1208,26 +1236,28 @@ export class Store {
     const effectiveHint = loginHint !== undefined ? loginHint : savedHint;
     const effectivePrompt = prompt !== undefined ? prompt : effectiveHint ? '' : 'select_account';
 
-    if (remember) {
-      saveConnectPrefs({
-        authType: 'oauth',
-        clientId: cleanClientId,
-        folderId: cleanFolderId,
-        tokenRenewalUrl: cleanRenewalUrl,
-        rememberCredentials: true,
-        autoConnect: true,
-      });
-    } else {
-      saveConnectPrefs({
-        authType: 'oauth',
-        rememberCredentials: false,
-        autoConnect: false,
-        apiKey: '',
-        clientId: '',
-        folderId: '',
-        tokenRenewalUrl: '',
-      });
+    this._persistOAuthConnectPrefs({
+      remember,
+      clientId: cleanClientId,
+      folderId: cleanFolderId,
+      tokenRenewalUrl: cleanRenewalUrl,
+    });
+
+    let session = reuseSession ? getCachedSession(cleanClientId) : null;
+    if (!remember && !session) {
       clearSession({ forgetUser: true, clearRenewal: true });
+    }
+    const pendingAuthPromise = !session
+      ? authenticateGoogle(cleanClientId, {
+          prompt: effectivePrompt,
+          loginHint: effectiveHint,
+          remember,
+          tokenRenewalUrl: cleanRenewalUrl,
+          allowSilentFirst: false,
+        })
+      : null;
+    if (pendingAuthPromise) {
+      pendingAuthPromise.catch(() => {});
     }
 
     const cachedBeforeAuth = !forceRescan ? await getCachedAlbum('oauth', cleanFolderId) : null;
@@ -1291,16 +1321,11 @@ export class Store {
     }
 
     try {
-      let session = reuseSession ? getCachedSession(cleanClientId) : null;
-      if (!session) {
-        session = await authenticateGoogle(cleanClientId, {
-          prompt: effectivePrompt,
-          loginHint: effectiveHint,
-          remember,
-          tokenRenewalUrl: cleanRenewalUrl,
-        });
+      if (!session && pendingAuthPromise) {
+        session = await pendingAuthPromise;
       }
       if (reqSeq !== this.connectSeq) return false;
+      this._silentRenewalExhausted = false;
 
       const nextSavedUser = remember
         ? getSavedOAuthUser(cleanClientId) || {
@@ -1495,9 +1520,110 @@ export class Store {
       } else {
         this.setState({ loading: false, loadingText: '', backgroundRefreshing: false });
       }
+      if (err?.isPopupBlocked) {
+        this.openModal('connect');
+        this.toast(t('gdrive.popupBlockedRedirectHint'), 'error', 6000);
+      } else {
+        this.toast(err?.message || t('store.connectFailed'), 'error', 5000);
+      }
+      return false;
+    }
+  }
+
+  startRedirectGoogleDrive({
+    clientId,
+    folderInput,
+    tokenRenewalUrl = this.state.tokenRenewalUrl,
+    rememberCredentials = this.state.rememberCredentials,
+  }) {
+    const cleanClientId = String(clientId || '').trim();
+    const cleanFolderId = parseDriveFolderId(folderInput);
+    const cleanRenewalUrl = normalizeRenewalEndpoint(tokenRenewalUrl);
+    const remember = rememberCredentials !== false;
+
+    if (!cleanClientId) {
+      this.toast(t('store.missingClientId'), 'error');
+      return false;
+    }
+    if (!cleanFolderId) {
+      this.toast(t('store.invalidFolder'), 'error');
+      return false;
+    }
+
+    this._persistOAuthConnectPrefs({
+      remember,
+      clientId: cleanClientId,
+      folderId: cleanFolderId,
+      tokenRenewalUrl: cleanRenewalUrl,
+    });
+    if (!remember) {
+      clearSession({ forgetUser: true, clearRenewal: true });
+    }
+
+    const savedHint = getSavedOAuthUser(cleanClientId)?.email || '';
+    startOAuthRedirectFlow({
+      clientId: cleanClientId,
+      folderId: cleanFolderId,
+      tokenRenewalUrl: cleanRenewalUrl,
+      remember,
+      loginHint: savedHint,
+    });
+    return true;
+  }
+
+  async handleOAuthRedirectReturn() {
+    let result = null;
+    try {
+      result = await consumeOAuthRedirectCallback();
+    } catch (err) {
       this.toast(err?.message || t('store.connectFailed'), 'error', 5000);
       return false;
     }
+    if (!result) return false;
+
+    const { session, folderId, clientId, tokenRenewalUrl, remember } = result;
+    this._silentRenewalExhausted = false;
+    if (remember !== false) {
+      saveConnectPrefs({
+        authType: 'oauth',
+        clientId,
+        folderId,
+        tokenRenewalUrl,
+        rememberCredentials: true,
+        autoConnect: true,
+      });
+    }
+    const savedOAuthUser =
+      remember !== false
+        ? getSavedOAuthUser(clientId) || {
+            clientId,
+            id: session.user.id,
+            email: session.user.email,
+            name: session.user.name,
+            picture: session.user.picture,
+            color: session.user.color,
+          }
+        : null;
+
+    this.setState({
+      authType: 'oauth',
+      clientId,
+      folderId,
+      tokenRenewalUrl,
+      rememberCredentials: remember !== false,
+      accessToken: session.accessToken,
+      currentUser: session.user,
+      savedOAuthUser,
+    });
+    this._scheduleSessionLifecycle(session.expiresAt);
+
+    return this.connectGoogleDrive({
+      clientId,
+      folderInput: folderId,
+      tokenRenewalUrl,
+      reuseSession: true,
+      rememberCredentials: remember,
+    });
   }
 
   async connectWithApiKey({
@@ -1890,6 +2016,7 @@ export class Store {
         remember: this.state.rememberCredentials,
       });
       if (reqSeq !== this.connectSeq) return false;
+      this._silentRenewalExhausted = !renewed?.accessToken;
       if (renewed?.accessToken) {
         if (hasUsableCache) {
           this.setState(
@@ -1986,6 +2113,7 @@ export class Store {
           { remember: true }
         );
         if (reqSeq !== this.connectSeq) return false;
+        this._silentRenewalExhausted = !renewed?.accessToken;
         if (renewed?.accessToken) {
           if (hasUsableCache) {
             this.setState(
@@ -2111,6 +2239,7 @@ export class Store {
           { remember: this.state.rememberCredentials }
         );
         if (reqSeq !== this.connectSeq) return false;
+        this._silentRenewalExhausted = !renewed?.accessToken;
         if (renewed?.accessToken) {
           accessToken = renewed.accessToken;
           this.setState(
@@ -3593,33 +3722,52 @@ export class Store {
         return false;
       }
 
-      let session = null;
-      if (
-        this.state.tokenRenewalUrl &&
-        hasStoredRenewalTicket(this.state.clientId, this.state.tokenRenewalUrl)
-      ) {
-        session = await renewOAuthSessionSilently(
-          this.state.clientId,
-          this.state.tokenRenewalUrl,
-          { remember: this.state.rememberCredentials }
-        );
-      }
-
-      if (!session) {
+      const promptInteractiveAuth = async () => {
         try {
-          session = await authenticateGoogle(this.state.clientId, {
+          return await authenticateGoogle(this.state.clientId, {
             prompt: '',
             loginHint:
               this.state.savedOAuthUser?.email || this.state.currentUser?.email || '',
             remember: this.state.rememberCredentials,
             tokenRenewalUrl: this.state.tokenRenewalUrl,
+            allowSilentFirst: false,
           });
         } catch (err) {
           this.openModal('connect');
-          this.toast(err?.message || t('toast.reauthToSync'), 'info');
-          return false;
+          this.toast(
+            err?.isPopupBlocked
+              ? t('gdrive.popupBlockedRedirectHint')
+              : err?.message || t('toast.reauthToSync'),
+            err?.isPopupBlocked ? 'error' : 'info',
+            err?.isPopupBlocked ? 6000 : 3200
+          );
+          return null;
+        }
+      };
+
+      let session = getCachedSession(this.state.clientId);
+      const canTrySilent =
+        !session &&
+        this.state.tokenRenewalUrl &&
+        hasStoredRenewalTicket(this.state.clientId, this.state.tokenRenewalUrl) &&
+        !this._silentRenewalExhausted;
+
+      if (!session && canTrySilent) {
+        session = await renewOAuthSessionSilently(
+          this.state.clientId,
+          this.state.tokenRenewalUrl,
+          { remember: this.state.rememberCredentials }
+        );
+        if (!session) {
+          this._silentRenewalExhausted = true;
         }
       }
+
+      if (!session) {
+        session = await promptInteractiveAuth();
+        if (!session) return false;
+      }
+      this._silentRenewalExhausted = false;
 
       const remember = this.state.rememberCredentials !== false;
       const nextSavedUser = remember

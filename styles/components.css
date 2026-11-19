@@ -1032,6 +1032,12 @@
   transform: translateY(0);
 }
 
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) #galleryMonthPill,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .gallery-month-pill,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .gallery-back-top {
+  position: fixed;
+}
+
 .photo-overlay-left,
 .photo-overlay-right {
   display: flex;

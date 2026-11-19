@@ -1,4 +1,4 @@
-import { getCachedSession } from './api/gdrive.js';
+import { ensureGoogleIdentityLoaded, getCachedSession } from './api/gdrive.js';
 import { t } from './i18n.js';
 import { loadConnectPrefs, Store } from './state/store.js';
 import { syncServiceWorkerAuth, updateSmartHdSchedule } from './storage/imageLoader.js';
@@ -260,7 +260,22 @@ function handleInitialUrlHash() {
   }
 }
 
-handleInitialUrlHash();
+const bootPrefs = loadConnectPrefs();
+const bootHashParams = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+if (
+  bootPrefs.authType === 'oauth' ||
+  Boolean(String(bootPrefs.clientId || '').trim()) ||
+  Boolean((bootHashParams.get('client_id') || '').trim())
+) {
+  ensureGoogleIdentityLoaded().catch(() => {});
+}
+
+(async () => {
+  const handledRedirect = await store.handleOAuthRedirectReturn();
+  if (!handledRedirect) {
+    handleInitialUrlHash();
+  }
+})();
 
 if (
   'serviceWorker' in navigator &&

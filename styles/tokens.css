@@ -140,6 +140,21 @@ body {
   user-select: none;
 }
 
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]),
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) body {
+  height: auto;
+  min-height: 100vh;
+  min-height: 100lvh;
+  overflow-x: hidden;
+  overflow-y: auto;
+  -webkit-overflow-scrolling: touch;
+}
+
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]).has-overlay-lock,
+:is(html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]).has-overlay-lock body {
+  overflow: hidden;
+}
+
 button,
 input,
 select,

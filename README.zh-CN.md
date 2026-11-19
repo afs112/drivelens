@@ -58,6 +58,7 @@
      https://afs112.github.io
      ```
      *（注意：只填域名来源 Origin，**不要**带 `/drivelens` 路径，也不要带末尾 `/`！）*
+   - **移动端 / iOS PWA / 应用内浏览器提示**：DriveLens 会在点击按钮时同步拉起 Google OAuth 弹窗，以兼容手机 Safari/Chrome；如果您的手机浏览器、桌面 PWA 或应用内 WebView 彻底拦截弹窗，请在连接弹窗中点击 **免弹窗本页跳转登录**！如需启用该跳转登录模式，请同时在 Google Cloud Console 的 **已获授权的重定向 URI（Authorized redirect URIs）** 中添加您的完整应用页面地址（例如 `https://afs112.github.io/drivelens/` —— 注意保留末尾 `/`；如配合 Cloudflare 续期 Worker 使用，请确保 Worker 已更新为最新版 [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js)）。
 4. **连接并分享一键链接**：
    - 复制生成的 **客户端 ID**（`xxx.apps.googleusercontent.com`）。
    - 打开 **[https://afs112.github.io/drivelens/#lang=zh](https://afs112.github.io/drivelens/#lang=zh)**，切换到 **OAuth 账号登录** 标签页，填入相册链接与您的 Client ID，点击 **授权并打开相册**。
@@ -90,7 +91,7 @@
 #### 第 1 步：在 Google Cloud Console 获取 Client Secret
 
 1. 打开 [Google Cloud Console](https://console.cloud.google.com/) → **API 和服务 → 凭据**，点开您的 Web OAuth 客户端，复制 **客户端密钥（Client Secret）**（`<YOUR_OAUTH_CLIENT_SECRET>` —— **请严格保密，绝对不要提交到 GitHub！**）。
-2. 确认 **已获授权的 JavaScript 来源** 中已填入您的站点 Origin（例如 `https://afs112.github.io` 或 `https://<您的用户名>.github.io`）。Google 的弹窗授权码流程会自动使用 `postmessage`，因此无需填写额外重定向 URI（**已获授权的重定向 URI** 可保持为空）。
+2. 确认 **已获授权的 JavaScript 来源** 中已填入您的站点 Origin（例如 `https://afs112.github.io` 或 `https://<您的用户名>.github.io`）。Google 的弹窗授权码流程会自动使用 `postmessage`，因此弹窗模式下无需填写额外重定向 URI（**已获授权的重定向 URI** 可保持为空）。*（**移动端 / iOS PWA / 应用内浏览器提示**：DriveLens 会在点击时同步拉起 Google OAuth 以适配手机 Safari/Chrome；若您的浏览器、已安装 PWA 或应用内 WebView 彻底拦截弹窗，请在连接弹窗点击 **免弹窗本页跳转登录**，同时在 **已获授权的重定向 URI** 中填入完整应用地址如 `https://afs112.github.io/drivelens/` —— 带末尾 `/`，并确保 Worker 已部署最新版 [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js)。）*
 3. *（Google 重要避坑提示）*：在 **OAuth 同意屏幕 / 受众（Audience）** 页面中，如果发布状态是 **测试中（Testing）**，Google 会强制让 `refresh_token` 每 **7 天** 过期一次。将其点击 **发布应用（Publish App）** 设为生产状态即可免费解决（个人或小团队未过审应用只需在首次登录时点一次 *“高级 → 继续前往（不安全）”*，之后刷新令牌即可持续有效数月而不再受 7 天限制！）。
 
 #### 第 2 步：将 [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js) 部署到 Cloudflare Workers（免费版每日 10 万次请求）
@@ -104,7 +105,8 @@
    - 添加 **Text Variable（文本变量）**：Name 填 `ALLOWED_ORIGINS`，Value 填 `https://afs112.github.io`（*如有多个域名或本地 `http://localhost:5173`，用英文逗号分隔*）。
    - *（可选进阶加固）* 添加 **Secret（密钥）**：Name 填 `TICKET_ENC_KEY`，Value 填 `<ANY_RANDOM_32_CHAR_PASSPHRASE>`（*开启后 Worker 会用 `AES-256-GCM` 加密 Google 刷新令牌，浏览器仅保存密文 `refresh_ticket`，原始刷新令牌永不离开 Cloudflare！*）。
    - *（可选）* 添加 **Text Variable**：Name 填 `ALLOWED_CLIENT_IDS`，Value 填 `<YOUR_CLIENT_ID>.apps.googleusercontent.com`。
-4. 在浏览器打开 `https://<your-worker>.<your-subdomain>.workers.dev/health` 自检，返回 `{"ok":true,"service":"drivelens-oauth-renewal",...}` 即部署成功。
+   - **重要提醒**：在 Cloudflare Dashboard 中保存好 Variables and Secrets 后，请务必点击 **Deploy** 使密钥与环境变量配置真正生效！
+4. 在浏览器打开 `https://<your-worker>.workers.dev/health`（或 `https://<your-worker>.<your-subdomain>.workers.dev/health`）自检：当 `GOOGLE_CLIENT_SECRET` 正确保存**并已点击 Deploy 部署**后，页面会返回 `"hasClientSecret": true`（例如 `{"ok":true,"service":"drivelens-oauth-renewal","hasClientSecret":true,...}`）。*（`server_misconfigured` 排查提示：若遇到 `server_misconfigured` 报错或 `/health` 显示 `"hasClientSecret": false`，请确认已将 `GOOGLE_CLIENT_SECRET` 保存为 Secret 并点击 **Deploy**！）*
 
 #### 第 3 步：在 DriveLens 中填入 Worker 地址
 

@@ -136,6 +136,7 @@ export default {
         {
           ok: true,
           service: 'drivelens-oauth-renewal',
+          hasClientSecret: Boolean(env.GOOGLE_CLIENT_SECRET),
           encryptedTickets: Boolean(env.TICKET_ENC_KEY),
         },
         200,
@@ -166,11 +167,26 @@ export default {
       if (!code) {
         return jsonResponse({ error: 'invalid_request' }, 400, corsHeaders);
       }
+      const redirectUri = String(payload?.redirect_uri || 'postmessage').trim() || 'postmessage';
+      if (redirectUri !== 'postmessage') {
+        let parsedRedirect;
+        try {
+          parsedRedirect = new URL(redirectUri);
+        } catch {
+          return jsonResponse({ error: 'invalid_redirect_uri' }, 400, corsHeaders);
+        }
+        if (parsedRedirect.protocol !== 'https:' && parsedRedirect.protocol !== 'http:') {
+          return jsonResponse({ error: 'invalid_redirect_uri' }, 400, corsHeaders);
+        }
+        if (allowedOrigins.length > 0 && !allowedOrigins.includes(parsedRedirect.origin)) {
+          return jsonResponse({ error: 'redirect_origin_not_allowed' }, 403, corsHeaders);
+        }
+      }
       const tokenRes = await postGoogleToken({
         code,
         client_id: clientId,
         client_secret: env.GOOGLE_CLIENT_SECRET,
-        redirect_uri: 'postmessage',
+        redirect_uri: redirectUri,
         grant_type: 'authorization_code',
       });
       if (!tokenRes.ok || !tokenRes.data?.access_token) {

@@ -506,6 +506,10 @@ function updateHeaderElements(headerEl, state, store) {
     langSelect.value = state.lang || 'en';
   }
 
+  document
+    .querySelector('meta[name="theme-color"]')
+    ?.setAttribute('content', state.theme === 'light' ? '#f4f6f9' : '#0b0d10');
+
   const themeBtn = headerEl.querySelector('[data-header="toggle-theme"]');
   if (themeBtn) {
     const currentTheme = state.theme === 'light' ? 'light' : 'dark';
@@ -1021,7 +1025,14 @@ export function bindMobileNavEvents(navEl, store) {
     const headerEl = document.getElementById('topHeader');
     headerEl.classList.remove('is-hidden-scroll');
     if (action === 'back-top') {
-      document.getElementById('galleryScroll')?.scrollTo({ top: 0, behavior: 'smooth' });
+      const useDocScroll =
+        document.documentElement.classList.contains('ios-safari-doc-scroll') ||
+        document.documentElement.dataset.forceDocScroll === 'true';
+      if (useDocScroll) {
+        window.scrollTo({ top: 0, behavior: 'smooth' });
+      } else {
+        document.getElementById('galleryScroll')?.scrollTo({ top: 0, behavior: 'smooth' });
+      }
       return;
     }
     if (action === 'search') {

@@ -10,13 +10,87 @@ import {
 } from '../storage/imageLoader.js';
 import { openPhotoContextMenu } from './contextMenu.js';
 import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
-import { openCompare } from './renderCompare.js';
+import { isCompareOpen, openCompare } from './renderCompare.js';
 
 const MAX_STAGE_PX = 12_000_000;
 const STAGE_BAND_PX = 65536;
 const MAX_MOUNTED_CARDS = 260;
 const MAX_FREE_CARD_POOL = 220;
 const ANCHOR_TTL_MS = 260;
+
+function isDocScrollMode() {
+  if (typeof document === 'undefined') return false;
+  const root = document.documentElement;
+  return (
+    root.classList.contains('ios-safari-doc-scroll') ||
+    root.dataset.forceDocScroll === 'true'
+  );
+}
+
+function readGalleryScrollTop(scrollContainer) {
+  if (isDocScrollMode()) {
+    return Math.max(
+      0,
+      window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0
+    );
+  }
+  return Math.max(0, scrollContainer?.scrollTop || 0);
+}
+
+function writeGalleryScrollTop(scrollContainer, nextTop) {
+  const safeTop = Math.max(0, nextTop);
+  if (isDocScrollMode()) {
+    window.scrollTo(0, safeTop);
+  } else if (scrollContainer) {
+    scrollContainer.scrollTop = safeTop;
+  }
+}
+
+function readGalleryViewportHeight(scrollContainer) {
+  if (isDocScrollMode()) {
+    return Math.max(1, window.visualViewport?.height || window.innerHeight || 800);
+  }
+  return Math.max(
+    1,
+    scrollContainer?.clientHeight ||
+      (typeof window !== 'undefined' ? window.innerHeight : 800)
+  );
+}
+
+function syncIosSafariDocScrollMode(state) {
+  if (typeof document === 'undefined' || typeof window === 'undefined') return false;
+  const root = document.documentElement;
+  const ua = navigator.userAgent || '';
+  const isIosTouch =
+    /iPhone|iPad|iPod/i.test(ua) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isStandalone = Boolean(
+    window.navigator.standalone ||
+      window.matchMedia?.('(display-mode: standalone)')?.matches
+  );
+  const autoIosDocScroll = isIosTouch && !isStandalone && window.innerWidth <= 920;
+  const enabled = autoIosDocScroll || root.dataset.forceDocScroll === 'true';
+  root.classList.toggle('ios-safari-doc-scroll', enabled);
+
+  const hasOverlay = Boolean(
+    state?.lightboxPhotoId ||
+      state?.modal ||
+      state?.sidebarOpen ||
+      state?.inspectorOpen ||
+      isCompareOpen()
+  );
+  root.classList.toggle('has-overlay-lock', hasOverlay);
+  return enabled;
+}
+
+function resolveFocalScreenY(scrollContainer, clientY) {
+  if (isDocScrollMode()) {
+    return Math.max(0, Math.min(readGalleryViewportHeight(scrollContainer), clientY));
+  }
+  const rect = scrollContainer?.getBoundingClientRect?.();
+  if (!rect) return null;
+  return Math.max(0, Math.min(scrollContainer.clientHeight || 1, clientY - rect.top));
+}
 
 const monthFormatterCache = new Map();
 const fallbackVersionMap = new WeakMap();
@@ -855,9 +929,9 @@ function ensureStageDom(gridEl, physicalTotalHeight) {
 
 function setScrollTopProgrammatically(scrollContainer, targetScrollTop) {
   const rounded = Math.max(0, Math.round(targetScrollTop));
-  if (Math.abs((scrollContainer.scrollTop || 0) - rounded) < 0.5) return;
-  scrollContainer.scrollTop = rounded;
-  lastProgrammaticScrollTop = scrollContainer.scrollTop;
+  if (Math.abs(readGalleryScrollTop(scrollContainer) - rounded) < 0.5) return;
+  writeGalleryScrollTop(scrollContainer, rounded);
+  lastProgrammaticScrollTop = readGalleryScrollTop(scrollContainer);
   lastProgrammaticScrollAt =
     typeof performance !== 'undefined' ? performance.now() : Date.now();
 }
@@ -929,12 +1003,9 @@ function upgradeVisibleCardsOnScrollSettle(scrollContainer, store) {
   if (!scrollContainer || !store || store.state.loading || !activeLayout || activePhotos.length === 0) {
     return;
   }
-  const vh = Math.max(
-    1,
-    scrollContainer.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 800)
-  );
+  const vh = readGalleryViewportHeight(scrollContainer);
   const metrics = getStageMetrics(activeLayout, vh);
-  const rawScrollTop = Math.max(0, scrollContainer.scrollTop || 0);
+  const rawScrollTop = readGalleryScrollTop(scrollContainer);
   const clampedScrollTop = Math.min(rawScrollTop, metrics.maxPhysicalScroll);
   const logicalTop = scrollTopToLogicalTop(activeLayout, clampedScrollTop, vh);
   const onScreenMinY = logicalTop;
@@ -982,12 +1053,9 @@ function syncVirtualViewport(
 ) {
   if (!gridEl || !scrollContainer || !layout || layout.count === 0) return;
 
-  const vh = Math.max(
-    1,
-    scrollContainer.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 800)
-  );
+  const vh = readGalleryViewportHeight(scrollContainer);
   const metrics = getStageMetrics(layout, vh);
-  const rawScrollTop = Math.max(0, scrollContainer.scrollTop || 0);
+  const rawScrollTop = readGalleryScrollTop(scrollContainer);
   const clampedScrollTop = Math.min(rawScrollTop, metrics.maxPhysicalScroll);
   const logicalTop = scrollTopToLogicalTop(layout, clampedScrollTop, vh);
   const vy = Number(scrollContainer._dlScrollVelocityY || 0);
@@ -1213,8 +1281,8 @@ export function getCurrentPageSmartTargets(scrollContainer, store, visiblePhotos
   let centerIdx = Math.round((start + end) * 0.5);
 
   if (activeLayout && activeLayout.count === len && scrollContainer) {
-    const vh = Math.max(1, scrollContainer.clientHeight || 800);
-    const logicalTop = scrollTopToLogicalTop(activeLayout, scrollContainer.scrollTop || 0, vh);
+    const vh = readGalleryViewportHeight(scrollContainer);
+    const logicalTop = scrollTopToLogicalTop(activeLayout, readGalleryScrollTop(scrollContainer), vh);
     const onScreen = queryLayoutRange(activeLayout, logicalTop, logicalTop + vh);
     if (onScreen.length > 0) {
       const minIdx = onScreen[0];
@@ -1227,12 +1295,18 @@ export function getCurrentPageSmartTargets(scrollContainer, store, visiblePhotos
         end = Math.min(len - 1, start + 59);
       }
     }
-  } else if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight) {
-    const maxScroll = Math.max(1, scrollContainer.scrollHeight - scrollContainer.clientHeight);
-    const ratio = Math.min(1, Math.max(0, scrollContainer.scrollTop / maxScroll));
-    centerIdx = Math.round(ratio * Math.max(0, len - 1));
-    start = Math.max(0, centerIdx - 30);
-    end = Math.min(len - 1, start + 59);
+  } else if (scrollContainer) {
+    const scVh = readGalleryViewportHeight(scrollContainer);
+    const scHeight = isDocScrollMode()
+      ? Math.max(scVh, document.documentElement.scrollHeight || 0)
+      : scrollContainer.scrollHeight || 0;
+    if (scHeight > scVh) {
+      const maxScroll = Math.max(1, scHeight - scVh);
+      const ratio = Math.min(1, Math.max(0, readGalleryScrollTop(scrollContainer) / maxScroll));
+      centerIdx = Math.round(ratio * Math.max(0, len - 1));
+      start = Math.max(0, centerIdx - 30);
+      end = Math.min(len - 1, start + 59);
+    }
   }
 
   const ratedCandidates = [];
@@ -1464,8 +1538,8 @@ function buildGridSignature(state, isMobile, rowHeight, roundedWidth, photosVer,
 
 function findSampleCardTimestamp(scrollContainer) {
   if (!activeLayout || activeLayout.count === 0 || activePhotos.length === 0) return 0;
-  const vh = Math.max(1, scrollContainer?.clientHeight || 800);
-  const logicalTop = scrollTopToLogicalTop(activeLayout, scrollContainer?.scrollTop || 0, vh);
+  const vh = readGalleryViewportHeight(scrollContainer);
+  const logicalTop = scrollTopToLogicalTop(activeLayout, readGalleryScrollTop(scrollContainer), vh);
   const probeY = Math.min(activeLayout.logicalTotalHeight, logicalTop + 72);
   const idx = findAnchorItemIndexAtY(activeLayout, probeY);
   if (idx < 0 || idx >= activePhotos.length) return 0;
@@ -1483,7 +1557,7 @@ function updateFloatingScrollState(scrollContainer, store, fromActiveScroll = fa
     backBtn.setAttribute('aria-label', backLabel);
   }
 
-  const showBackTop = scrollContainer.scrollTop > 320 && lastVisiblePhotos.length > 0;
+  const showBackTop = readGalleryScrollTop(scrollContainer) > 320 && lastVisiblePhotos.length > 0;
   backBtn.classList.toggle('visible', showBackTop);
   document.getElementById('mobileNavBar')?.classList.toggle('has-back-top', showBackTop);
 
@@ -1537,7 +1611,11 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
   backBtn.title = t('gallery.backToTop');
   backBtn.setAttribute('aria-label', t('gallery.backToTop'));
   backBtn.addEventListener('click', () => {
-    scrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
+    if (isDocScrollMode()) {
+      window.scrollTo({ top: 0, behavior: 'smooth' });
+    } else {
+      scrollContainer.scrollTo({ top: 0, behavior: 'smooth' });
+    }
   });
 
   host.appendChild(pillEl);
@@ -1548,100 +1626,158 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
   scrollContainer._dlFloatingAttached = true;
 
   let scrollVirtualRafId = 0;
-  let lastScrollTop = scrollContainer.scrollTop || 0;
+  let lastScrollTop = readGalleryScrollTop(scrollContainer);
   let lastScrollTimeMs = 0;
   scrollContainer._dlScrollVelocityY = 0;
-  scrollContainer.addEventListener(
-    'scroll',
-    () => {
-      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
-      const curTopNow = scrollContainer.scrollTop || 0;
-      if (
-        lastProgrammaticScrollAt > 0 &&
-        now - lastProgrammaticScrollAt < 80 &&
-        Math.abs(curTopNow - lastProgrammaticScrollTop) <= 2
-      ) {
-        lastProgrammaticScrollAt = 0;
-        lastScrollTop = curTopNow;
-        lastScrollTimeMs = 0;
-        scrollContainer._dlScrollVelocityY = 0;
-        updateFloatingScrollState(scrollContainer, scrollContainer._dlStoreRef, false);
-        return;
+  const handleGalleryScroll = () => {
+    const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+    const curTopNow = readGalleryScrollTop(scrollContainer);
+    if (
+      lastProgrammaticScrollAt > 0 &&
+      now - lastProgrammaticScrollAt < 80 &&
+      Math.abs(curTopNow - lastProgrammaticScrollTop) <= 2
+    ) {
+      lastProgrammaticScrollAt = 0;
+      lastScrollTop = curTopNow;
+      lastScrollTimeMs = 0;
+      scrollContainer._dlScrollVelocityY = 0;
+      updateFloatingScrollState(scrollContainer, scrollContainer._dlStoreRef, false);
+      return;
+    }
+
+    // User scroll clears any pending zoom/resize gesture anchor
+    gestureAnchor = null;
+
+    if (scrollVirtualRafId) return;
+    scrollVirtualRafId = requestAnimationFrame(() => {
+      scrollVirtualRafId = 0;
+      const frameNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const curTop = readGalleryScrollTop(scrollContainer);
+      const delta = curTop - lastScrollTop;
+      lastScrollTop = curTop;
+
+      const dt =
+        lastScrollTimeMs > 0 && frameNow - lastScrollTimeMs <= 250
+          ? Math.max(8, frameNow - lastScrollTimeMs)
+          : 32;
+      lastScrollTimeMs = frameNow;
+      if (Math.abs(delta) >= 0.5) {
+        const rawVy = (delta / dt) * 1000;
+        const prevVy = scrollContainer._dlScrollVelocityY || 0;
+        if (prevVy !== 0 && Math.sign(rawVy) !== Math.sign(prevVy)) {
+          scrollContainer._dlScrollVelocityY = rawVy * 0.65;
+        } else if (prevVy === 0) {
+          scrollContainer._dlScrollVelocityY = rawVy * 0.7;
+        } else {
+          scrollContainer._dlScrollVelocityY = prevVy * 0.55 + rawVy * 0.45;
+        }
       }
 
-      // User scroll clears any pending zoom/resize gesture anchor
-      gestureAnchor = null;
+      const curStore = scrollContainer._dlStoreRef;
+      const curGrid = scrollContainer._dlGridRef;
+      if (
+        curGrid &&
+        curStore &&
+        !curStore.state.loading &&
+        activeLayout &&
+        activePhotos.length > 0
+      ) {
+        syncVirtualViewport(curGrid, scrollContainer, curStore, activeLayout, activePhotos, {
+          patchMeta: true,
+          forceAllMeta: false,
+        });
+      }
 
-      if (scrollVirtualRafId) return;
-      scrollVirtualRafId = requestAnimationFrame(() => {
-        scrollVirtualRafId = 0;
-        const frameNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
-        const curTop = scrollContainer.scrollTop || 0;
-        const delta = curTop - lastScrollTop;
-        lastScrollTop = curTop;
+      const topHeaderEl = document.getElementById('topHeader');
+      const overlayOpen = Boolean(
+        document.querySelector(
+          '#headerMorePopover.is-open, #topHeader.search-expanded, #demoBanner:not(.hidden), #drawerBackdrop.visible'
+        )
+      );
 
-        const dt =
-          lastScrollTimeMs > 0 && frameNow - lastScrollTimeMs <= 250
-            ? Math.max(8, frameNow - lastScrollTimeMs)
-            : 32;
-        lastScrollTimeMs = frameNow;
-        if (Math.abs(delta) >= 0.5) {
-          const rawVy = (delta / dt) * 1000;
-          const prevVy = scrollContainer._dlScrollVelocityY || 0;
-          if (prevVy !== 0 && Math.sign(rawVy) !== Math.sign(prevVy)) {
-            scrollContainer._dlScrollVelocityY = rawVy * 0.65;
-          } else if (prevVy === 0) {
-            scrollContainer._dlScrollVelocityY = rawVy * 0.7;
-          } else {
-            scrollContainer._dlScrollVelocityY = prevVy * 0.55 + rawVy * 0.45;
-          }
-        }
+      if (curTop <= 30 || delta < -5 || overlayOpen) {
+        topHeaderEl?.classList.remove('is-hidden-scroll');
+      } else if (curTop > 50 && delta > 4) {
+        topHeaderEl?.classList.add('is-hidden-scroll');
+      }
 
-        const curStore = scrollContainer._dlStoreRef;
-        const curGrid = scrollContainer._dlGridRef;
-        if (
-          curGrid &&
-          curStore &&
-          !curStore.state.loading &&
-          activeLayout &&
-          activePhotos.length > 0
-        ) {
-          syncVirtualViewport(curGrid, scrollContainer, curStore, activeLayout, activePhotos, {
-            patchMeta: true,
-            forceAllMeta: false,
-          });
-        }
+      updateFloatingScrollState(scrollContainer, curStore, true);
+      clearTimeout(scrollContainer._dlVelocitySettleTimer);
+      scrollContainer._dlVelocitySettleTimer = setTimeout(() => {
+        scrollContainer._dlVelocitySettleTimer = 0;
+        scrollContainer._dlScrollVelocityY = 0;
+        lastScrollTimeMs = 0;
+        upgradeVisibleCardsOnScrollSettle(scrollContainer, scrollContainer._dlStoreRef);
+      }, 180);
 
-        const topHeaderEl = document.getElementById('topHeader');
-        const overlayOpen = Boolean(
-          document.querySelector(
-            '#headerMorePopover.is-open, #topHeader.search-expanded, #demoBanner:not(.hidden), #drawerBackdrop.visible'
-          )
-        );
+      clearTimeout(scrollContainer._dlSettleTimer);
+      scrollContainer._dlSettleTimer = setTimeout(() => {
+        if (scrollSettleCallback) scrollSettleCallback();
+      }, 280);
+    });
+  };
 
-        if (curTop <= 30 || delta < -5 || overlayOpen) {
-          topHeaderEl?.classList.remove('is-hidden-scroll');
-        } else if (curTop > 50 && delta > 4) {
-          topHeaderEl?.classList.add('is-hidden-scroll');
-        }
-
-        updateFloatingScrollState(scrollContainer, curStore, true);
-        clearTimeout(scrollContainer._dlVelocitySettleTimer);
-        scrollContainer._dlVelocitySettleTimer = setTimeout(() => {
-          scrollContainer._dlVelocitySettleTimer = 0;
-          scrollContainer._dlScrollVelocityY = 0;
-          lastScrollTimeMs = 0;
-          upgradeVisibleCardsOnScrollSettle(scrollContainer, scrollContainer._dlStoreRef);
-        }, 180);
-
-        clearTimeout(scrollContainer._dlSettleTimer);
-        scrollContainer._dlSettleTimer = setTimeout(() => {
-          if (scrollSettleCallback) scrollSettleCallback();
-        }, 280);
-      });
+  scrollContainer.addEventListener('scroll', handleGalleryScroll, { passive: true });
+  window.addEventListener(
+    'scroll',
+    () => {
+      if (!isDocScrollMode()) return;
+      handleGalleryScroll();
     },
     { passive: true }
   );
+
+  let docResizeRafId = 0;
+  const handleViewportResize = () => {
+    const curStore = scrollContainer._dlStoreRef;
+    syncIosSafariDocScrollMode(curStore?.state);
+    if (!isDocScrollMode()) return;
+    if (docResizeRafId) return;
+    docResizeRafId = requestAnimationFrame(() => {
+      docResizeRafId = 0;
+      const st = scrollContainer._dlStoreRef;
+      const gd = scrollContainer._dlGridRef;
+      if (!gd || !st || st.state.loading || !activeLayout || activePhotos.length === 0) return;
+      relayoutGalleryOnResize(gd, scrollContainer, st);
+      syncVirtualViewport(gd, scrollContainer, st, activeLayout, activePhotos, {
+        patchMeta: false,
+        forceAllMeta: false,
+      });
+      updateFloatingScrollState(scrollContainer, st, false);
+    });
+  };
+  window.addEventListener('resize', handleViewportResize, { passive: true });
+  window.visualViewport?.addEventListener('resize', handleViewportResize, { passive: true });
+
+  if (
+    typeof MutationObserver !== 'undefined' &&
+    !document.documentElement._dlForceDocScrollObserver
+  ) {
+    const observer = new MutationObserver(() => {
+      const curStore = scrollContainer._dlStoreRef;
+      const curGrid = scrollContainer._dlGridRef;
+      syncIosSafariDocScrollMode(curStore?.state);
+      lastScrollTop = readGalleryScrollTop(scrollContainer);
+      if (
+        curGrid &&
+        curStore &&
+        !curStore.state.loading &&
+        activeLayout &&
+        activePhotos.length > 0
+      ) {
+        syncVirtualViewport(curGrid, scrollContainer, curStore, activeLayout, activePhotos, {
+          patchMeta: false,
+          forceAllMeta: false,
+        });
+        updateFloatingScrollState(scrollContainer, curStore, false);
+      }
+    });
+    observer.observe(document.documentElement, {
+      attributes: true,
+      attributeFilter: ['data-force-doc-scroll'],
+    });
+    document.documentElement._dlForceDocScrollObserver = observer;
+  }
 
   updateFloatingScrollState(scrollContainer, store, false);
 }
@@ -1675,13 +1811,10 @@ function applyGalleryGeometry(
   const photosVer = getPhotosVersion(store, visiblePhotos);
   const filterKey = buildFilterKey(state);
 
-  const vh = Math.max(
-    1,
-    scrollContainer.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 800)
-  );
+  const vh = readGalleryViewportHeight(scrollContainer);
   const prevLayout = activeLayout;
   const prevPhotos = activePhotos;
-  const prevScrollTop = Math.max(0, scrollContainer.scrollTop || 0);
+  const prevScrollTop = readGalleryScrollTop(scrollContainer);
   const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
   let anchorToApply = null;
@@ -1795,6 +1928,8 @@ function applyGalleryGeometry(
 
 export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos) {
   if (!gridEl || !scrollContainer) return;
+
+  syncIosSafariDocScrollMode(store.state);
 
   const albumKey = `${store.state.mode}:${store.state.folderId || 'demo'}`;
   if (albumKey !== pooledAlbumKey) {
@@ -1934,6 +2069,7 @@ export function previewGalleryRowHeight(
 
 export function relayoutGalleryOnResize(gridEl, scrollContainer, store) {
   if (!gridEl || !scrollContainer || !store) return;
+  syncIosSafariDocScrollMode(store.state);
   if (store.state.loading || lastVisiblePhotos.length === 0) return;
 
   const isMobile = scrollContainer.clientWidth <= 600;
@@ -2218,11 +2354,8 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
           pinchLiveHeight = nextH;
           syncRangeSliders(nextH);
           const sc = resolveScrollContainer();
-          const rect = sc?.getBoundingClientRect?.();
           const midY = (e.touches[0].clientY + e.touches[1].clientY) * 0.5;
-          const focalY = rect
-            ? Math.max(0, Math.min(sc.clientHeight || 1, midY - rect.top))
-            : null;
+          const focalY = resolveFocalScreenY(sc, midY);
           previewGalleryRowHeight(gridEl, sc, store, nextH, focalY);
           return;
         }
@@ -2265,10 +2398,7 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
         const nextH = Math.max(130, Math.min(320, Math.round(base + (e.deltaY < 0 ? 18 : -18))));
         syncRangeSliders(nextH);
         const sc = resolveScrollContainer();
-        const rect = sc?.getBoundingClientRect?.();
-        const focalY = rect
-          ? Math.max(0, Math.min(sc.clientHeight || 1, e.clientY - rect.top))
-          : null;
+        const focalY = resolveFocalScreenY(sc, e.clientY);
         previewGalleryRowHeight(gridEl, sc, store, nextH, focalY);
         clearTimeout(wheelCommitTimer);
         wheelCommitTimer = setTimeout(() => {
