@@ -115,6 +115,26 @@ function buildHeaderSkeleton(headerEl, state) {
     </div>
 
     <div id="headerMorePopover" class="header-more-popover" role="region" aria-label="${escapeAttr(t('header.moreMenu'))}" inert>
+      <div class="more-popover-section more-popover-layout-mobile">
+        <div class="more-popover-label">
+          <span>${escapeHtml(t('header.layoutGroup'))}</span>
+        </div>
+        <div class="segmented segmented-sliding" data-layout-seg role="group" aria-label="${escapeAttr(t('header.layoutGroup'))}">
+          <button type="button" class="seg-btn" data-header="layout" data-layout="justified" title="${escapeAttr(t('header.layoutJustified'))}" aria-label="${escapeAttr(t('sidebar.viewJustified'))}">
+            ${icon('rows', 14)}
+            <span>${escapeHtml(t('sidebar.viewJustified'))}</span>
+          </button>
+          <button type="button" class="seg-btn" data-header="layout" data-layout="waterfall" title="${escapeAttr(t('header.layoutWaterfall'))}" aria-label="${escapeAttr(t('sidebar.viewWaterfall'))}">
+            ${icon('waterfall', 14)}
+            <span>${escapeHtml(t('sidebar.viewWaterfall'))}</span>
+          </button>
+          <button type="button" class="seg-btn" data-header="layout" data-layout="grid" title="${escapeAttr(t('header.layoutGrid'))}" aria-label="${escapeAttr(t('sidebar.viewGrid'))}">
+            ${icon('grid', 14)}
+            <span>${escapeHtml(t('sidebar.viewGrid'))}</span>
+          </button>
+        </div>
+      </div>
+
       <div class="more-popover-section">
         <div class="more-popover-label">
           <span>${escapeHtml(t('header.thumbSize'))}</span>
@@ -354,7 +374,9 @@ function updateHeaderElements(headerEl, state, store) {
   }
 
   const segIndex = String(LAYOUT_INDEX_MAP[state.layoutMode] ?? 1);
-  headerEl.querySelector('[data-layout-seg]')?.style.setProperty('--seg-index', segIndex);
+  for (const segEl of headerEl.querySelectorAll('[data-layout-seg]')) {
+    segEl.style.setProperty('--seg-index', segIndex);
+  }
 
   for (const btn of headerEl.querySelectorAll('[data-header="layout"]')) {
     const active = btn.dataset.layout === state.layoutMode;
@@ -558,6 +580,7 @@ function expandSearchPalette(headerEl, store, toggleIfOpen = false) {
   moreMenuOpen = false;
   demoBannerExpanded = false;
   headerEl.classList.remove('is-hidden-scroll');
+  headerEl.classList.add('search-expanded');
   if (store.state.sidebarOpen || store.state.inspectorOpen) {
     store.setState({ sidebarOpen: false, inspectorOpen: false });
   } else {

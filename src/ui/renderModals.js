@@ -1,4 +1,10 @@
-import { ensureGoogleIdentityLoaded, getCleanOAuthRedirectUri } from '../api/gdrive.js';
+import {
+  ensureGoogleIdentityLoaded,
+  getCleanOAuthRedirectUri,
+  getStoredRenewalTicket,
+  normalizeRenewalEndpoint,
+  parseDriveFolderId,
+} from '../api/gdrive.js';
 import { APP_CONFIG } from '../constants.js';
 import { t } from '../i18n.js';
 import { getTagColors } from '../state/store.js';
@@ -34,6 +40,32 @@ function buildExportRows(store) {
     });
   }
   return rows;
+}
+
+async function copyTextWithFallback(text) {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // Fallback below
+    }
+  }
+  try {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    ta.setAttribute('readonly', '');
+    ta.style.position = 'fixed';
+    ta.style.top = '-9999px';
+    ta.style.opacity = '0';
+    document.body.appendChild(ta);
+    ta.select();
+    const ok = document.execCommand('copy');
+    ta.remove();
+    return Boolean(ok);
+  } catch {
+    return false;
+  }
 }
 
 function downloadTextFile(filename, content, mimeType) {
@@ -144,6 +176,12 @@ export function renderModals(container, store) {
                 <span>${escapeHtml(t('modal.rememberCreds'))}</span>
               </label>
 
+              <div class="connect-tools-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <button type="button" class="btn btn-sm" data-action="copy-setup-link-apikey" title="${escapeAttr(t('modal.copySetupLinkHint'))}">
+                  ${icon('share', 13)} ${escapeHtml(t('modal.copySetupLinkBtn'))}
+                </button>
+              </div>
+
               ${recentHtml}
 
               <details class="guide-details">
@@ -200,6 +238,15 @@ export function renderModals(container, store) {
                 <input type="checkbox" id="rememberOAuthCheck" ${rememberChecked} />
                 <span>${escapeHtml(t('modal.rememberCreds'))}</span>
               </label>
+
+              <div class="connect-tools-row" style="display:flex;align-items:center;gap:8px;flex-wrap:wrap">
+                <button type="button" class="btn btn-sm" data-action="copy-setup-link-oauth" title="${escapeAttr(t('modal.copySetupLinkHint'))}">
+                  ${icon('share', 13)} ${escapeHtml(t('modal.copySetupLinkBtn'))}
+                </button>
+                <button type="button" class="btn btn-sm" data-action="copy-mcp-config" title="${escapeAttr(t('modal.copyMcpConfigHint'))}">
+                  ${icon('appWindow', 13)} ${escapeHtml(t('modal.copyMcpConfigBtn'))}
+                </button>
+              </div>
 
               ${recentHtml}
 
@@ -578,6 +625,116 @@ export function bindModalEvents(container, store) {
         tokenRenewalUrl,
         rememberCredentials,
       });
+      return;
+    }
+
+    if (e.target.closest('[data-action="copy-setup-link-oauth"]')) {
+      const clientId = String(container.querySelector('#clientIdInput')?.value || '').trim();
+      const folderInput = container.querySelector('#folderUrlInput')?.value || '';
+      const rawRenewal = String(container.querySelector('#tokenRenewalUrlInput')?.value || '').trim();
+      const folderId = parseDriveFolderId(folderInput);
+      if (!clientId) {
+        store.toast(t('store.missingClientId'), 'error');
+        return;
+      }
+      if (!folderId) {
+        store.toast(t('store.invalidFolder'), 'error');
+        return;
+      }
+      const cleanRenewal = rawRenewal ? normalizeRenewalEndpoint(rawRenewal) : '';
+      if (rawRenewal && !cleanRenewal) {
+        store.toast(t('modal.invalidRenewalUrl'), 'error');
+        return;
+      }
+      const params = new URLSearchParams();
+      params.set('folder', folderId);
+      params.set('client_id', clientId);
+      if (cleanRenewal) {
+        params.set('renewal_url', cleanRenewal);
+      }
+      const setupUrl = `${window.location.origin}${window.location.pathname}#${params.toString()}`;
+      const copied = await copyTextWithFallback(setupUrl);
+      if (copied) {
+        store.toast(t('modal.setupLinkCopiedToast'), 'success', 4200);
+      } else {
+        window.prompt(t('modal.copySetupLinkBtn'), setupUrl);
+        store.toast(t('modal.copyFailedManual'), 'info');
+      }
+      return;
+    }
+
+    if (e.target.closest('[data-action="copy-setup-link-apikey"]')) {
+      const apiKey = String(container.querySelector('#apiKeyInput')?.value || '').trim();
+      const folderInput = container.querySelector('#apiKeyFolderUrlInput')?.value || '';
+      const nickname = String(container.querySelector('#nicknameInput')?.value || '').trim();
+      const folderId = parseDriveFolderId(folderInput);
+      if (!apiKey) {
+        store.toast(t('store.missingApiKey'), 'error');
+        return;
+      }
+      if (!folderId) {
+        store.toast(t('store.invalidFolder'), 'error');
+        return;
+      }
+      const params = new URLSearchParams();
+      params.set('folder', folderId);
+      params.set('key', apiKey);
+      if (nickname) {
+        params.set('nick', nickname);
+      }
+      const setupUrl = `${window.location.origin}${window.location.pathname}#${params.toString()}`;
+      const copied = await copyTextWithFallback(setupUrl);
+      if (copied) {
+        store.toast(t('modal.setupLinkCopiedToast'), 'success', 4200);
+      } else {
+        window.prompt(t('modal.copySetupLinkBtn'), setupUrl);
+        store.toast(t('modal.copyFailedManual'), 'info');
+      }
+      return;
+    }
+
+    if (e.target.closest('[data-action="copy-mcp-config"]')) {
+      const clientId =
+        String(container.querySelector('#clientIdInput')?.value || '').trim() ||
+        store.state.clientId ||
+        '';
+      const folderInput =
+        container.querySelector('#folderUrlInput')?.value || store.state.folderId || '';
+      const rawRenewal =
+        String(container.querySelector('#tokenRenewalUrlInput')?.value || '').trim() ||
+        store.state.tokenRenewalUrl ||
+        '';
+      const folderId = parseDriveFolderId(folderInput);
+      const cleanRenewal = rawRenewal ? normalizeRenewalEndpoint(rawRenewal) : '';
+      if (rawRenewal && !cleanRenewal) {
+        store.toast(t('modal.invalidRenewalUrl'), 'error');
+        return;
+      }
+      const ticket =
+        clientId && cleanRenewal ? getStoredRenewalTicket(clientId, cleanRenewal) : '';
+      const mcpConfig = {
+        mcpServers: {
+          drivelens: {
+            command: 'python',
+            args: ['/path/to/drivelens/mcp/drivelens_mcp.py'],
+            env: {
+              DRIVELENS_FOLDER_ID: folderId || '<YOUR_FOLDER_ID>',
+              DRIVELENS_CLIENT_ID: clientId || '<YOUR_CLIENT_ID>',
+              DRIVELENS_RENEWAL_URL: cleanRenewal || '<YOUR_WORKER_URL>',
+              DRIVELENS_REFRESH_TICKET:
+                ticket || '<SIGN_IN_FIRST_OR_USE_SERVICE_ACCOUNT>',
+            },
+          },
+        },
+      };
+      const jsonText = JSON.stringify(mcpConfig, null, 2);
+      const copied = await copyTextWithFallback(jsonText);
+      if (copied) {
+        store.toast(t('modal.mcpConfigCopiedToast'), 'success', 5000);
+      } else {
+        window.prompt(t('modal.copyMcpConfigBtn'), jsonText);
+        store.toast(t('modal.copyFailedManual'), 'info');
+      }
       return;
     }
 

@@ -36,7 +36,7 @@ Best when anyone with the folder link is allowed to view the photos and you want
 1. **Share your Google Drive folder**: Right-click the album folder in Google Drive → **Share** → set General access to **Anyone with the link (Viewer)**.
 2. **Create a free API Key**: Open [Google Cloud Console](https://console.cloud.google.com/) → create/select a project → enable **Google Drive API** under **APIs & Services → Library** → go to **Credentials → + Create Credentials → API key** (`AIzaSy...`). *(Optional: restrict the key to **Google Drive API** under API restrictions.)*
 3. **Connect & share**: Open **[https://afs112.github.io/drivelens/](https://afs112.github.io/drivelens/)** → click **Connect Drive** → paste your **Folder Link/ID**, **API Key**, and display nickname.
-   - To send friends a **1-click direct link**, share:
+   - Or click **Copy 1-Click Setup Link** inside the modal (generates `#folder=<FOLDER_ID>&key=<YOUR_API_KEY>`; also accepts `?` query params). When opened, DriveLens saves settings in `localStorage` and **immediately scrubs sensitive parameters from the address bar** via `history.replaceState` to prevent accidental resharing:
      ```text
      https://afs112.github.io/drivelens/#folder=<FOLDER_ID>&key=<YOUR_API_KEY>
      ```
@@ -63,7 +63,7 @@ Best when photos must stay private to invited Google accounts, or when multiple 
    - Copy the generated **Client ID** (`<YOUR_CLIENT_ID>.apps.googleusercontent.com`).
    - Open **[https://afs112.github.io/drivelens/](https://afs112.github.io/drivelens/)**, switch to the **OAuth Account Sign-In** tab, paste your **Folder Link/ID** and **Client ID**, and click **Authorize & Open Album**.
    - Collaborators with **Editor** access automatically sync ratings, tags, and notes to `.drivelens/` inside the Drive folder; **Viewer** accounts save picks locally.
-   - Share this 1-click link with your test-user friends:
+   - Click **Copy 1-Click Setup Link** in the OAuth tab (includes Folder + Client ID + optional Worker URL; accepts both `#` hash and `?` query parameters as well as `&worker=` alias) or share this format with your test-user friends. Opening the link saves settings locally and **immediately clears sensitive URL parameters** (`folder`, `client_id`, `key`, `renewal_url`, `worker`, `nick`):
      ```text
      https://afs112.github.io/drivelens/#folder=<FOLDER_ID>&client_id=<YOUR_CLIENT_ID>
      ```
@@ -112,7 +112,7 @@ For users who want native-app-style **sign in once for months** with zero popups
 #### Step 3: Connect in DriveLens
 
 1. Open DriveLens → **Connect Drive → OAuth Account Sign-In**, paste `https://<your-worker>.<your-subdomain>.workers.dev` into **Token Renewal Endpoint (Optional)**, and sign in once.
-2. Your Worker URL is saved **only in your own browser's `localStorage`** (never in GitHub). DriveLens will now silently renew your `access_token` in the background every ~55 minutes (5 minutes before expiry), on tab wake, and automatically upon reopening the browser or PWA! *(You can also pass `#folder=<FOLDER_ID>&client_id=<YOUR_CLIENT_ID>&renewal_url=https://<your-worker>.<your-subdomain>.workers.dev` in a direct share link.)*
+2. Your Worker URL is saved **only in your own browser's `localStorage`** (never in GitHub). DriveLens will now silently renew your `access_token` in the background every ~55 minutes (5 minutes before expiry), on tab wake, and automatically upon reopening the browser or PWA! *(Need to configure another device or browser? Click **Copy 1-Click Setup Link** in the OAuth tab to export `#folder=<FOLDER_ID>&client_id=<YOUR_CLIENT_ID>&renewal_url=<YOUR_WORKER_URL>` — `?` query params and `&worker=` also work, and parameters are auto-scrubbed from the URL bar right after import.)*
 
 ---
 
@@ -228,6 +228,61 @@ Service Worker caching ([`sw.js`](sw.js)) and PWA installation activate automati
 - **Auto-Reconnect**: **Remember login credentials & auto-reconnect** is enabled by default so refreshing or relaunching the PWA restores your album automatically. In OAuth mode, Solution A preserves your email hint for 1-click `0.5s` re-consent (`prompt: ''`), while Solution B (optional Cloudflare Worker) stores an encrypted refresh ticket in your browser to renew silently in the background.
 - **One-Click Wipe**: Click **Forget Saved Credentials** in the Connect modal to immediately clear saved API keys, Client IDs, tokens, and recent albums, or click **Clear Cache** to wipe local IndexedDB album/thumbnail caches.
 - **Zero Secrets in Repository**: This repository contains **zero** API keys, OAuth Client IDs, folder IDs, emails, or tokens ([`src/constants.js`](src/constants.js) holds empty defaults only; [`.gitignore`](.gitignore) blocks `config*.js`, `.env*`, `*credentials*`, `*secret*`, and `.local-meta/`).
+
+---
+
+## 7. AI MCP Server (`mcp/drivelens_mcp.py`)
+
+Let AI assistants (Antigravity, Claude Desktop, Cursor, etc.) inspect album stats, search photos, view thumbnails, manage tags, rate shots, and write review notes over local **stdio MCP** — with **zero external Python dependencies** (Python 3 stdlib only):
+
+- **12 Built-In MCP Tools**: `get_album_stats`, `list_folders`, `search_photos`, `get_photo_details`, `get_photo_image` (returns base64 preview images so multimodal models can visually inspect framing/focus), `list_tags`, `upsert_tag`, `delete_tag`, `tag_photos`, `rate_photos`, `set_photo_note`, and `refresh_album_index`.
+- **Conflict-Free AI Collaborator File**: AI edits write to an isolated collaborator file inside `.drivelens/` (controlled by `DRIVELENS_MEMBER_ID`, default `ai_assistant`) with the same LWW timestamps and soft-delete tag tombstones used by the web app, so human collaborator ratings and notes are never overwritten.
+
+### Auth Mode 1: Quickest — Reuse Your Cloudflare Worker
+
+1. Sign in once in DriveLens with your **Token Renewal Endpoint (Optional)** configured (Solution B above).
+2. Open **Connect Drive → OAuth Account Sign-In** and click **Copy AI MCP Config**, then replace `/path/to/drivelens/mcp/drivelens_mcp.py` with the local path on your machine:
+   ```json
+   {
+     "mcpServers": {
+       "drivelens": {
+         "command": "python",
+         "args": ["/path/to/drivelens/mcp/drivelens_mcp.py"],
+         "env": {
+           "DRIVELENS_FOLDER_ID": "<YOUR_FOLDER_ID>",
+           "DRIVELENS_CLIENT_ID": "<YOUR_CLIENT_ID>",
+           "DRIVELENS_RENEWAL_URL": "<YOUR_WORKER_URL>",
+           "DRIVELENS_REFRESH_TICKET": "<COPIED_FROM_BROWSER_KEEP_PRIVATE>"
+         }
+       }
+     }
+   }
+   ```
+3. **How renewal works**: Requests still route through your own `workers/oauth-renewal-worker.js` to mint short-lived Google `access_token`s for your Google account (`workers/oauth-renewal-worker.js` permits local CLI requests without an `Origin` header). Treat `DRIVELENS_REFRESH_TICKET` as a private credential on your computer and never share or commit it.
+
+### Auth Mode 2: Single-Folder Isolation — Google Service Account (Recommended for Least Privilege)
+
+If you prefer the AI **physically cannot access any other folder** on your Google Drive:
+
+1. In Google Cloud Console → **IAM & Admin → Service Accounts**, create a Service Account (e.g. `drivelens-bot@my-project.iam.gserviceaccount.com`) and download its JSON key to `/path/to/service-account.json` (outside the repository).
+2. Right-click **only the target album folder** in Google Drive → **Share** → add `drivelens-bot@my-project.iam.gserviceaccount.com` as **Editor**.
+3. Configure your MCP client (`drivelens_mcp.py` signs RS256 JWT assertions directly in pure Python stdlib):
+   ```json
+   {
+     "mcpServers": {
+       "drivelens": {
+         "command": "python",
+         "args": ["/path/to/drivelens/mcp/drivelens_mcp.py"],
+         "env": {
+           "DRIVELENS_FOLDER_ID": "<YOUR_FOLDER_ID>",
+           "GOOGLE_SERVICE_ACCOUNT_JSON": "/path/to/service-account.json",
+           "DRIVELENS_MEMBER_ID": "ai_assistant",
+           "DRIVELENS_MEMBER_NAME": "AI Assistant"
+         }
+       }
+     }
+   }
+   ```
 
 ---
 

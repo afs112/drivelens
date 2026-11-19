@@ -36,7 +36,7 @@
 1. **开启文件夹链接共享**：在 Google Drive 右键相册文件夹 → **共享（Share）** → 将“常规访问权限”设为 **知道链接的任何人（查看者 / Viewer）**。
 2. **创建免费 API Key**：打开 [Google Cloud Console](https://console.cloud.google.com/) → 创建或选择项目 → 在 **API 和服务 → 库** 中启用 **Google Drive API** → 在 **凭据 → 创建凭据 → API 密钥** 中生成并复制 `AIzaSy...`。（*建议在密钥限制中勾选仅限 Google Drive API。*）
 3. **连接并分享**：打开 **[https://afs112.github.io/drivelens/#lang=zh](https://afs112.github.io/drivelens/#lang=zh)** → 点击右上角 **连接 Drive** → 粘贴文件夹链接/ID、API Key 和您的昵称即可！
-   - 您还可以直接把下面这种**一键直达链接**发给朋友：
+   - 也可以在弹窗内点击 **复制一键配置链接** 导出直达链接（自动包含相册与 API Key，兼容 `#` 与 `?` 查询参数）；任何设备打开链接并自动保存到本地后，DriveLens 会通过 `history.replaceState` **立刻清空地址栏参数**，防止复制网址时误泄露：
      ```text
      https://afs112.github.io/drivelens/#folder=<FOLDER_ID>&key=<YOUR_API_KEY>&lang=zh
      ```
@@ -63,7 +63,7 @@
    - 复制生成的 **客户端 ID**（`xxx.apps.googleusercontent.com`）。
    - 打开 **[https://afs112.github.io/drivelens/#lang=zh](https://afs112.github.io/drivelens/#lang=zh)**，切换到 **OAuth 账号登录** 标签页，填入相册链接与您的 Client ID，点击 **授权并打开相册**。
    - 拥有文件夹 **编辑者（Editor）** 权限的协作者会自动将评分、标签和批注同步至相册内的 `.drivelens/` 目录；**查看者（Viewer）** 权限则可正常看图并在本地暂存评分。
-   - 将以下一键直达链接发给已加入测试用户的朋友，对方点击授权即可加入协同选片：
+   - 在 **OAuth 账号登录** 标签页点击 **复制一键配置链接**（会自动导出相册 ID、Client ID 与可选的 Worker 地址；同时兼容 `#` 与 `?` 参数及 `&worker=` 别名），或按下面格式发给已加入测试用户的朋友。打开链接并保存配置后，系统会**立即自动清空地址栏敏感参数**（`folder`、`client_id`、`key`、`renewal_url`、`worker`、`nick`），避免分享当前页面链接时意外泄露参数：
      ```text
      https://afs112.github.io/drivelens/#folder=<FOLDER_ID>&client_id=<YOUR_CLIENT_ID>&lang=zh
      ```
@@ -111,7 +111,7 @@
 #### 第 3 步：在 DriveLens 中填入 Worker 地址
 
 1. 打开 DriveLens → **连接 Drive → OAuth 账号登录**，将 `https://<your-worker>.<your-subdomain>.workers.dev` 粘贴到 **Token 续期接口（可选）**，完成一次登录授权即可。
-2. 您的 Worker 地址**仅保存在当前浏览器的 `localStorage` 中**（不会写入 GitHub 仓库）。此后 DriveLens 会在令牌过期前 5 分钟（约每 55 分钟）、标签页唤醒时以及每次重新打开网页 / PWA 时于后台静默续期，全程零弹窗！（*也可在分享直达链接中附带 `&renewal_url=https://<your-worker>.<your-subdomain>.workers.dev` 参数。*）
+2. 您的 Worker 地址**仅保存在当前浏览器的 `localStorage` 中**（不会写入 GitHub 仓库）。此后 DriveLens 会在令牌过期前 5 分钟（约每 55 分钟）、标签页唤醒时以及每次重新打开网页 / PWA 时于后台静默续期，全程零弹窗！（*换手机或新浏览器时，可在 OAuth 标签页点击 **复制一键配置链接** 一键导出 `#folder=<FOLDER_ID>&client_id=<YOUR_CLIENT_ID>&renewal_url=<YOUR_WORKER_URL>` —— 同样支持 `?` 参数与 `&worker=` 别名，导入后会自动擦除地址栏参数。*）
 
 ---
 
@@ -230,7 +230,62 @@ DriveLens 采用浏览器原生 ES Modules，**零构建步骤、无需安装 No
 
 ---
 
-## 7. 设计灵感与独立性声明（Design Inspiration & Independence）
+## 7. AI 助手 MCP 接口（`mcp/drivelens_mcp.py`）
+
+支持将本地 AI 助手（Antigravity、Claude Desktop、Cursor 等）通过标准 **stdio MCP** 接入共享相册，查看统计、检索照片、多模态看图、批量创建/修改标签、打分与写批注，且**纯 Python 3 标准库零第三方依赖**：
+
+- **内置 12 个 MCP 工具**：`get_album_stats`、`list_folders`、`search_photos`、`get_photo_details`、`get_photo_image`（支持拉取缩放预览图做多模态看图分析）、`list_tags`、`upsert_tag`、`delete_tag`、`tag_photos`、`rate_photos`、`set_photo_note`、`refresh_album_index`。
+- **AI 独立协作者文件与无冲突同步**：AI 的标签、评分与批注会写入 `.drivelens/` 中独立的成员文件（可通过 `DRIVELENS_MEMBER_ID` 自定义，默认 `ai_assistant`），遵循与前端完全一致的 LWW 时间戳合并与软删除 Tombstone 协议，绝不会覆盖人类协作者的记录。
+
+### 认证方式 1：最省心 — 直接复用 Cloudflare Worker 自动续租
+
+1. 先在网页端配置好 **Token 续期接口（可选）** 并登录授权一次（即上文方案 B）。
+2. 在 **连接 Drive → OAuth 账号登录** 中点击 **复制 AI MCP 配置**，将 `/path/to/drivelens/mcp/drivelens_mcp.py` 替换为本机真实脚本路径即可：
+   ```json
+   {
+     "mcpServers": {
+       "drivelens": {
+         "command": "python",
+         "args": ["/path/to/drivelens/mcp/drivelens_mcp.py"],
+         "env": {
+           "DRIVELENS_FOLDER_ID": "<YOUR_FOLDER_ID>",
+           "DRIVELENS_CLIENT_ID": "<YOUR_CLIENT_ID>",
+           "DRIVELENS_RENEWAL_URL": "<YOUR_WORKER_URL>",
+           "DRIVELENS_REFRESH_TICKET": "<COPIED_FROM_BROWSER_KEEP_PRIVATE>"
+         }
+       }
+     }
+   }
+   ```
+3. **工作原理与权限说明**：`mcp/drivelens_mcp.py` 仍调用你自己的 Cloudflare Worker（`workers/oauth-renewal-worker.js` 允许不带 `Origin` 头的本地 CLI 请求）向 Google 换取你的账号临时令牌，权限范围与你网页登录的 `drive` / `drive.file` 账号权限一致。`DRIVELENS_REFRESH_TICKET` 仅保存在你本机配置中，切勿公开分享或提交到仓库。
+
+### 认证方式 2：最小权限物理隔离 — Google Service Account（推荐）
+
+如果希望 AI **从权限上完全隔离**，绝对无法读取你 Google Drive 中的任何其他相册或文件：
+
+1. 在 Google Cloud Console → **IAM 与管理 → 服务账号（Service Accounts）** 创建一个服务账号（例如 `drivelens-bot@my-project.iam.gserviceaccount.com`），生成 JSON 密钥文件并保存在仓库目录之外（如 `/path/to/service-account.json`）。
+2. 在 Google Drive 中**仅右键目标相册文件夹 → 共享**，将该服务账号邮箱设为 **编辑者（Editor）**。
+3. 在 MCP 客户端中按如下配置即可（脚本内纯 Python 实现 RS256 JWT 签名，无需额外库）：
+   ```json
+   {
+     "mcpServers": {
+       "drivelens": {
+         "command": "python",
+         "args": ["/path/to/drivelens/mcp/drivelens_mcp.py"],
+         "env": {
+           "DRIVELENS_FOLDER_ID": "<YOUR_FOLDER_ID>",
+           "GOOGLE_SERVICE_ACCOUNT_JSON": "/path/to/service-account.json",
+           "DRIVELENS_MEMBER_ID": "ai_assistant",
+           "DRIVELENS_MEMBER_NAME": "AI Assistant"
+         }
+       }
+     }
+   }
+   ```
+
+---
+
+## 8. 设计灵感与独立性声明（Design Inspiration & Independence）
 
 - **UX 灵感致敬**：DriveLens 的暗房级视觉配色、高效键盘打分流（`1–5`、`0`、`F`、`T`）以及多图并排对比交互体验灵感源自 [julyx10/lap](https://github.com/julyx10/lap)。
 - **完全独立项目**：DriveLens 从零独立设计与编写，是一款纯前端原生 Web 应用，专为 **Google Drive** 共享文件夹的零安装浏览器/PWA 看图与多人无冲突协同选片而打造。

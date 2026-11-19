@@ -734,7 +734,9 @@ export function renderLightbox(container, store, visiblePhotos) {
     clearDarkroomSettleTimer();
     pointerInChromeZone = false;
     openPointerState = null;
-    closePhotoContextMenu();
+    if (activeLightboxPhotoId) {
+      closePhotoContextMenu();
+    }
     popLightboxHistoryIfNeeded();
     activeLightboxContainer = null;
     activeLightboxPhotoId = null;

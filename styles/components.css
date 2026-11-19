@@ -2036,6 +2036,20 @@ kbd {
   gap: 10px;
 }
 
+.empty-state.is-boot-restoring {
+  opacity: 0;
+  animation: bootRestoreFadeIn 180ms ease 140ms forwards;
+}
+
+@keyframes bootRestoreFadeIn {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
 /* Toast Notifications */
 .toast-container {
   position: fixed;
@@ -2470,4 +2484,26 @@ kbd {
 :is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
   .gallery-month-pill:not(.visible) {
   visibility: hidden;
+}
+
+@media (display-mode: standalone) {
+  .lightbox-bottom {
+    padding-bottom: max(14px, calc(var(--safe-bottom) - 12px));
+  }
+}
+
+@media (display-mode: standalone) and (max-width: 860px) {
+  .gallery-month-pill {
+    bottom: calc(var(--mobile-nav-height) + max(18px, calc(var(--safe-bottom) - 12px)));
+  }
+}
+
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .lightbox-bottom {
+  padding-bottom: max(14px, calc(var(--safe-bottom) - 12px));
+}
+
+@media (max-width: 860px) {
+  html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .gallery-month-pill {
+    bottom: calc(var(--mobile-nav-height) + max(18px, calc(var(--safe-bottom) - 12px)));
+  }
 }

@@ -155,7 +155,7 @@ export function loadConnectPrefs() {
   }
 }
 
-function saveConnectPrefs(patch) {
+export function saveConnectPrefs(patch) {
   try {
     const prev = loadConnectPrefs();
     const next = { ...prev, ...patch };
@@ -166,6 +166,89 @@ function saveConnectPrefs(patch) {
   } catch {
     // Ignore
   }
+}
+
+export function scrubSensitiveUrlParams() {
+  try {
+    if (typeof window === 'undefined' || !window.location || !window.history?.replaceState) {
+      return false;
+    }
+    const sensitiveKeys = [
+      'folder',
+      'client_id',
+      'key',
+      'renewal_url',
+      'worker',
+      'nick',
+      'nickname',
+    ];
+    const searchParams = new URLSearchParams(window.location.search || '');
+    const rawHash = window.location.hash || '';
+    const hashBody = rawHash.startsWith('#') ? rawHash.slice(1) : rawHash;
+    const hashParams = new URLSearchParams(hashBody);
+    let changed = false;
+    for (const k of sensitiveKeys) {
+      if (searchParams.has(k)) {
+        searchParams.delete(k);
+        changed = true;
+      }
+      if (hashParams.has(k)) {
+        hashParams.delete(k);
+        changed = true;
+      }
+    }
+    if (!changed) return false;
+    const nextSearch = searchParams.toString();
+    const nextHash = hashParams.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${nextHash ? `#${nextHash}` : ''}`;
+    window.history.replaceState(null, '', nextUrl);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function detectCloudBootIntent(prefs) {
+  try {
+    if (typeof window !== 'undefined' && window.location) {
+      const sp = new URLSearchParams(window.location.search || '');
+      const hp = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
+      if ((hp.get('folder') || sp.get('folder') || '').trim()) {
+        return true;
+      }
+      const hasOAuthParams =
+        Boolean(
+          (
+            sp.get('code') ||
+            hp.get('access_token') ||
+            sp.get('error') ||
+            hp.get('error') ||
+            ''
+          ).trim()
+        ) && Boolean((sp.get('state') || hp.get('state') || '').trim());
+      if (hasOAuthParams) {
+        const hasPending = Boolean(
+          (typeof sessionStorage !== 'undefined' &&
+            sessionStorage.getItem('drivelens_oauth_redirect_pending_v1')) ||
+            (typeof localStorage !== 'undefined' &&
+              localStorage.getItem('drivelens_oauth_redirect_pending_v1'))
+        );
+        if (hasPending) return true;
+      }
+    }
+  } catch {
+    // Ignore URL/storage read errors
+  }
+  if (!prefs || !prefs.rememberCredentials || !prefs.autoConnect) return false;
+  const folderId = String(prefs.folderId || '').trim();
+  if (!folderId) return false;
+  if (prefs.authType === 'oauth') {
+    return Boolean(String(prefs.clientId || '').trim());
+  }
+  if (prefs.authType === 'apikey') {
+    return Boolean(String(prefs.apiKey || '').trim());
+  }
+  return false;
 }
 
 function loadUiPrefs() {
@@ -231,6 +314,7 @@ const UI_ONLY_STATE_KEYS = new Set([
   'syncMessage',
   'loadingText',
   'backgroundRefreshing',
+  'bootRestoring',
 ]);
 const SELECTION_ONLY_STATE_KEYS = new Set([
   'selectedPhotoIds',
@@ -352,29 +436,40 @@ export class Store {
     const prefs = loadConnectPrefs();
     const uiPrefs = loadUiPrefs();
     const initialPersonas = getDemoPersonas(initialLang);
+    const savedOAuthUser = getSavedOAuthUser(prefs.clientId);
+    const cloudBoot = detectCloudBootIntent(prefs);
 
     this.state = {
       lang: initialLang,
-      mode: 'demo',
+      mode: cloudBoot ? 'gdrive' : 'demo',
       authType: prefs.authType,
-      loading: false,
-      loadingText: '',
+      loading: cloudBoot,
+      loadingText: cloudBoot ? t('store.restoringAlbum') : '',
+      bootRestoring: cloudBoot,
       backgroundRefreshing: false,
       cacheRestoredAt: 0,
-      syncStatus: 'idle',
-      syncMessageKey: 'store.syncDemo',
-      syncMessage: t('store.syncDemo'),
+      syncStatus: cloudBoot ? 'syncing' : 'idle',
+      syncMessageKey: cloudBoot ? 'store.syncCachedRevalidating' : 'store.syncDemo',
+      syncMessage: cloudBoot ? t('store.syncCachedRevalidating') : t('store.syncDemo'),
       apiKey: prefs.apiKey,
       nickname: prefs.nickname,
       clientId: prefs.clientId,
       folderId: prefs.folderId,
       tokenRenewalUrl: prefs.tokenRenewalUrl || '',
       rememberCredentials: prefs.rememberCredentials,
-      savedOAuthUser: getSavedOAuthUser(prefs.clientId),
+      savedOAuthUser,
       canInstallPwa: false,
       localMetaSupported: false,
       accessToken: '',
-      currentUser: { ...initialPersonas[0] },
+      currentUser: cloudBoot
+        ? {
+            id: savedOAuthUser?.id || `nick_${sanitizeMemberKey(prefs.nickname || 'me')}`,
+            name: savedOAuthUser?.name || prefs.nickname || t('store.defaultNickname'),
+            email: savedOAuthUser?.email || '',
+            picture: savedOAuthUser?.picture || '',
+            color: savedOAuthUser?.color || '#38bdf8',
+          }
+        : { ...initialPersonas[0] },
       rootFolder: null,
       folders: [],
       files: [],
@@ -445,7 +540,9 @@ export class Store {
         patchCachedThumbnailLinks(authType, this.state.folderId, patches).catch(() => {});
       }
     });
-    this.loadDemoMode(false);
+    if (!cloudBoot) {
+      this.loadDemoMode(false);
+    }
   }
 
   _normalizeFileRecord(f) {
@@ -804,6 +901,7 @@ export class Store {
       localMetaSupported: false,
       loading: false,
       loadingText: '',
+      bootRestoring: false,
       backgroundRefreshing: false,
       cacheRestoredAt: 0,
       syncStatus: 'idle',
@@ -960,6 +1058,7 @@ export class Store {
           : Boolean(cached.localMetaSupported),
       loading: false,
       loadingText: '',
+      bootRestoring: false,
       backgroundRefreshing: Boolean(backgroundRefreshing),
       cacheRestoredAt: Number(cached.savedAt || Date.now()),
       syncStatus,
@@ -1050,6 +1149,7 @@ export class Store {
         ...(user ? { currentUser: user } : {}),
         loading: false,
         loadingText: '',
+        bootRestoring: false,
         backgroundRefreshing: true,
         syncStatus: 'syncing',
         syncMessageKey: 'store.syncStreamingAlbum',
@@ -1120,6 +1220,7 @@ export class Store {
         localMetaSupported,
         loading: false,
         loadingText: '',
+        bootRestoring: false,
         backgroundRefreshing: false,
         cacheRestoredAt: Date.now(),
         syncStatus,
@@ -1233,10 +1334,16 @@ export class Store {
     const remember = rememberCredentials !== false;
 
     if (!cleanClientId) {
+      if (this.state.loading || this.state.bootRestoring) {
+        this.setState({ loading: false, loadingText: '', bootRestoring: false }, { type: 'ui-only' });
+      }
       this.toast(t('store.missingClientId'), 'error');
       return false;
     }
     if (!cleanFolderId) {
+      if (this.state.loading || this.state.bootRestoring) {
+        this.setState({ loading: false, loadingText: '', bootRestoring: false }, { type: 'ui-only' });
+      }
       this.toast(t('store.invalidFolder'), 'error');
       return false;
     }
@@ -1317,6 +1424,7 @@ export class Store {
       this.setState({
         loading: !keepVisible,
         loadingText: keepVisible ? '' : t('store.connectingAccount'),
+        bootRestoring: false,
         backgroundRefreshing: keepVisible,
         authType: 'oauth',
         localMetaSupported: false,
@@ -1527,13 +1635,19 @@ export class Store {
         this.setState({
           loading: false,
           loadingText: '',
+          bootRestoring: false,
           backgroundRefreshing: false,
           syncStatus: 'readonly',
           syncMessageKey: 'store.syncOfflineCached',
           syncMessage: t('store.syncOfflineCached'),
         });
       } else {
-        this.setState({ loading: false, loadingText: '', backgroundRefreshing: false });
+        this.setState({
+          loading: false,
+          loadingText: '',
+          bootRestoring: false,
+          backgroundRefreshing: false,
+        });
       }
       if (err?.isPopupBlocked) {
         this.openModal('connect');
@@ -1557,10 +1671,16 @@ export class Store {
     const remember = rememberCredentials !== false;
 
     if (!cleanClientId) {
+      if (this.state.loading || this.state.bootRestoring) {
+        this.setState({ loading: false, loadingText: '', bootRestoring: false }, { type: 'ui-only' });
+      }
       this.toast(t('store.missingClientId'), 'error');
       return false;
     }
     if (!cleanFolderId) {
+      if (this.state.loading || this.state.bootRestoring) {
+        this.setState({ loading: false, loadingText: '', bootRestoring: false }, { type: 'ui-only' });
+      }
       this.toast(t('store.invalidFolder'), 'error');
       return false;
     }
@@ -1591,6 +1711,9 @@ export class Store {
     try {
       result = await consumeOAuthRedirectCallback();
     } catch (err) {
+      if (this.state.loading || this.state.bootRestoring) {
+        this.setState({ loading: false, loadingText: '', bootRestoring: false }, { type: 'ui-only' });
+      }
       this.toast(err?.message || t('store.connectFailed'), 'error', 5000);
       return false;
     }
@@ -1654,10 +1777,16 @@ export class Store {
     const remember = rememberCredentials !== false;
 
     if (!cleanApiKey) {
+      if (this.state.loading || this.state.bootRestoring) {
+        this.setState({ loading: false, loadingText: '', bootRestoring: false }, { type: 'ui-only' });
+      }
       this.toast(t('store.missingApiKey'), 'error');
       return false;
     }
     if (!cleanFolderId) {
+      if (this.state.loading || this.state.bootRestoring) {
+        this.setState({ loading: false, loadingText: '', bootRestoring: false }, { type: 'ui-only' });
+      }
       this.toast(t('store.invalidFolder'), 'error');
       return false;
     }
@@ -1749,6 +1878,7 @@ export class Store {
       this.setState({
         loading: !keepVisible,
         loadingText: keepVisible ? '' : t('store.connectingApiKey'),
+        bootRestoring: false,
         backgroundRefreshing: keepVisible,
         authType: 'apikey',
         apiKey: cleanApiKey,
@@ -1916,13 +2046,19 @@ export class Store {
         this.setState({
           loading: false,
           loadingText: '',
+          bootRestoring: false,
           backgroundRefreshing: false,
           syncStatus: 'readonly',
           syncMessageKey: 'store.syncOfflineCached',
           syncMessage: t('store.syncOfflineCached'),
         });
       } else {
-        this.setState({ loading: false, loadingText: '', backgroundRefreshing: false });
+        this.setState({
+          loading: false,
+          loadingText: '',
+          bootRestoring: false,
+          backgroundRefreshing: false,
+        });
       }
       this.toast(err?.message || t('store.connectApiKeyFailed'), 'error', 5000);
       return false;
@@ -1971,6 +2107,9 @@ export class Store {
     }
 
     this.setState({
+      loading: false,
+      loadingText: '',
+      bootRestoring: false,
       authType: 'oauth',
       clientId: cleanClientId,
       folderId: folderInput,
@@ -2070,6 +2209,9 @@ export class Store {
   async restoreSavedSession() {
     const prefs = loadConnectPrefs();
     if (!prefs.rememberCredentials || !prefs.autoConnect || !prefs.folderId) {
+      if (this.state.bootRestoring) {
+        this.loadDemoMode(false);
+      }
       return false;
     }
 
@@ -2170,6 +2312,9 @@ export class Store {
       });
     }
 
+    if (this.state.bootRestoring) {
+      this.loadDemoMode(false);
+    }
     return false;
   }
 
@@ -2779,37 +2924,11 @@ export class Store {
   }
 
   _clearUrlHash() {
-    try {
-      const rawHash = window.location.hash || '';
-      if (!rawHash) return;
-      const body = rawHash.startsWith('#') ? rawHash.slice(1) : rawHash;
-      const params = new URLSearchParams(body);
-      params.delete('folder');
-      params.delete('client_id');
-      params.delete('key');
-      params.delete('renewal_url');
-      const rest = params.toString();
-      const nextUrl = `${window.location.pathname}${window.location.search}${rest ? `#${rest}` : ''}`;
-      window.history.replaceState(null, '', nextUrl);
-    } catch {
-      // Ignore
-    }
+    scrubSensitiveUrlParams();
   }
 
-  _updateUrlHash(folderId, clientId) {
-    try {
-      const params = new URLSearchParams();
-      if (folderId) params.set('folder', folderId);
-      if (clientId && clientId !== APP_CONFIG.DEFAULT_CLIENT_ID) {
-        params.set('client_id', clientId);
-      }
-      const nextHash = params.toString();
-      if (nextHash) {
-        window.history.replaceState(null, '', `#${nextHash}`);
-      }
-    } catch {
-      // Ignore
-    }
+  _updateUrlHash() {
+    scrubSensitiveUrlParams();
   }
 
   // ---------- Computed Selectors ----------
@@ -3911,19 +4030,21 @@ export class Store {
       return true;
     }
 
-    let flushedAny = false;
+    let flushedMember = false;
+    let flushedSchema = false;
     if (this.memberSyncTimer) {
       clearTimeout(this.memberSyncTimer);
       this.memberSyncTimer = null;
       await this._flushMemberSync();
-      flushedAny = true;
+      flushedMember = true;
     }
     if (this.schemaSyncTimer) {
       clearTimeout(this.schemaSyncTimer);
       this.schemaSyncTimer = null;
       await this._flushSchemaSync();
-      flushedAny = true;
+      flushedSchema = true;
     }
+    const flushedAny = flushedMember || flushedSchema;
 
     if (this.state.authType === 'apikey' && this.state.localMetaSupported && !flushedAny) {
       await this._flushApiKeyMetaSync();
@@ -3940,10 +4061,10 @@ export class Store {
     }
 
     if (this.state.authType === 'oauth' && this.state.canWrite && this.state.accessToken) {
-      if (this._unsyncedPhotoIds.size > 0) {
+      if (!flushedMember && this._unsyncedPhotoIds.size > 0) {
         await this._flushMemberSync();
       }
-      if (this._unsyncedSchemaDirty) {
+      if (!flushedSchema && this._unsyncedSchemaDirty) {
         await this._flushSchemaSync();
       }
     }

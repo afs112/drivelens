@@ -280,6 +280,10 @@ export function hasStoredRenewalTicket(clientId, tokenRenewalUrl) {
   return Boolean(getStoredRenewalTicketRecord(clientId, tokenRenewalUrl));
 }
 
+export function getStoredRenewalTicket(clientId, tokenRenewalUrl) {
+  return getStoredRenewalTicketRecord(clientId, tokenRenewalUrl)?.refreshTicket || '';
+}
+
 export function clearSession(options = {}) {
   const shouldClearRenewal = options?.forgetUser === true || options?.clearRenewal === true;
   try {

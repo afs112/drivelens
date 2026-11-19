@@ -2182,17 +2182,24 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
   gridEl.classList.toggle('gallery-select-active', selectActive);
 
   if (store.state.loading) {
+    const loadingSig = store.state.bootRestoring
+      ? '__loading_boot__'
+      : `__loading__|${store.state.loadingText || ''}`;
+    if (lastGridSignature === loadingSig && gridEl.querySelector('.empty-state')) {
+      hideGalleryFloatingUi(scrollContainer);
+      return;
+    }
     clearAllMountedCards();
     activeLayout = null;
     activePhotos = [];
     lastVisiblePhotos = [];
     lastRenderedMode = '';
-    lastGridSignature = '__loading__';
+    lastGridSignature = loadingSig;
     lastTopBleedSig = '';
     gridEl.classList.remove('is-virtual-stage');
     gridEl.style.height = '';
     gridEl.innerHTML = `
-      <div class="empty-state">
+      <div class="empty-state${store.state.bootRestoring ? ' is-boot-restoring' : ''}">
         <div class="spin" style="color:var(--accent)">${icon('refresh', 28)}</div>
         <div style="font-size:14px;color:var(--text-primary)">${escapeHtml(store.state.loadingText || t('gallery.loadingAlbum'))}</div>
       </div>

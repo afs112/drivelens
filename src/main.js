@@ -1,6 +1,16 @@
-import { ensureGoogleIdentityLoaded, getCachedSession } from './api/gdrive.js';
+import {
+  ensureGoogleIdentityLoaded,
+  getCachedSession,
+  normalizeRenewalEndpoint,
+  parseDriveFolderId,
+} from './api/gdrive.js';
 import { t } from './i18n.js';
-import { loadConnectPrefs, Store } from './state/store.js';
+import {
+  loadConnectPrefs,
+  saveConnectPrefs,
+  scrubSensitiveUrlParams,
+  Store,
+} from './state/store.js';
 import { syncServiceWorkerAuth, updateSmartHdSchedule } from './storage/imageLoader.js';
 import { closePhotoContextMenu } from './ui/contextMenu.js';
 import {
@@ -176,39 +186,47 @@ if (typeof ResizeObserver !== 'undefined' && galleryScroll) {
   resizeObserver.observe(galleryScroll);
 }
 
-function handleInitialUrlHash() {
+async function handleInitialUrlHash() {
+  const searchParams = new URLSearchParams(window.location.search || '');
   const rawHash = window.location.hash || '';
   const hashBody = rawHash.startsWith('#') ? rawHash.slice(1) : rawHash;
-  if (!hashBody) {
-    store.restoreSavedSession();
-    return;
-  }
+  const hashParams = new URLSearchParams(hashBody);
+  const getParam = (name) => (hashParams.get(name) ?? searchParams.get(name) ?? '').trim();
 
-  const params = new URLSearchParams(hashBody);
-  const langParam = (params.get('lang') || '').trim().toLowerCase();
+  const langParam = getParam('lang').toLowerCase();
   if (langParam === 'en' || langParam === 'zh') {
     store.setLanguage(langParam);
   }
 
-  const layoutParam = (params.get('layout') || '').trim().toLowerCase();
+  const layoutParam = getParam('layout').toLowerCase();
   if (layoutParam === 'justified' || layoutParam === 'waterfall' || layoutParam === 'grid') {
     store.setLayoutMode(layoutParam);
   }
 
-  const folderInput = (params.get('folder') || '').trim();
+  const folderInput = getParam('folder');
+  const keyParam = getParam('key');
+  const clientIdParam = getParam('client_id');
+  const renewalParam = normalizeRenewalEndpoint(getParam('renewal_url') || getParam('worker'));
+  const nickParam = getParam('nick') || getParam('nickname');
+
+  scrubSensitiveUrlParams();
+
   if (!folderInput) {
-    store.restoreSavedSession();
-    return;
+    if (renewalParam || clientIdParam || keyParam || nickParam) {
+      const prePatch = {};
+      if (renewalParam) prePatch.tokenRenewalUrl = renewalParam;
+      if (clientIdParam) prePatch.clientId = clientIdParam;
+      if (keyParam) prePatch.apiKey = keyParam;
+      if (nickParam) prePatch.nickname = nickParam;
+      saveConnectPrefs(prePatch);
+      store.setState(prePatch, { type: 'ui-only' });
+    }
+    return store.restoreSavedSession();
   }
 
   const prefs = loadConnectPrefs();
-  const keyParam = (params.get('key') || '').trim();
-  const clientIdParam = (params.get('client_id') || '').trim();
-  const renewalUrlParam = (params.get('renewal_url') || '').trim();
-  const nickname =
-    (params.get('nick') || params.get('nickname') || '').trim() ||
-    store.state.nickname ||
-    prefs.nickname;
+  const parsedFolder = parseDriveFolderId(folderInput) || folderInput;
+  const nickname = nickParam || store.state.nickname || prefs.nickname;
 
   const authType = keyParam
     ? 'apikey'
@@ -219,24 +237,40 @@ function handleInitialUrlHash() {
   const apiKey = keyParam || store.state.apiKey || prefs.apiKey || '';
   const clientId = clientIdParam || store.state.clientId || prefs.clientId || '';
   const tokenRenewalUrl =
-    renewalUrlParam || store.state.tokenRenewalUrl || prefs.tokenRenewalUrl || '';
+    renewalParam || store.state.tokenRenewalUrl || prefs.tokenRenewalUrl || '';
 
   if (authType === 'apikey' && apiKey) {
+    saveConnectPrefs({
+      authType: 'apikey',
+      apiKey,
+      folderId: parsedFolder,
+      nickname,
+      rememberCredentials: true,
+      autoConnect: true,
+    });
     store.setState({
-      folderId: folderInput,
+      folderId: parsedFolder,
       apiKey,
       authType: 'apikey',
+      nickname,
     });
-    store.connectWithApiKey({
+    return store.connectWithApiKey({
       apiKey,
       folderInput,
       nickname,
     });
-    return;
   }
 
+  saveConnectPrefs({
+    authType: 'oauth',
+    clientId,
+    folderId: parsedFolder,
+    tokenRenewalUrl,
+    rememberCredentials: true,
+    autoConnect: true,
+  });
   store.setState({
-    folderId: folderInput,
+    folderId: parsedFolder,
     clientId,
     apiKey,
     authType,
@@ -245,35 +279,48 @@ function handleInitialUrlHash() {
 
   const cached = clientId ? getCachedSession(clientId) : null;
   if (cached) {
-    store.connectGoogleDrive({
+    return store.connectGoogleDrive({
       clientId,
       folderInput,
       tokenRenewalUrl,
       reuseSession: true,
     });
-  } else {
-    store.restoreExpiredOAuthCacheOrPrompt({
-      clientId,
-      folderInput,
-      tokenRenewalUrl,
-    });
   }
+  return store.restoreExpiredOAuthCacheOrPrompt({
+    clientId,
+    folderInput,
+    tokenRenewalUrl,
+  });
 }
 
 const bootPrefs = loadConnectPrefs();
+const bootSearchParams = new URLSearchParams(window.location.search || '');
 const bootHashParams = new URLSearchParams((window.location.hash || '').replace(/^#/, ''));
 if (
   bootPrefs.authType === 'oauth' ||
   Boolean(String(bootPrefs.clientId || '').trim()) ||
-  Boolean((bootHashParams.get('client_id') || '').trim())
+  Boolean((bootHashParams.get('client_id') || bootSearchParams.get('client_id') || '').trim())
 ) {
   ensureGoogleIdentityLoaded().catch(() => {});
 }
 
 (async () => {
-  const handledRedirect = await store.handleOAuthRedirectReturn();
-  if (!handledRedirect) {
-    handleInitialUrlHash();
+  try {
+    const handledRedirect = await store.handleOAuthRedirectReturn();
+    if (!handledRedirect) {
+      await handleInitialUrlHash();
+    }
+  } finally {
+    if (store.state.bootRestoring) {
+      if (store.state.files.length === 0 && !store.state.modal) {
+        store.loadDemoMode(false);
+      } else {
+        store.setState(
+          { loading: false, loadingText: '', bootRestoring: false },
+          { type: 'ui-only' }
+        );
+      }
+    }
   }
 })();
 

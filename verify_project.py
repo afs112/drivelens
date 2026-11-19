@@ -17,7 +17,10 @@ Checks:
 """
 
 from html.parser import HTMLParser
+import base64
+import hashlib
 import http.client
+import importlib.util
 import io
 import json
 import os
@@ -1912,24 +1915,24 @@ def verify_mobile_ux(parsed_js):
         if missing:
             errors.append(f"{rel_js} missing touch handler(s): {missing}")
 
-    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v16'
+    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v17'
     checks += 1
     sw_path = ROOT_DIR / "sw.js"
     if not sw_path.is_file():
         errors.append("Missing sw.js")
     else:
         sw_toks = tokenize_js(sw_path.read_text(encoding="utf-8"), filename="sw.js")
-        has_v16 = any(
+        has_v17 = any(
             sw_toks[i].kind == "IDENT"
             and sw_toks[i].value == "CACHE_NAME"
             and sw_toks[i + 1].kind == "PUNCT"
             and sw_toks[i + 1].value == "="
             and sw_toks[i + 2].kind == "STRING"
-            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v16"
+            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v17"
             for i in range(len(sw_toks) - 2)
         )
-        if not has_v16:
-            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v16'")
+        if not has_v17:
+            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v17'")
 
     # 5. workers/oauth-renewal-worker.js exists, tokenizes cleanly, and exports default fetch handler
     checks += 1
@@ -1987,6 +1990,386 @@ def verify_mobile_ux(parsed_js):
             errors.append("README.md modified or missing exact '## Design Inspiration & Independence' section")
 
     return {"checks": checks}, errors
+
+
+def _der_len(length):
+    if length < 0x80:
+        return bytes([length])
+    encoded = length.to_bytes((length.bit_length() + 7) // 8, "big")
+    return bytes([0x80 | len(encoded)]) + encoded
+
+
+def _der_tlv(tag, payload):
+    return bytes([tag]) + _der_len(len(payload)) + payload
+
+
+def _der_int(val):
+    if val == 0:
+        raw = b"\x00"
+    else:
+        raw = val.to_bytes((val.bit_length() + 7) // 8, "big")
+        if raw[0] & 0x80:
+            raw = b"\x00" + raw
+    return _der_tlv(0x02, raw)
+
+
+def _is_probable_prime(n):
+    if n < 2 or n % 2 == 0:
+        return False
+    for p in (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41):
+        if n == p:
+            return True
+        if n % p == 0:
+            return False
+    d = n - 1
+    r = 0
+    while d % 2 == 0:
+        d //= 2
+        r += 1
+    for a in (2, 3, 5, 7, 11, 13, 17):
+        if a >= n:
+            continue
+        x = pow(a, d, n)
+        if x == 1 or x == n - 1:
+            continue
+        for _ in range(r - 1):
+            x = pow(x, 2, n)
+            if x == n - 1:
+                break
+        else:
+            return False
+    return True
+
+
+def _next_prime(start):
+    cand = start | 1
+    while not _is_probable_prime(cand):
+        cand += 2
+    return cand
+
+
+def verify_mcp_server():
+    checks = 0
+    errors = []
+    mcp_path = ROOT_DIR / "mcp" / "drivelens_mcp.py"
+    if not mcp_path.is_file():
+        return {"checks": 1, "tools": 0}, ["Missing mcp/drivelens_mcp.py"]
+
+    spec = importlib.util.spec_from_file_location("drivelens_mcp", mcp_path)
+    mcp_mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mcp_mod)
+
+    # 1. sanitize_member_key JS/Python parity
+    checks += 1
+    expected_keys = {
+        "ai_assistant": "ai_assistant_2202u",
+        "Alex": "alex_1s8bi",
+        "member_1": "member_1_aqnqk",
+        "": "member_htocb",
+    }
+    for raw_id, expected_key in expected_keys.items():
+        actual_key = mcp_mod.sanitize_member_key(raw_id)
+        if actual_key != expected_key:
+            errors.append(f"sanitize_member_key({raw_id!r}) expected {expected_key!r}, got {actual_key!r}")
+
+    # 2. merge_tag_schemas LWW + tombstone retention
+    checks += 1
+    merged = mcp_mod.merge_tag_schemas(
+        {
+            "version": 1,
+            "tags": {
+                "keep_local": {"name": "Portrait New", "color": "blue", "group": "Style", "updatedAt": 200},
+                "del_local": {"name": "Trash", "color": "gray", "group": "", "updatedAt": 300, "deleted": True},
+            },
+        },
+        {
+            "version": 1,
+            "tags": {
+                "keep_local": {"name": "Portrait Old", "color": "red", "group": "Style", "updatedAt": 100},
+                "del_local": {"name": "Trash Revive?", "color": "gray", "group": "", "updatedAt": 250},
+                "remote_only": {"name": "Sunset", "color": "amber", "group": "Light", "updatedAt": 150},
+            },
+        },
+    )
+    mtags = merged.get("tags") or {}
+    if (mtags.get("keep_local") or {}).get("name") != "Portrait New":
+        errors.append(f"merge_tag_schemas LWW failed: {mtags.get('keep_local')!r}")
+    if not (mtags.get("del_local") or {}).get("deleted"):
+        errors.append("merge_tag_schemas failed to preserve newer deleted tombstone")
+    if (mtags.get("remote_only") or {}).get("name") != "Sunset":
+        errors.append("merge_tag_schemas dropped remote-only tag")
+
+    # 3. RS256 DER key parsing + PKCS#1 v1.5 signing verification (programmatic keypair, no PEM literals)
+    checks += 1
+    p = _next_prime((1 << 259) + 101)
+    q = _next_prime((1 << 259) + 5003)
+    n = p * q
+    e = 65537
+    d = pow(e, -1, (p - 1) * (q - 1))
+    pkcs1_der = _der_tlv(0x30, _der_int(0) + _der_int(n) + _der_int(e) + _der_int(d))
+    rsa_oid = bytes.fromhex("06092a864886f70d0101010500")
+    pkcs8_der = _der_tlv(0x30, _der_int(0) + _der_tlv(0x30, rsa_oid) + _der_tlv(0x04, pkcs1_der))
+
+    for der_label, der_bytes in (("PKCS#1", pkcs1_der), ("PKCS#8", pkcs8_der)):
+        pn, pe, pd = mcp_mod.parse_rsa_private_key_der(der_bytes)
+        if (pn, pe, pd) != (n, e, d):
+            errors.append(f"parse_rsa_private_key_der mismatch for {der_label}")
+
+    msg_bytes = b"drivelens.mcp.rs256.test"
+    sig = mcp_mod.sign_rs256_pkcs1v15(msg_bytes, n, d)
+    k = (n.bit_length() + 7) // 8
+    em_verified = pow(int.from_bytes(sig, "big"), e, n).to_bytes(k, "big")
+    digest = hashlib.sha256(msg_bytes).digest()
+    t_block = mcp_mod.SHA256_DIGEST_INFO_PREFIX + digest
+    expected_em = b"\x00\x01" + (b"\xff" * (k - len(t_block) - 3)) + b"\x00" + t_block
+    if em_verified != expected_em:
+        errors.append("RS256 signature verification failed against PKCS#1 v1.5 padding")
+
+    jwt_str = mcp_mod.build_signed_jwt("bot@example.invalid", pkcs8_der)
+    jwt_parts = jwt_str.split(".")
+    if len(jwt_parts) != 3:
+        errors.append(f"build_signed_jwt returned {len(jwt_parts)} parts")
+    else:
+        jwt_pad = jwt_parts[2] + "=" * ((-len(jwt_parts[2])) % 4)
+        jwt_sig = base64.urlsafe_b64decode(jwt_pad.encode("ascii"))
+        jwt_em = pow(int.from_bytes(jwt_sig, "big"), e, n).to_bytes(k, "big")
+        jwt_digest = hashlib.sha256(f"{jwt_parts[0]}.{jwt_parts[1]}".encode("ascii")).digest()
+        jwt_t = mcp_mod.SHA256_DIGEST_INFO_PREFIX + jwt_digest
+        jwt_expected_em = b"\x00\x01" + (b"\xff" * (k - len(jwt_t) - 3)) + b"\x00" + jwt_t
+        if jwt_em != jwt_expected_em:
+            errors.append("build_signed_jwt RS256 signature failed public-exponent verification")
+
+    # 4. McpStdioServer protocol + mock Drive transport across all 12 tools
+    class FakeDriveTransport:
+        def __init__(self):
+            self.root_id = "folder_root"
+            self.sub_id = "folder_sub"
+            self.meta_id = "folder_meta"
+            self.next_id = 100
+            self.files_meta = {
+                self.root_id: {
+                    "id": self.root_id,
+                    "name": "MCP Test Album",
+                    "mimeType": mcp_mod.FOLDER_MIME,
+                    "capabilities": {"canAddChildren": True, "canEdit": True},
+                },
+                self.sub_id: {
+                    "id": self.sub_id,
+                    "name": "Day 1",
+                    "mimeType": mcp_mod.FOLDER_MIME,
+                    "parents": [self.root_id],
+                },
+                self.meta_id: {
+                    "id": self.meta_id,
+                    "name": ".drivelens",
+                    "mimeType": mcp_mod.FOLDER_MIME,
+                    "parents": [self.root_id],
+                },
+                "photo_1": {
+                    "id": "photo_1",
+                    "name": "IMG_0001.JPG",
+                    "mimeType": "image/jpeg",
+                    "parents": [self.root_id],
+                    "size": "102400",
+                    "createdTime": "2026-10-01T10:00:00Z",
+                    "modifiedTime": "2026-10-01T10:00:00Z",
+                    "thumbnailLink": "https://lh3.googleusercontent.com/d/photo_1=s220",
+                    "imageMediaMetadata": {"width": 4000, "height": 3000, "cameraModel": "X-T5"},
+                },
+                "photo_2": {
+                    "id": "photo_2",
+                    "name": "IMG_0002.JPG",
+                    "mimeType": "image/jpeg",
+                    "parents": [self.sub_id],
+                    "size": "204800",
+                    "createdTime": "2026-10-02T10:00:00Z",
+                    "modifiedTime": "2026-10-02T10:00:00Z",
+                    "thumbnailLink": "https://lh3.googleusercontent.com/d/photo_2=s220",
+                    "imageMediaMetadata": {"width": 3000, "height": 4000, "cameraModel": "A7C2"},
+                },
+            }
+            self.json_docs = {
+                "meta_schema_file": {
+                    "version": 1,
+                    "tags": {
+                        "hero": {"name": "Hero Shot", "color": "amber", "group": "Pick", "updatedAt": 1000},
+                    },
+                },
+                "meta_human_file": {
+                    "version": 1,
+                    "member": {"id": "alex", "name": "Alex", "color": "#22d3ee"},
+                    "items": {
+                        "photo_1": {
+                            "rating": 4,
+                            "favorite": True,
+                            "note": "Great light",
+                            "updatedAt": 1000,
+                            "tags": {"hero": {"active": True, "updatedAt": 1000}},
+                        }
+                    },
+                },
+            }
+            self.meta_entries = {
+                "meta_schema_file": "tags-schema.json",
+                "meta_human_file": "member-alex_1s8bi.json",
+            }
+
+        def request(self, method, url, body=None, headers=None, expect_json=True):
+            parsed = urllib.parse.urlparse(url)
+            if not expect_json:
+                return b"\xff\xd8\xff\xe0FAKEJPEGDATA", "image/jpeg"
+
+            qs = urllib.parse.parse_qs(parsed.query)
+            if method == "GET" and parsed.path.startswith("/drive/v3/files/"):
+                fid = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+                if qs.get("alt") == ["media"]:
+                    return json.loads(json.dumps(self.json_docs[fid]))
+                if fid in self.files_meta:
+                    return dict(self.files_meta[fid])
+                raise RuntimeError(f"Mock 404 for {fid}")
+
+            if method == "GET" and parsed.path == "/drive/v3/files":
+                q_str = (qs.get("q") or [""])[0]
+                if f"'{self.meta_id}' in parents" in q_str:
+                    m = re.search(r"name = '([^']+)'", q_str)
+                    target_name = m.group(1) if m else ""
+                    out = [
+                        {"id": mid, "name": mname}
+                        for mid, mname in self.meta_entries.items()
+                        if not target_name or mname == target_name
+                    ]
+                    return {"files": out}
+                requested_parents = set(re.findall(r"'([^']+)' in parents", q_str))
+                out = [
+                    dict(entry)
+                    for entry in self.files_meta.values()
+                    if any(pid in requested_parents for pid in (entry.get("parents") or []))
+                ]
+                return {"files": out}
+
+            if method == "POST" and parsed.path == "/upload/drive/v3/files":
+                raw_text = body.decode("utf-8")
+                parts = raw_text.split("\r\n\r\n")
+                meta_obj = json.loads(parts[1].split("\r\n--")[0])
+                payload_obj = json.loads(parts[2].split("\r\n--")[0])
+                self.next_id += 1
+                new_id = f"meta_created_{self.next_id}"
+                self.meta_entries[new_id] = meta_obj["name"]
+                self.json_docs[new_id] = payload_obj
+                return {"id": new_id, "name": meta_obj["name"]}
+
+            if method == "PATCH" and parsed.path.startswith("/upload/drive/v3/files/"):
+                fid = urllib.parse.unquote(parsed.path.rsplit("/", 1)[-1])
+                self.json_docs[fid] = json.loads(body.decode("utf-8"))
+                return {"id": fid}
+
+            raise RuntimeError(f"Unhandled mock route: {method} {url}")
+
+    transport = FakeDriveTransport()
+    client = mcp_mod.DriveLensClient("https://drive.google.com/drive/folders/folder_root", transport)
+    server = mcp_mod.McpStdioServer(lambda: client)
+
+    def _call_tool(name, args=None, req_id=1):
+        resp = server.handle_message(
+            {"jsonrpc": "2.0", "id": req_id, "method": "tools/call", "params": {"name": name, "arguments": args or {}}}
+        )
+        res = (resp or {}).get("result") or {}
+        if res.get("isError"):
+            errors.append(f"MCP tool {name} returned isError: {res}")
+            return None, res
+        text_items = [c.get("text", "") for c in (res.get("content") or []) if c.get("type") == "text"]
+        parsed_json = json.loads(text_items[0]) if text_items else {}
+        return parsed_json, res
+
+    checks += 1
+    init_resp = server.handle_message({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {"protocolVersion": "2024-11-05"}})
+    if ((init_resp or {}).get("result") or {}).get("serverInfo", {}).get("name") != "drivelens-mcp":
+        errors.append(f"Unexpected MCP initialize response: {init_resp!r}")
+
+    ping_resp = server.handle_message({"jsonrpc": "2.0", "id": 2, "method": "ping"})
+    if (ping_resp or {}).get("result") != {}:
+        errors.append(f"Unexpected MCP ping response: {ping_resp!r}")
+
+    list_resp = server.handle_message({"jsonrpc": "2.0", "id": 3, "method": "tools/list"})
+    listed_tools = [t["name"] for t in ((list_resp or {}).get("result") or {}).get("tools") or []]
+    expected_tools = {
+        "get_album_stats",
+        "list_folders",
+        "search_photos",
+        "get_photo_details",
+        "get_photo_image",
+        "list_tags",
+        "upsert_tag",
+        "delete_tag",
+        "tag_photos",
+        "rate_photos",
+        "set_photo_note",
+        "refresh_album_index",
+    }
+    if len(listed_tools) != 12 or set(listed_tools) != expected_tools:
+        errors.append(f"MCP tools/list mismatch: {listed_tools!r}")
+
+    checks += 1
+    stats_before, _ = _call_tool("get_album_stats", req_id=10)
+    if (stats_before or {}).get("totalItems") != 2 or (stats_before or {}).get("untaggedCount") != 1:
+        errors.append(f"get_album_stats unexpected: {stats_before!r}")
+
+    folders_res, _ = _call_tool("list_folders", req_id=11)
+    if len((folders_res or {}).get("folders") or []) != 2:
+        errors.append(f"list_folders unexpected: {folders_res!r}")
+
+    up_tag, _ = _call_tool("upsert_tag", {"id": "sunset_pick", "name": "Sunset Pick", "color": "pink", "group": "AI"}, req_id=12)
+    if (up_tag or {}).get("id") != "sunset_pick":
+        errors.append(f"upsert_tag failed: {up_tag!r}")
+
+    tag_op, _ = _call_tool("tag_photos", {"photo_ids": ["photo_2"], "add_tag_ids": ["sunset_pick"]}, req_id=13)
+    if (tag_op or {}).get("updatedCount") != 1:
+        errors.append(f"tag_photos failed: {tag_op!r}")
+
+    rate_op, _ = _call_tool("rate_photos", {"photo_ids": ["photo_2"], "rating": 5, "favorite": True}, req_id=14)
+    if (rate_op or {}).get("updatedCount") != 1 or (rate_op or {}).get("rating") != 5:
+        errors.append(f"rate_photos failed: {rate_op!r}")
+
+    note_op, _ = _call_tool("set_photo_note", {"photo_id": "photo_2", "note": "AI sharp portrait"}, req_id=15)
+    if (note_op or {}).get("updatedCount") != 1:
+        errors.append(f"set_photo_note failed: {note_op!r}")
+
+    ai_doc_name = "member-ai_assistant_2202u.json"
+    if ai_doc_name not in transport.meta_entries.values():
+        errors.append(f"Expected isolated AI member JSON {ai_doc_name} in Drive .drivelens/, got {list(transport.meta_entries.values())!r}")
+
+    search_tagged, _ = _call_tool("search_photos", {"tag_ids": ["sunset_pick"], "min_rating": 5}, req_id=16)
+    tagged_items = (search_tagged or {}).get("items") or []
+    if len(tagged_items) != 1 or tagged_items[0].get("id") != "photo_2":
+        errors.append(f"search_photos(tag_ids, min_rating) failed: {search_tagged!r}")
+
+    search_untagged, _ = _call_tool("search_photos", {"untagged_only": True}, req_id=17)
+    if len((search_untagged or {}).get("items") or []) != 0:
+        errors.append(f"search_photos(untagged_only=True) expected 0 after tagging photo_2, got: {search_untagged!r}")
+
+    details_res, _ = _call_tool("get_photo_details", {"photo_id": "photo_2"}, req_id=18)
+    details_meta = (details_res or {}).get("meta") or {}
+    if details_meta.get("avgRating") != 5.0 or "sunset_pick" not in (details_meta.get("activeTagIds") or []):
+        errors.append(f"get_photo_details unexpected: {details_res!r}")
+
+    _, img_raw_res = _call_tool("get_photo_image", {"photo_id": "photo_2", "size": 640}, req_id=19)
+    img_blocks = [c for c in (img_raw_res.get("content") or []) if c.get("type") == "image"]
+    if not img_blocks or img_blocks[0].get("mimeType") != "image/jpeg" or not img_blocks[0].get("data"):
+        errors.append(f"get_photo_image missing image block: {img_raw_res!r}")
+
+    del_op, _ = _call_tool("delete_tag", {"tag_id": "sunset_pick"}, req_id=20)
+    if not (del_op or {}).get("deleted"):
+        errors.append(f"delete_tag failed: {del_op!r}")
+
+    list_tags_after, _ = _call_tool("list_tags", req_id=21)
+    if any(t.get("id") == "sunset_pick" for t in (list_tags_after or {}).get("tags") or []):
+        errors.append(f"delete_tag did not hide sunset_pick in list_tags: {list_tags_after!r}")
+
+    refresh_res, _ = _call_tool("refresh_album_index", req_id=22)
+    if (refresh_res or {}).get("totalItems") != 2 or not (refresh_res or {}).get("refreshed"):
+        errors.append(f"refresh_album_index failed: {refresh_res!r}")
+
+    return {"checks": checks, "tools": len(listed_tools)}, errors
 
 
 def main():
@@ -2107,7 +2490,18 @@ def main():
             print(f"      - {e}")
         all_errors.extend(mob_errors)
     else:
-        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v16, worker export, and README section preserved.")
+        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v17, worker export, and README section preserved.")
+
+    # (k) Local stdio MCP server verification
+    mcp_info, mcp_errors = verify_mcp_server()
+    print(f"[k] MCP server check: {mcp_info['checks']} checks, {mcp_info['tools']} tools")
+    if mcp_errors:
+        print(f"    FAIL ({len(mcp_errors)} errors):")
+        for e in mcp_errors:
+            print(f"      - {e}")
+        all_errors.extend(mcp_errors)
+    else:
+        print("    PASS: 12 MCP tools, JS-exact member keys, LWW tag schema merge, RS256 DER signing, and mock Drive round-trip verified.")
 
     print("=" * 56)
     if all_errors:
