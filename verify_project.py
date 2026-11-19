@@ -1909,24 +1909,24 @@ def verify_mobile_ux(parsed_js):
         if missing:
             errors.append(f"{rel_js} missing touch handler(s): {missing}")
 
-    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v14'
+    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v15'
     checks += 1
     sw_path = ROOT_DIR / "sw.js"
     if not sw_path.is_file():
         errors.append("Missing sw.js")
     else:
         sw_toks = tokenize_js(sw_path.read_text(encoding="utf-8"), filename="sw.js")
-        has_v14 = any(
+        has_v15 = any(
             sw_toks[i].kind == "IDENT"
             and sw_toks[i].value == "CACHE_NAME"
             and sw_toks[i + 1].kind == "PUNCT"
             and sw_toks[i + 1].value == "="
             and sw_toks[i + 2].kind == "STRING"
-            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v14"
+            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v15"
             for i in range(len(sw_toks) - 2)
         )
-        if not has_v14:
-            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v14'")
+        if not has_v15:
+            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v15'")
 
     # 5. workers/oauth-renewal-worker.js exists, tokenizes cleanly, and exports default fetch handler
     checks += 1
@@ -2104,7 +2104,7 @@ def main():
             print(f"      - {e}")
         all_errors.extend(mob_errors)
     else:
-        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v14, worker export, and README section preserved.")
+        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v15, worker export, and README section preserved.")
 
     print("=" * 56)
     if all_errors:

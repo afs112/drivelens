@@ -4,6 +4,7 @@ import {
   buildDesktopDragDownloadSpec,
   cancelElementPhotoLoad,
   getAdaptiveThumbTier,
+  getInstantCachedSrc,
   loadPhotoIntoElement,
   preloadPhoto,
   quantizeThumbSize,
@@ -75,6 +76,37 @@ function readGalleryViewportHeight(scrollContainer) {
   );
 }
 
+export function syncDarkroomOverlayState(state) {
+  if (typeof document === 'undefined') return false;
+  const root = document.documentElement;
+  const isIos = detectIosDevice();
+  root.classList.toggle('is-ios-device', isIos);
+  const isDarkroom = Boolean(state?.lightboxPhotoId || isCompareOpen());
+  root.classList.toggle('has-darkroom-overlay', isDarkroom);
+  if (isIos) {
+    if (isDarkroom) {
+      let themeMeta = document.querySelector('meta[name="theme-color"]');
+      if (!themeMeta && document.head) {
+        themeMeta = document.createElement('meta');
+        themeMeta.setAttribute('name', 'theme-color');
+        document.head.appendChild(themeMeta);
+      }
+      themeMeta?.setAttribute('content', '#050608');
+    } else {
+      document.querySelectorAll('meta[name="theme-color"]').forEach((el) => el.remove());
+    }
+  } else if (state) {
+    let themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (!themeMeta && document.head) {
+      themeMeta = document.createElement('meta');
+      themeMeta.setAttribute('name', 'theme-color');
+      document.head.appendChild(themeMeta);
+    }
+    themeMeta?.setAttribute('content', state.theme === 'light' ? '#f4f6f9' : '#0b0d10');
+  }
+  return isDarkroom;
+}
+
 function syncIosSafariDocScrollMode(state) {
   if (typeof document === 'undefined' || typeof window === 'undefined') return false;
   const root = document.documentElement;
@@ -88,14 +120,11 @@ function syncIosSafariDocScrollMode(state) {
   const enabled = autoIosDocScroll || root.dataset.forceDocScroll === 'true';
   root.classList.toggle('ios-safari-doc-scroll', enabled);
 
-  const hasOverlay = Boolean(
-    state?.lightboxPhotoId ||
-      state?.modal ||
-      state?.sidebarOpen ||
-      state?.inspectorOpen ||
-      isCompareOpen()
+  const hasOverlayLock = Boolean(
+    state?.modal || state?.sidebarOpen || state?.inspectorOpen
   );
-  root.classList.toggle('has-overlay-lock', hasOverlay);
+  root.classList.toggle('has-overlay-lock', hasOverlayLock);
+  syncDarkroomOverlayState(state);
   return enabled;
 }
 
@@ -757,6 +786,9 @@ const mountedCardsById = new Map();
 const freeCardPool = [];
 const recentLookaheadPreloads = new Map();
 let stageLayerEl = null;
+let topBleedEl = null;
+let lastTopBleedSig = '';
+let lastLogicalTop = 0;
 
 let cachedLayout = null;
 let activeLayout = null;
@@ -966,10 +998,82 @@ function applyCardGeometry(card, x, relY, w, h, isWaterfall) {
   }
 }
 
+function syncGalleryTopBleed(layout, visiblePhotos, logicalTop = 0) {
+  if (!topBleedEl || !layout || !visiblePhotos || visiblePhotos.length === 0) return;
+  if (!document.documentElement.classList.contains('is-ios-device')) {
+    if (lastTopBleedSig) {
+      topBleedEl.replaceChildren();
+      lastTopBleedSig = '';
+    }
+    return;
+  }
+  if (logicalTop > 160) return;
+
+  const srcs = [];
+  const limit = Math.min(layout.count, 16);
+  for (let idx = 0; idx < limit && srcs.length < 3; idx += 1) {
+    if (layout.itemY[idx] > 160) continue;
+    const file = visiblePhotos[idx];
+    if (!file) continue;
+    const cardImg = mountedCardsById.get(file.id)?.el?._imgEl;
+    const domReady = Boolean(
+      cardImg &&
+        (Number(cardImg.dataset.loadedSize || 0) > 0 ||
+          (cardImg.complete && cardImg.naturalWidth > 0))
+    );
+    const domSrc = domReady ? cardImg.currentSrc || cardImg.getAttribute('src') || '' : '';
+    const src = domSrc || getInstantCachedSrc(file);
+    if (src && (file.isDemo || !src.startsWith('data:image/svg+xml'))) {
+      srcs.push(src);
+    }
+  }
+
+  const sig = srcs.join('|');
+  if (sig === lastTopBleedSig) return;
+  lastTopBleedSig = sig;
+  if (srcs.length === 0) {
+    topBleedEl.replaceChildren();
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  for (let i = 0; i < srcs.length; i += 1) {
+    const sliceImg = document.createElement('img');
+    sliceImg.className = 'gallery-top-bleed-slice';
+    sliceImg.alt = '';
+    sliceImg.decoding = 'async';
+    sliceImg.draggable = false;
+    sliceImg.setAttribute('aria-hidden', 'true');
+    sliceImg.src = srcs[i];
+    frag.appendChild(sliceImg);
+  }
+  topBleedEl.replaceChildren(frag);
+}
+
 function ensureStageDom(gridEl, physicalTotalHeight) {
+  if (!topBleedEl) {
+    topBleedEl = document.createElement('div');
+    topBleedEl.id = 'galleryTopBleed';
+    topBleedEl.className = 'gallery-top-bleed';
+    topBleedEl.setAttribute('aria-hidden', 'true');
+  }
   if (!stageLayerEl) {
     stageLayerEl = document.createElement('div');
     stageLayerEl.className = 'virtual-stage-layer';
+    stageLayerEl.addEventListener(
+      'load',
+      (e) => {
+        if (
+          e.target?.tagName === 'IMG' &&
+          lastLogicalTop <= 160 &&
+          document.documentElement.classList.contains('is-ios-device') &&
+          activeLayout &&
+          activePhotos.length > 0
+        ) {
+          syncGalleryTopBleed(activeLayout, activePhotos, lastLogicalTop);
+        }
+      },
+      true
+    );
   }
   gridEl.classList.add('is-virtual-stage');
   const nextHeightStr = `${Math.ceil(physicalTotalHeight)}px`;
@@ -977,8 +1081,12 @@ function ensureStageDom(gridEl, physicalTotalHeight) {
     gridEl.style.height = nextHeightStr;
     lastStageHeightAttr = nextHeightStr;
   }
-  if (stageLayerEl.parentElement !== gridEl || gridEl.childElementCount !== 1) {
-    gridEl.replaceChildren(stageLayerEl);
+  if (
+    topBleedEl.parentElement !== gridEl ||
+    stageLayerEl.parentElement !== gridEl ||
+    gridEl.childElementCount !== 2
+  ) {
+    gridEl.replaceChildren(topBleedEl, stageLayerEl);
   }
 }
 
@@ -1113,6 +1221,7 @@ function syncVirtualViewport(
   const rawScrollTop = readGalleryScrollTop(scrollContainer);
   const clampedScrollTop = Math.min(rawScrollTop, metrics.maxPhysicalScroll);
   const logicalTop = scrollTopToLogicalTop(layout, clampedScrollTop, vh);
+  lastLogicalTop = logicalTop;
   const vy = Number(scrollContainer._dlScrollVelocityY || 0);
   const absVy = Math.abs(vy);
 
@@ -1263,6 +1372,8 @@ function syncVirtualViewport(
   if (newCardsFrag) {
     stageLayerEl.appendChild(newCardsFrag);
   }
+
+  syncGalleryTopBleed(layout, visiblePhotos, logicalTop);
 
   for (let i = 0; i < pendingLoads.length; i += 1) {
     const req = pendingLoads[i];
@@ -1843,7 +1954,7 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
       const nowIos = document.documentElement.classList.contains('is-ios-device');
       if (wasIos !== nowIos) {
         if (nowIos) {
-          document.querySelectorAll('meta[name="theme-color"]').forEach((el) => el.remove());
+          syncDarkroomOverlayState(curStore?.state);
         } else {
           curStore?.emit();
         }
@@ -2035,6 +2146,7 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
     gestureAnchor = null;
     lastRenderedMode = '';
     lastGridSignature = '';
+    lastTopBleedSig = '';
   }
 
   if (store.state.selectedPhotoIds.size === 0 && mobileSelectMode) {
@@ -2050,6 +2162,7 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
     lastVisiblePhotos = [];
     lastRenderedMode = '';
     lastGridSignature = '__loading__';
+    lastTopBleedSig = '';
     gridEl.classList.remove('is-virtual-stage');
     gridEl.style.height = '';
     gridEl.innerHTML = `
@@ -2069,6 +2182,7 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
     lastVisiblePhotos = [];
     lastRenderedMode = '';
     lastGridSignature = '__empty__';
+    lastTopBleedSig = '';
     gridEl.classList.remove('is-virtual-stage');
     gridEl.style.height = '';
     gridEl.innerHTML = `

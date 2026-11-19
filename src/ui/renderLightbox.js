@@ -14,6 +14,7 @@ import {
   openPhotoContextMenu,
 } from './contextMenu.js';
 import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
+import { syncDarkroomOverlayState } from './renderGallery.js';
 
 let activeLightboxPhotoId = null;
 let activeLightboxLang = '';
@@ -675,6 +676,7 @@ export function renderLightbox(container, store, visiblePhotos) {
   activeStoreRef = store;
   const state = store.state;
   const photoId = state.lightboxPhotoId;
+  syncDarkroomOverlayState(state);
 
   if (!photoId) {
     clearChromeAutoHideTimer();
@@ -696,6 +698,7 @@ export function renderLightbox(container, store, visiblePhotos) {
     isPinching = false;
     isTouchPanning = false;
     clearAllSlideLoads();
+    container.style.setProperty('--lb-pocket-opacity', '1');
     container.classList.add('hidden');
     container.innerHTML = '';
     return;
@@ -707,6 +710,7 @@ export function renderLightbox(container, store, visiblePhotos) {
     return;
   }
 
+  container.style.setProperty('--lb-pocket-opacity', '1');
   container.classList.remove('hidden');
 
   const idx = visiblePhotos.findIndex((p) => p.id === photoId);
@@ -920,6 +924,7 @@ export function closeLightboxWithAnimation(container, store) {
   const flip = pid ? computeFlipFromGridCard(container, pid, targetW) : null;
 
   isClosingAnimated = true;
+  container.style.setProperty('--lb-pocket-opacity', '0');
   rootEl.classList.add('chrome-hidden');
   rootEl.style.transition = 'opacity 180ms cubic-bezier(0.32, 0.72, 0, 1)';
   rootEl.style.opacity = '0';
@@ -1371,9 +1376,11 @@ export function bindLightboxEvents(container, store) {
         curSlide.style.transition = 'none';
         curSlide.style.transform = `translate3d(${Math.round(dx * 0.25)}px, ${Math.round(dy)}px, 0) scale(${Math.max(0.76, 1 - absDy / 900).toFixed(3)})`;
       }
+      const pocketAlpha = Math.max(0.2, 0.96 - absDy / 420).toFixed(2);
       if (rootEl) {
-        rootEl.style.background = `rgba(5, 7, 10, ${Math.max(0.2, 0.96 - absDy / 420).toFixed(2)})`;
+        rootEl.style.background = `rgba(5, 7, 10, ${pocketAlpha})`;
       }
+      container.style.setProperty('--lb-pocket-opacity', pocketAlpha);
     }
   });
 
@@ -1423,6 +1430,7 @@ export function bindLightboxEvents(container, store) {
           curSlide.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
         }
         if (rootEl) rootEl.style.background = '';
+        container.style.setProperty('--lb-pocket-opacity', '1');
       }
     }
     mouseSwipeAxis = null;
@@ -1523,9 +1531,11 @@ export function bindLightboxEvents(container, store) {
             curSlide.style.transition = 'none';
             curSlide.style.transform = `translate3d(${Math.round(dx * 0.28)}px, ${Math.round(dy)}px, 0) scale(${Math.max(0.76, 1 - absDy / 900).toFixed(3)})`;
           }
+          const pocketAlpha = Math.max(0.2, 0.96 - absDy / 420).toFixed(2);
           if (rootEl) {
-            rootEl.style.background = `rgba(5, 7, 10, ${Math.max(0.2, 0.96 - absDy / 420).toFixed(2)})`;
+            rootEl.style.background = `rgba(5, 7, 10, ${pocketAlpha})`;
           }
+          container.style.setProperty('--lb-pocket-opacity', pocketAlpha);
         }
       }
     },
@@ -1664,6 +1674,7 @@ export function bindLightboxEvents(container, store) {
               curSlide.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
             }
             if (rootEl) rootEl.style.background = '';
+            container.style.setProperty('--lb-pocket-opacity', '1');
           }
         }
       }
@@ -1696,6 +1707,7 @@ export function bindLightboxEvents(container, store) {
       if (rootEl) {
         rootEl.style.background = '';
       }
+      container.style.setProperty('--lb-pocket-opacity', '1');
       scheduleImageTransform(container, true);
     },
     { passive: true }

@@ -155,6 +155,11 @@ body {
   overflow: hidden;
 }
 
+html.has-darkroom-overlay,
+html.has-darkroom-overlay body {
+  background-color: #050608 !important;
+}
+
 @media (display-mode: standalone) {
   html.is-ios-device,
   html.is-ios-device body {

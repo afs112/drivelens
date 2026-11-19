@@ -1322,6 +1322,7 @@
 }
 
 :is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .top-header {
+  top: calc(var(--safe-top) + 14px);
   background: transparent !important;
   background-image: none !important;
   box-shadow: none !important;
@@ -1331,6 +1332,9 @@
 
 :is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
   .top-header.is-hidden-scroll:not(:has(:focus-visible)) {
+  top: -320px !important;
+  opacity: 0;
+  pointer-events: none;
   visibility: hidden;
   transform: translateY(calc(-140% - var(--safe-top) - var(--chrome-gap)));
 }
@@ -1408,7 +1412,7 @@ html.is-ios-device:not(.ios-safari-doc-scroll) .app-shell {
 }
 
 html.is-ios-device:not(.ios-safari-doc-scroll) .top-header {
-  top: calc(var(--safe-top) + max(6px, var(--chrome-gap)));
+  top: calc(var(--safe-top) + 14px);
 }
 
 @media (prefers-reduced-motion: reduce) {

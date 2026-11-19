@@ -730,6 +730,37 @@
   overflow-anchor: none;
 }
 
+html.is-ios-device .gallery-grid.is-virtual-stage {
+  overflow: visible;
+}
+
+.gallery-top-bleed {
+  display: none;
+  position: absolute;
+  top: -92px;
+  left: 0;
+  right: 0;
+  height: 96px;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+
+html.is-ios-device .gallery-top-bleed {
+  display: flex;
+}
+
+.gallery-top-bleed-slice {
+  flex: 1 1 0;
+  min-width: 0;
+  height: 100%;
+  object-fit: cover;
+  filter: blur(20px) saturate(1.2);
+  transform: scale(1.18);
+  opacity: 0.88;
+  pointer-events: none;
+}
+
 .virtual-stage-layer {
   position: absolute;
   left: 0;
@@ -1262,6 +1293,23 @@
 }
 
 /* Fullscreen Lightbox */
+#lightboxRoot {
+  --lb-pocket-opacity: 1;
+}
+
+#lightboxRoot:not(.hidden)::before {
+  content: '';
+  position: fixed;
+  top: -160px;
+  bottom: -200px;
+  left: -20px;
+  right: -20px;
+  background-color: #050608;
+  opacity: var(--lb-pocket-opacity, 1);
+  z-index: 99;
+  pointer-events: none;
+}
+
 .lightbox {
   position: fixed;
   inset: 0;
@@ -1274,6 +1322,8 @@
   color: #f8fafc;
   overflow: hidden;
   overflow: clip;
+  overscroll-behavior: none;
+  touch-action: none;
 }
 
 .lightbox-ambient-bg {
@@ -1596,6 +1646,7 @@
   gap: 10px;
   overflow-y: auto;
   overscroll-behavior: contain;
+  touch-action: pan-y;
   padding: 12px;
   border-radius: 20px;
   background: rgba(24, 24, 26, 0.88);
@@ -1731,6 +1782,7 @@
   align-items: center;
   gap: 5px;
   overflow-x: auto;
+  touch-action: pan-x;
   max-width: 100%;
   padding: 4px;
   border-radius: 12px;
