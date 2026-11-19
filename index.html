@@ -4,6 +4,22 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
     <meta name="theme-color" content="#0b0d10" />
+    <script>
+      (function () {
+        var r = document.documentElement;
+        var ua = navigator.userAgent || '';
+        var isIos =
+          /iPhone|iPad|iPod/i.test(ua) ||
+          (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
+          r.dataset.forceIos === 'true' ||
+          r.dataset.forceDocScroll === 'true';
+        r.classList.toggle('is-ios-device', isIos);
+        if (isIos) {
+          var metas = document.querySelectorAll('meta[name="theme-color"]');
+          for (var i = 0; i < metas.length; i += 1) metas[i].remove();
+        }
+      })();
+    </script>
     <meta name="mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />

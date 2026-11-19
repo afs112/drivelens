@@ -18,6 +18,18 @@ const MAX_MOUNTED_CARDS = 260;
 const MAX_FREE_CARD_POOL = 220;
 const ANCHOR_TTL_MS = 260;
 
+export function detectIosDevice() {
+  if (typeof document === 'undefined' || typeof navigator === 'undefined') return false;
+  const root = document.documentElement;
+  const ua = navigator.userAgent || '';
+  return Boolean(
+    /iPhone|iPad|iPod/i.test(ua) ||
+      (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1) ||
+      root.dataset.forceIos === 'true' ||
+      root.dataset.forceDocScroll === 'true'
+  );
+}
+
 function isDocScrollMode() {
   if (typeof document === 'undefined') return false;
   const root = document.documentElement;
@@ -27,12 +39,18 @@ function isDocScrollMode() {
   );
 }
 
+function readRawDocScrollY() {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return 0;
+  return Math.max(
+    0,
+    window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0
+  );
+}
+
 function readGalleryScrollTop(scrollContainer) {
   if (isDocScrollMode()) {
-    return Math.max(
-      0,
-      window.scrollY || window.pageYOffset || document.documentElement.scrollTop || 0
-    );
+    const rawY = readRawDocScrollY();
+    return rawY <= 2 ? 0 : rawY;
   }
   return Math.max(0, scrollContainer?.scrollTop || 0);
 }
@@ -60,15 +78,13 @@ function readGalleryViewportHeight(scrollContainer) {
 function syncIosSafariDocScrollMode(state) {
   if (typeof document === 'undefined' || typeof window === 'undefined') return false;
   const root = document.documentElement;
-  const ua = navigator.userAgent || '';
-  const isIosTouch =
-    /iPhone|iPad|iPod/i.test(ua) ||
-    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const isIos = detectIosDevice();
+  root.classList.toggle('is-ios-device', isIos);
   const isStandalone = Boolean(
     window.navigator.standalone ||
       window.matchMedia?.('(display-mode: standalone)')?.matches
   );
-  const autoIosDocScroll = isIosTouch && !isStandalone && window.innerWidth <= 920;
+  const autoIosDocScroll = isIos && !isStandalone && window.innerWidth <= 920;
   const enabled = autoIosDocScroll || root.dataset.forceDocScroll === 'true';
   root.classList.toggle('ios-safari-doc-scroll', enabled);
 
@@ -768,6 +784,45 @@ let scrollSettleCallback = null;
 let gestureAnchor = null;
 let lastProgrammaticScrollTop = -1;
 let lastProgrammaticScrollAt = 0;
+let windowTouchActive = false;
+let runwayNudgeTimer = 0;
+
+function nudgeIosScrollRunway(store) {
+  if (typeof window === 'undefined' || typeof document === 'undefined') return;
+  if (!isDocScrollMode() || windowTouchActive) return;
+  const state = store?.state;
+  if (
+    !state ||
+    state.loading ||
+    lastVisiblePhotos.length === 0 ||
+    state.lightboxPhotoId ||
+    state.modal ||
+    state.sidebarOpen ||
+    state.inspectorOpen ||
+    isCompareOpen()
+  ) {
+    return;
+  }
+  if (readRawDocScrollY() !== 0) return;
+  const vh = window.visualViewport?.height || window.innerHeight || 0;
+  if (document.documentElement.scrollHeight <= vh + 1) return;
+  window.scrollTo(0, 1);
+  lastProgrammaticScrollTop = 1;
+  lastProgrammaticScrollAt =
+    typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+function scheduleIosRunwayNudge(store, delayMs = 220) {
+  if (runwayNudgeTimer) {
+    clearTimeout(runwayNudgeTimer);
+    runwayNudgeTimer = 0;
+  }
+  if (!isDocScrollMode()) return;
+  runwayNudgeTimer = setTimeout(() => {
+    runwayNudgeTimer = 0;
+    nudgeIosScrollRunway(store);
+  }, delayMs);
+}
 
 let activeHoverPeekClear = null;
 
@@ -1632,6 +1687,14 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
   const handleGalleryScroll = () => {
     const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
     const curTopNow = readGalleryScrollTop(scrollContainer);
+    if (isDocScrollMode()) {
+      if (readRawDocScrollY() === 0) {
+        scheduleIosRunwayNudge(scrollContainer._dlStoreRef, 220);
+      } else if (runwayNudgeTimer) {
+        clearTimeout(runwayNudgeTimer);
+        runwayNudgeTimer = 0;
+      }
+    }
     if (
       lastProgrammaticScrollAt > 0 &&
       now - lastProgrammaticScrollAt < 80 &&
@@ -1726,6 +1789,25 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
     },
     { passive: true }
   );
+  window.addEventListener(
+    'touchstart',
+    (e) => {
+      if (e.touches && e.touches.length > 0) {
+        windowTouchActive = true;
+      }
+    },
+    { passive: true }
+  );
+  const handleWindowTouchEnd = (e) => {
+    if (!e.touches || e.touches.length === 0) {
+      windowTouchActive = false;
+      if (isDocScrollMode() && readRawDocScrollY() === 0) {
+        scheduleIosRunwayNudge(scrollContainer._dlStoreRef, 180);
+      }
+    }
+  };
+  window.addEventListener('touchend', handleWindowTouchEnd, { passive: true });
+  window.addEventListener('touchcancel', handleWindowTouchEnd, { passive: true });
 
   let docResizeRafId = 0;
   const handleViewportResize = () => {
@@ -1756,7 +1838,16 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
     const observer = new MutationObserver(() => {
       const curStore = scrollContainer._dlStoreRef;
       const curGrid = scrollContainer._dlGridRef;
+      const wasIos = document.documentElement.classList.contains('is-ios-device');
       syncIosSafariDocScrollMode(curStore?.state);
+      const nowIos = document.documentElement.classList.contains('is-ios-device');
+      if (wasIos !== nowIos) {
+        if (nowIos) {
+          document.querySelectorAll('meta[name="theme-color"]').forEach((el) => el.remove());
+        } else {
+          curStore?.emit();
+        }
+      }
       lastScrollTop = readGalleryScrollTop(scrollContainer);
       if (
         curGrid &&
@@ -1770,11 +1861,12 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
           forceAllMeta: false,
         });
         updateFloatingScrollState(scrollContainer, curStore, false);
+        nudgeIosScrollRunway(curStore);
       }
     });
     observer.observe(document.documentElement, {
       attributes: true,
-      attributeFilter: ['data-force-doc-scroll'],
+      attributeFilter: ['data-force-doc-scroll', 'data-force-ios'],
     });
     document.documentElement._dlForceDocScrollObserver = observer;
   }
@@ -2033,6 +2125,8 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
   }
 
   applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, rowHeight, true, null);
+  nudgeIosScrollRunway(store);
+  requestAnimationFrame(() => nudgeIosScrollRunway(store));
 }
 
 export function previewGalleryRowHeight(

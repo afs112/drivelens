@@ -2,7 +2,7 @@ import { getDemoPersonas } from '../demo/demoAlbum.js';
 import { SUPPORTED_LANGS, t } from '../i18n.js';
 import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 import { isCompareOpen, openCompare, closeCompare } from './renderCompare.js';
-import { previewGalleryRowHeight } from './renderGallery.js';
+import { detectIosDevice, previewGalleryRowHeight } from './renderGallery.js';
 
 const SIDEBAR_ICON_SVG =
   '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><rect width="18" height="18" x="3" y="3" rx="2"/><path d="M9 3v18"/></svg>';
@@ -506,9 +506,19 @@ function updateHeaderElements(headerEl, state, store) {
     langSelect.value = state.lang || 'en';
   }
 
-  document
-    .querySelector('meta[name="theme-color"]')
-    ?.setAttribute('content', state.theme === 'light' ? '#f4f6f9' : '#0b0d10');
+  const isIos = detectIosDevice();
+  document.documentElement.classList.toggle('is-ios-device', isIos);
+  if (isIos) {
+    document.querySelectorAll('meta[name="theme-color"]').forEach((el) => el.remove());
+  } else {
+    let themeMeta = document.querySelector('meta[name="theme-color"]');
+    if (!themeMeta && document.head) {
+      themeMeta = document.createElement('meta');
+      themeMeta.setAttribute('name', 'theme-color');
+      document.head.appendChild(themeMeta);
+    }
+    themeMeta?.setAttribute('content', state.theme === 'light' ? '#f4f6f9' : '#0b0d10');
+  }
 
   const themeBtn = headerEl.querySelector('[data-header="toggle-theme"]');
   if (themeBtn) {

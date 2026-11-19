@@ -1265,6 +1265,7 @@
 .lightbox {
   position: fixed;
   inset: 0;
+  min-height: 100lvh;
   z-index: 100;
   --lightbox-slide-gap: 16px;
   background: #050608;
@@ -2366,4 +2367,25 @@ kbd {
   .form-input {
     height: 40px;
   }
+}
+
+/* iOS 26 Safari Lightbox & Floating Pill Zero-Gradient Adaptation */
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .lightbox-bottom {
+  background: none !important;
+  background-image: none !important;
+  box-shadow: none !important;
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .lightbox-bottom
+  .lightbox-glass-pill {
+  box-shadow: inset 0 1px 0.5px rgba(255, 255, 255, 0.28),
+    inset 0 -0.5px 0.5px rgba(255, 255, 255, 0.08),
+    0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .gallery-month-pill:not(.visible) {
+  visibility: hidden;
 }
