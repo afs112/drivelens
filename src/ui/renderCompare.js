@@ -13,7 +13,34 @@ let isTouchPanning = false;
 let dragStartX = 0;
 let dragStartY = 0;
 let activeCompareKey = '';
+let activeStore = null;
 const boundContainers = new WeakSet();
+
+function syncCompareDarkroomState(open) {
+  if (typeof document === 'undefined') return;
+  const root = document.documentElement;
+  const isIos = root.classList.contains('is-ios-device');
+  if (open) {
+    root.classList.add('has-darkroom-overlay', 'is-darkroom-settled');
+    if (isIos) {
+      let themeMeta = document.querySelector('meta[name="theme-color"]');
+      if (!themeMeta && document.head) {
+        themeMeta = document.createElement('meta');
+        themeMeta.setAttribute('name', 'theme-color');
+        document.head.appendChild(themeMeta);
+      }
+      themeMeta?.setAttribute('content', '#050608');
+    }
+    return;
+  }
+
+  if (!activeStore?.state?.lightboxPhotoId) {
+    root.classList.remove('is-darkroom-settled', 'has-darkroom-overlay');
+    if (isIos) {
+      document.querySelectorAll('meta[name="theme-color"]').forEach((el) => el.remove());
+    }
+  }
+}
 
 function getTouchDistance(t1, t2) {
   return Math.hypot(t2.clientX - t1.clientX, t2.clientY - t1.clientY);
@@ -159,6 +186,7 @@ function applyCompareTransform(container) {
 
 export function openCompare(photoIds, store) {
   if (!store) return false;
+  activeStore = store;
   const files = store.state.files || [];
   const validSet = new Set(files.map((f) => f.id));
 
@@ -227,12 +255,14 @@ export function openCompare(photoIds, store) {
   isPinching = false;
   isTouchPanning = false;
   activeCompareKey = '';
+  syncCompareDarkroomState(true);
 
   store.emit();
   return true;
 }
 
 export function closeCompare(store) {
+  if (store) activeStore = store;
   compareActive = false;
   compareIds = [];
   compareZoom = 1;
@@ -242,6 +272,7 @@ export function closeCompare(store) {
   isPinching = false;
   isTouchPanning = false;
   activeCompareKey = '';
+  syncCompareDarkroomState(false);
   store?.emit();
 }
 
@@ -251,6 +282,7 @@ export function isCompareOpen() {
 
 export function renderCompare(container, store) {
   if (!container) return;
+  if (store) activeStore = store;
 
   const files = store?.state?.files || [];
   const fileById = new Map(files.map((f) => [f.id, f]));
@@ -273,6 +305,7 @@ export function renderCompare(container, store) {
     isDragging = false;
     isPinching = false;
     isTouchPanning = false;
+    syncCompareDarkroomState(false);
     container.classList.add('hidden');
     if (container.innerHTML !== '') {
       container.innerHTML = '';
@@ -280,6 +313,7 @@ export function renderCompare(container, store) {
     return;
   }
 
+  syncCompareDarkroomState(true);
   container.classList.remove('hidden');
 
   const compareFiles = compareIds.map((id) => fileById.get(id)).filter(Boolean);
@@ -395,6 +429,7 @@ export function renderCompare(container, store) {
 
 export function bindCompareEvents(container, store) {
   if (!container || boundContainers.has(container)) return;
+  if (store) activeStore = store;
   boundContainers.add(container);
 
   let pinchStartDist = 0;

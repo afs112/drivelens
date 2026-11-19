@@ -1868,6 +1868,9 @@ def verify_mobile_ux(parsed_js):
             errors.append("index.html viewport <meta> missing viewport-fit=cover")
         if not re.search(r'<nav\b[^>]*\bid\s*=\s*["\']mobileNavBar["\']', html_text, re.IGNORECASE):
             errors.append('index.html missing <nav id="mobileNavBar">')
+        for shim_id in ("iosTopPocketShim", "iosBottomPocketShim"):
+            if not re.search(rf'\bid\s*=\s*["\']{shim_id}["\']', html_text):
+                errors.append(f'index.html missing #{shim_id}')
 
     # 2. CSS safe-area variables, mobile nav bar, drawer header, and 16px mobile input font-size
     checks += 1
@@ -1909,24 +1912,24 @@ def verify_mobile_ux(parsed_js):
         if missing:
             errors.append(f"{rel_js} missing touch handler(s): {missing}")
 
-    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v15'
+    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v16'
     checks += 1
     sw_path = ROOT_DIR / "sw.js"
     if not sw_path.is_file():
         errors.append("Missing sw.js")
     else:
         sw_toks = tokenize_js(sw_path.read_text(encoding="utf-8"), filename="sw.js")
-        has_v15 = any(
+        has_v16 = any(
             sw_toks[i].kind == "IDENT"
             and sw_toks[i].value == "CACHE_NAME"
             and sw_toks[i + 1].kind == "PUNCT"
             and sw_toks[i + 1].value == "="
             and sw_toks[i + 2].kind == "STRING"
-            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v15"
+            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v16"
             for i in range(len(sw_toks) - 2)
         )
-        if not has_v15:
-            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v15'")
+        if not has_v16:
+            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v16'")
 
     # 5. workers/oauth-renewal-worker.js exists, tokenizes cleanly, and exports default fetch handler
     checks += 1
@@ -2104,7 +2107,7 @@ def main():
             print(f"      - {e}")
         all_errors.extend(mob_errors)
     else:
-        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v15, worker export, and README section preserved.")
+        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v16, worker export, and README section preserved.")
 
     print("=" * 56)
     if all_errors:

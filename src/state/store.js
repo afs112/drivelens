@@ -335,6 +335,8 @@ export class Store {
     this._itemsByPhotoIdRef = null;
     this._libraryStatsCache = null;
     this.visiblePhotosVersion = 0;
+    this.layoutSortEpoch = 0;
+    this._stabilizedOrderState = { key: '', ids: [], idSet: new Set() };
     this._changeSeq = 0;
     this.lastChange = { type: 'full', photoIds: null, seq: 0 };
     this._startPageToken = '';
@@ -565,6 +567,7 @@ export class Store {
   }
 
   setLanguage(nextLang) {
+    this.layoutSortEpoch += 1;
     const prevDefaultNick = t('store.defaultNickname');
     const prevGuestNick = t('store.guestNickname');
     const lang = setLangCode(nextLang);
@@ -773,6 +776,7 @@ export class Store {
   }
 
   loadDemoMode(showNotice = true, disableAutoConnect = false) {
+    this.layoutSortEpoch += 1;
     const wasGdrive = this.state?.mode === 'gdrive';
     this.connectSeq += 1;
     clearTimeout(this.cacheSnapshotTimer);
@@ -836,6 +840,7 @@ export class Store {
   }
 
   resetDemo() {
+    this.layoutSortEpoch += 1;
     const lang = this.state.lang || getLang();
     const fresh = resetDemoState(lang);
     this.loadDemoMode(false);
@@ -1088,6 +1093,16 @@ export class Store {
     const alreadyIndexed =
       album.files === this.state.files && this._fileById.size === album.files.length;
     if (!alreadyIndexed) {
+      if (sameActiveAlbum && Array.isArray(album.files)) {
+        for (let i = 0; i < album.files.length; i += 1) {
+          const f = album.files[i];
+          if (!f || !f.id) continue;
+          const prev = this._fileById.get(f.id);
+          if (prev && typeof prev._aspect === 'number' && prev._aspect > 0) {
+            f._aspect = prev._aspect;
+          }
+        }
+      }
       this._rebuildFileIndex(album.files);
     }
     const nextSelectedIds = sameActiveAlbum
@@ -2468,6 +2483,10 @@ export class Store {
       for (const rawFile of res.upsertedFiles || []) {
         const norm = this._normalizeFileRecord(rawFile);
         if (norm && norm.id) {
+          const prev = this._fileById.get(norm.id);
+          if (prev && typeof prev._aspect === 'number' && prev._aspect > 0) {
+            norm._aspect = prev._aspect;
+          }
           upsertedMap.set(norm.id, norm);
           normalizedUpserted.push(norm);
         }
@@ -2716,6 +2735,7 @@ export class Store {
   }
 
   async refreshAlbum({ fullRescan = false } = {}) {
+    this.layoutSortEpoch += 1;
     if (this.state.mode !== 'gdrive') {
       this.toast(t('store.refreshDemoNotice'), 'info');
       return;
@@ -3107,7 +3127,8 @@ export class Store {
       cached.tagMatchMode === tagMatchMode &&
       cached.searchQuery === searchQuery &&
       cached.sortBy === sortBy &&
-      cached.lang === lang
+      cached.lang === lang &&
+      cached.layoutSortEpoch === this.layoutSortEpoch
     ) {
       return cached.result;
     }
@@ -3250,33 +3271,111 @@ export class Store {
         if (sortBy === 'ratingDesc') {
           const diff = b.avgRating - a.avgRating;
           if (Math.abs(diff) > 0.001) return diff;
-          return b.ratingCount - a.ratingCount || b.ts - a.ts;
+          return (
+            b.ratingCount - a.ratingCount ||
+            b.ts - a.ts ||
+            (a.file.id < b.file.id ? -1 : a.file.id > b.file.id ? 1 : 0)
+          );
         }
         const diff = a.avgRating - b.avgRating;
         if (Math.abs(diff) > 0.001) return diff;
-        return a.ratingCount - b.ratingCount || a.ts - b.ts;
+        return (
+          a.ratingCount - b.ratingCount ||
+          a.ts - b.ts ||
+          (a.file.id < b.file.id ? -1 : a.file.id > b.file.id ? 1 : 0)
+        );
       });
     } else {
       matched.sort((a, b) => {
+        let cmp = 0;
         switch (sortBy) {
           case 'dateAsc':
-            return getPhotoTimestamp(a) - getPhotoTimestamp(b);
+            cmp = getPhotoTimestamp(a) - getPhotoTimestamp(b);
+            break;
           case 'nameAsc':
-            return nameCollator.compare(a.name || '', b.name || '');
+            cmp = nameCollator.compare(a.name || '', b.name || '');
+            break;
           case 'nameDesc':
-            return nameCollator.compare(b.name || '', a.name || '');
+            cmp = nameCollator.compare(b.name || '', a.name || '');
+            break;
           case 'sizeDesc':
-            return (b.size || 0) - (a.size || 0);
+            cmp = (b.size || 0) - (a.size || 0);
+            break;
           case 'sizeAsc':
-            return (a.size || 0) - (b.size || 0);
+            cmp = (a.size || 0) - (b.size || 0);
+            break;
           case 'dateDesc':
           default:
-            return getPhotoTimestamp(b) - getPhotoTimestamp(a);
+            cmp = getPhotoTimestamp(b) - getPhotoTimestamp(a);
+            break;
         }
+        return cmp || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
       });
     }
 
-    const result = sortByRating ? matched.map((x) => x.file) : matched;
+    const canonicalResult = sortByRating ? matched.map((x) => x.file) : matched;
+    const stabilizeKey = [
+      this.state.mode,
+      this.state.folderId || 'demo',
+      activeFolderId || '',
+      includeSubfolders ? 1 : 0,
+      quickView,
+      mediaFilter || 'all',
+      aspectFilter || 'all',
+      ratingScope,
+      minRating,
+      memberFilterId || '',
+      tagKey,
+      tagMatchMode,
+      searchQuery,
+      sortBy,
+      lang,
+      this.layoutSortEpoch,
+    ].join('|');
+
+    let result;
+    if (
+      this._stabilizedOrderState.key !== stabilizeKey ||
+      this._stabilizedOrderState.ids.length === 0
+    ) {
+      result = canonicalResult;
+      const ids = result.map((f) => f.id);
+      this._stabilizedOrderState = {
+        key: stabilizeKey,
+        ids,
+        idSet: new Set(ids),
+      };
+    } else {
+      const byId = new Map(canonicalResult.map((f) => [f.id, f]));
+      const stabilized = [];
+      const nextIds = [];
+      const nextSet = new Set();
+      const prevIds = this._stabilizedOrderState.ids;
+      for (let i = 0; i < prevIds.length; i += 1) {
+        const prevId = prevIds[i];
+        const existing = byId.get(prevId);
+        if (existing) {
+          stabilized.push(existing);
+          nextIds.push(prevId);
+          nextSet.add(prevId);
+        }
+      }
+      for (let i = 0; i < canonicalResult.length; i += 1) {
+        const f = canonicalResult[i];
+        if (!nextSet.has(f.id)) {
+          stabilized.push(f);
+          nextIds.push(f.id);
+          nextSet.add(f.id);
+        }
+      }
+      this._stabilizedOrderState = {
+        key: stabilizeKey,
+        ids: nextIds,
+        idSet: nextSet,
+      };
+      result = stabilized;
+    }
+
     this.visiblePhotosVersion += 1;
     this._visiblePhotosCache = {
       files,
@@ -3299,6 +3398,7 @@ export class Store {
       searchQuery,
       sortBy,
       lang,
+      layoutSortEpoch: this.layoutSortEpoch,
       result,
     };
     return result;

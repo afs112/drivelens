@@ -51,9 +51,59 @@ let transformRafId = 0;
 const slideCache = new Map();
 const slideProgressById = new Map();
 let hdHideTimer = 0;
+let darkroomSettleTimer = 0;
 let activeLightboxContainer = null;
 let activeStoreRef = null;
 let resizeBound = false;
+
+function clearDarkroomSettleTimer() {
+  if (darkroomSettleTimer) {
+    clearTimeout(darkroomSettleTimer);
+    darkroomSettleTimer = 0;
+  }
+}
+
+function setDarkroomPocketOpacity(container, value) {
+  if (value === null) {
+    container?.style?.removeProperty('--lb-pocket-opacity');
+    if (typeof document !== 'undefined') {
+      document.documentElement.style.removeProperty('--lb-pocket-opacity');
+    }
+    return;
+  }
+  const v = String(value);
+  container?.style?.setProperty('--lb-pocket-opacity', v);
+  if (typeof document !== 'undefined') {
+    document.documentElement.style.setProperty('--lb-pocket-opacity', v);
+  }
+}
+
+function setDarkroomSwiping(active) {
+  if (typeof document === 'undefined') return;
+  const rootDoc = document.documentElement;
+  if (active) {
+    clearDarkroomSettleTimer();
+    rootDoc.classList.add('is-darkroom-swiping');
+    rootDoc.classList.remove('is-darkroom-settled');
+  } else {
+    rootDoc.classList.remove('is-darkroom-swiping');
+    if (activeStoreRef?.state?.lightboxPhotoId && !isClosingAnimated) {
+      rootDoc.classList.add('is-darkroom-settled');
+    }
+  }
+}
+
+function nudgeIosPocketShims() {
+  if (typeof document === 'undefined') return;
+  for (const id of ['iosTopPocketShim', 'iosBottomPocketShim']) {
+    const shim = document.getElementById(id);
+    if (shim) {
+      shim.style.transform = '';
+      void shim.offsetWidth;
+      shim.style.transform = 'translateZ(0)';
+    }
+  }
+}
 
 function ensureGlobalPointerTracker() {
   if (globalPointerBound || typeof window === 'undefined') return;
@@ -608,6 +658,7 @@ function buildLightboxTools() {
 
 function buildLightboxShell(container, zoom) {
   container.innerHTML = `
+    <div class="lightbox-bleed-bg" aria-hidden="true"></div>
     <div class="lightbox chrome-hidden">
       <div
         class="lightbox-hd-float"
@@ -680,6 +731,7 @@ export function renderLightbox(container, store, visiblePhotos) {
 
   if (!photoId) {
     clearChromeAutoHideTimer();
+    clearDarkroomSettleTimer();
     pointerInChromeZone = false;
     openPointerState = null;
     closePhotoContextMenu();
@@ -698,7 +750,15 @@ export function renderLightbox(container, store, visiblePhotos) {
     isPinching = false;
     isTouchPanning = false;
     clearAllSlideLoads();
-    container.style.setProperty('--lb-pocket-opacity', '1');
+    if (typeof document !== 'undefined') {
+      const compareRoot = document.getElementById('compareRoot');
+      const compareOpen = Boolean(compareRoot && !compareRoot.classList.contains('hidden'));
+      if (!compareOpen) {
+        document.documentElement.classList.remove('is-darkroom-settled');
+      }
+      document.documentElement.classList.remove('is-darkroom-swiping');
+    }
+    setDarkroomPocketOpacity(container, null);
     container.classList.add('hidden');
     container.innerHTML = '';
     return;
@@ -710,7 +770,9 @@ export function renderLightbox(container, store, visiblePhotos) {
     return;
   }
 
-  container.style.setProperty('--lb-pocket-opacity', '1');
+  if (typeof document === 'undefined' || !document.documentElement.classList.contains('is-darkroom-swiping')) {
+    setDarkroomPocketOpacity(container, '1');
+  }
   container.classList.remove('hidden');
 
   const idx = visiblePhotos.findIndex((p) => p.id === photoId);
@@ -721,6 +783,22 @@ export function renderLightbox(container, store, visiblePhotos) {
 
   const wasClosed = activeLightboxPhotoId === null;
   if (wasClosed) {
+    clearDarkroomSettleTimer();
+    setDarkroomPocketOpacity(container, '1');
+    if (typeof document !== 'undefined') {
+      document.documentElement.classList.remove('is-darkroom-swiping');
+    }
+    nudgeIosPocketShims();
+    if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
+      document.documentElement.classList.add('is-darkroom-settled');
+    } else {
+      darkroomSettleTimer = setTimeout(() => {
+        darkroomSettleTimer = 0;
+        if (activeStoreRef?.state?.lightboxPhotoId && !isClosingAnimated && typeof document !== 'undefined') {
+          document.documentElement.classList.add('is-darkroom-settled');
+        }
+      }, 210);
+    }
     lightboxChromeHidden = false;
     pointerInChromeZone = false;
     liveZoom = state.lightboxZoom || 1;
@@ -901,6 +979,7 @@ export function closeLightboxWithAnimation(container, store) {
   if (!store?.state?.lightboxPhotoId) return;
   closePhotoContextMenu();
   clearChromeAutoHideTimer();
+  clearDarkroomSettleTimer();
   popLightboxHistoryIfNeeded();
   if (!container) {
     store.closeLightbox();
@@ -924,7 +1003,11 @@ export function closeLightboxWithAnimation(container, store) {
   const flip = pid ? computeFlipFromGridCard(container, pid, targetW) : null;
 
   isClosingAnimated = true;
-  container.style.setProperty('--lb-pocket-opacity', '0');
+  if (typeof document !== 'undefined') {
+    document.documentElement.classList.remove('is-darkroom-settled');
+    document.documentElement.classList.add('is-darkroom-swiping');
+  }
+  setDarkroomPocketOpacity(container, '0');
   rootEl.classList.add('chrome-hidden');
   rootEl.style.transition = 'opacity 180ms cubic-bezier(0.32, 0.72, 0, 1)';
   rootEl.style.opacity = '0';
@@ -1347,6 +1430,12 @@ export function bindLightboxEvents(container, store) {
     }
     if (!mouseSwipeDragging) return;
     if (e.altKey) {
+      if (mouseSwipeAxis === 'y' && liveZoom <= 1.01) {
+        const rootEl = container.querySelector('.lightbox');
+        if (rootEl) rootEl.style.background = '';
+        setDarkroomPocketOpacity(container, '1');
+        setDarkroomSwiping(false);
+      }
       mouseSwipeDragging = false;
       mouseSwipeAxis = null;
       setInteracting(false);
@@ -1369,6 +1458,7 @@ export function bindLightboxEvents(container, store) {
       scheduleTrackTranslate(effDx);
     } else if (mouseSwipeAxis === 'y' && liveZoom <= 1.01) {
       mouseLastDy = dy;
+      setDarkroomSwiping(true);
       const absDy = Math.abs(dy);
       const curSlide = container.querySelector('.lightbox-slide.is-current');
       const rootEl = container.querySelector('.lightbox');
@@ -1380,7 +1470,7 @@ export function bindLightboxEvents(container, store) {
       if (rootEl) {
         rootEl.style.background = `rgba(5, 7, 10, ${pocketAlpha})`;
       }
-      container.style.setProperty('--lb-pocket-opacity', pocketAlpha);
+      setDarkroomPocketOpacity(container, pocketAlpha);
     }
   });
 
@@ -1430,7 +1520,8 @@ export function bindLightboxEvents(container, store) {
           curSlide.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
         }
         if (rootEl) rootEl.style.background = '';
-        container.style.setProperty('--lb-pocket-opacity', '1');
+        setDarkroomPocketOpacity(container, '1');
+        setDarkroomSwiping(false);
       }
     }
     mouseSwipeAxis = null;
@@ -1521,8 +1612,9 @@ export function bindLightboxEvents(container, store) {
           }
           lastDragDx = effDx;
           scheduleTrackTranslate(effDx);
-        } else if (gestureAxis === 'y') {
+        } else if (gestureAxis === 'y' && liveZoom <= 1.01) {
           e.preventDefault();
+          setDarkroomSwiping(true);
           lastDragDy = dy;
           const absDy = Math.abs(dy);
           const curSlide = container.querySelector('.lightbox-slide.is-current');
@@ -1535,7 +1627,7 @@ export function bindLightboxEvents(container, store) {
           if (rootEl) {
             rootEl.style.background = `rgba(5, 7, 10, ${pocketAlpha})`;
           }
-          container.style.setProperty('--lb-pocket-opacity', pocketAlpha);
+          setDarkroomPocketOpacity(container, pocketAlpha);
         }
       }
     },
@@ -1674,7 +1766,8 @@ export function bindLightboxEvents(container, store) {
               curSlide.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
             }
             if (rootEl) rootEl.style.background = '';
-            container.style.setProperty('--lb-pocket-opacity', '1');
+            setDarkroomPocketOpacity(container, '1');
+            setDarkroomSwiping(false);
           }
         }
       }
@@ -1707,7 +1800,8 @@ export function bindLightboxEvents(container, store) {
       if (rootEl) {
         rootEl.style.background = '';
       }
-      container.style.setProperty('--lb-pocket-opacity', '1');
+      setDarkroomPocketOpacity(container, '1');
+      setDarkroomSwiping(false);
       scheduleImageTransform(container, true);
     },
     { passive: true }

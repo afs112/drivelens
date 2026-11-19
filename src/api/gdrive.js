@@ -1354,6 +1354,7 @@ async function crawlAlbumTree({
   signal = null,
 }) {
   const crawlStartIso = new Date(Date.now() - 60_000).toISOString();
+  const crawlStartedAt = Date.now();
   const folders = [rootFolder];
   const files = [];
   const seenFileIds = new Set();
@@ -1435,7 +1436,7 @@ async function crawlAlbumTree({
               const hasMoreWork = hasMoreInQuery || queue.length > 0 || remainingChunks > 1;
               if (onBatch && files.length > 0 && hasMoreWork) {
                 const shouldEmit = !emittedInitialBatch
-                  ? true
+                  ? now - crawlStartedAt >= 480 || files.length >= 240
                   : files.length < 5000
                     ? now - lastBatchEmit >= 900
                     : now - lastBatchEmit >= 2500 ||

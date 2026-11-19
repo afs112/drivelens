@@ -156,8 +156,18 @@ body {
 }
 
 html.has-darkroom-overlay,
-html.has-darkroom-overlay body {
+html.has-darkroom-overlay body,
+html.has-darkroom-overlay .app-shell,
+html.has-darkroom-overlay .workspace,
+html.has-darkroom-overlay .gallery-stage,
+html.has-darkroom-overlay .gallery-scroll {
   background-color: #050608 !important;
+  background-image: none !important;
+}
+
+html.has-darkroom-overlay.is-darkroom-settled:not(.is-darkroom-swiping)
+  :is(.workspace > *, .top-header, .mobile-nav-bar, .demo-banner) {
+  visibility: hidden !important;
 }
 
 @media (display-mode: standalone) {

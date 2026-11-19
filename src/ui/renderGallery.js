@@ -83,6 +83,10 @@ export function syncDarkroomOverlayState(state) {
   root.classList.toggle('is-ios-device', isIos);
   const isDarkroom = Boolean(state?.lightboxPhotoId || isCompareOpen());
   root.classList.toggle('has-darkroom-overlay', isDarkroom);
+  if (!isDarkroom) {
+    root.classList.remove('is-darkroom-settled', 'is-darkroom-swiping');
+    root.style.removeProperty('--lb-pocket-opacity');
+  }
   if (isIos) {
     if (isDarkroom) {
       let themeMeta = document.querySelector('meta[name="theme-color"]');
@@ -273,10 +277,11 @@ function computeVirtualLayout(
   roundedWidth,
   clampedRowHeight,
   isMobile,
-  photosVer
+  photosVer,
+  waterfallLockPrefix = ''
 ) {
   const n = visiblePhotos.length;
-  const cacheKey = `${photosVer}|${n}|${layoutMode}|${roundedWidth}|${clampedRowHeight}|${isMobile ? 1 : 0}`;
+  const cacheKey = `${photosVer}|${n}|${layoutMode}|${roundedWidth}|${clampedRowHeight}|${isMobile ? 1 : 0}|${layoutMode === 'waterfall' ? waterfallLockPrefix : ''}`;
   if (cachedLayout && cachedLayout.cacheKey === cacheKey) {
     return cachedLayout;
   }
@@ -365,34 +370,48 @@ function computeVirtualLayout(
       colWs[c] = Math.max(60, nextX - x - gap);
     }
 
+    const waterfallLockKey = `${waterfallLockPrefix}|${colCount}`;
+    if (waterfallLockKey !== lockedWaterfallKey) {
+      lockedWaterfallKey = waterfallLockKey;
+      lockedWaterfallColById.clear();
+    }
+
     const colHeights = new Float64Array(colCount);
     const colIndices = Array.from({ length: colCount }, () => []);
     const colTops = Array.from({ length: colCount }, () => []);
     const colBottoms = Array.from({ length: colCount }, () => []);
 
     for (let i = 0; i < n; i += 1) {
-      let minCol = 0;
-      let minH = colHeights[0];
-      for (let c = 1; c < colCount; c += 1) {
-        if (colHeights[c] < minH) {
-          minH = colHeights[c];
-          minCol = c;
+      const photo = visiblePhotos[i];
+      const prevCol = lockedWaterfallColById.get(photo.id);
+      let chosenCol;
+      if (typeof prevCol === 'number' && prevCol >= 0 && prevCol < colCount) {
+        chosenCol = prevCol;
+      } else {
+        chosenCol = 0;
+        let minH = colHeights[0];
+        for (let c = 1; c < colCount; c += 1) {
+          if (colHeights[c] < minH) {
+            minH = colHeights[c];
+            chosenCol = c;
+          }
         }
+        lockedWaterfallColById.set(photo.id, chosenCol);
       }
-      const ratio = getItemAspectRatio(visiblePhotos[i]);
-      const cw = colWs[minCol];
+      const ratio = getItemAspectRatio(photo);
+      const cw = colWs[chosenCol];
       const h = Math.max(88, Math.round(cw / ratio));
-      const y = minH;
+      const y = colHeights[chosenCol];
 
-      itemX[i] = colXs[minCol];
+      itemX[i] = colXs[chosenCol];
       itemY[i] = y;
       itemW[i] = cw;
       itemH[i] = h;
 
-      colIndices[minCol].push(i);
-      colTops[minCol].push(y);
-      colBottoms[minCol].push(y + h);
-      colHeights[minCol] = y + h + gap;
+      colIndices[chosenCol].push(i);
+      colTops[chosenCol].push(y);
+      colBottoms[chosenCol].push(y + h);
+      colHeights[chosenCol] = y + h + gap;
     }
 
     let maxColH = 0;
@@ -797,6 +816,8 @@ let activePhotosVer = 0;
 let lastAnchorFilterKey = '';
 
 let pooledAlbumKey = '';
+let lockedWaterfallKey = '';
+const lockedWaterfallColById = new Map();
 let lastSubbarSignature = '';
 let lastBatchSignature = '';
 let lastGridSignature = '';
@@ -1674,7 +1695,7 @@ function isTouchViewport() {
   return window.innerWidth <= 860 || Boolean(window.matchMedia?.('(pointer: coarse)').matches);
 }
 
-function buildFilterKey(state) {
+function buildFilterKey(state, layoutSortEpoch = 0) {
   const tags =
     state.selectedTagIds && state.selectedTagIds.size > 0
       ? Array.from(state.selectedTagIds).sort().join(',')
@@ -1695,6 +1716,7 @@ function buildFilterKey(state) {
     state.tagMatchMode,
     state.searchQuery,
     state.sortBy,
+    layoutSortEpoch || 0,
   ].join('|');
 }
 
@@ -2012,7 +2034,8 @@ function applyGalleryGeometry(
   );
   const roundedWidth = Math.round(containerWidth);
   const photosVer = getPhotosVersion(store, visiblePhotos);
-  const filterKey = buildFilterKey(state);
+  const albumKey = `${state.mode}:${state.folderId || 'demo'}`;
+  const filterKey = buildFilterKey(state, store?.layoutSortEpoch);
 
   const vh = readGalleryViewportHeight(scrollContainer);
   const prevLayout = activeLayout;
@@ -2073,7 +2096,8 @@ function applyGalleryGeometry(
     roundedWidth,
     clampedRowHeight,
     isMobile,
-    photosVer
+    photosVer,
+    `${albumKey}|${filterKey}`
   );
 
   activeLayout = nextLayout;
@@ -2137,6 +2161,8 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
   const albumKey = `${store.state.mode}:${store.state.folderId || 'demo'}`;
   if (albumKey !== pooledAlbumKey) {
     pooledAlbumKey = albumKey;
+    lockedWaterfallKey = '';
+    lockedWaterfallColById.clear();
     clearAllMountedCards();
     freeCardPool.length = 0;
     cachedLayout = null;
@@ -2199,7 +2225,7 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
 
   ensureGalleryFloatingUi(gridEl, scrollContainer, store);
   lastVisiblePhotos = visiblePhotos;
-  lastFilterKey = buildFilterKey(store.state);
+  lastFilterKey = buildFilterKey(store.state, store?.layoutSortEpoch);
 
   const rowHeight = Math.max(130, Math.min(320, Math.round(Number(store.state.rowHeight) || 210)));
   const isMobile = scrollContainer.clientWidth <= 600;
@@ -2297,6 +2323,8 @@ export function resetGallerySignature() {
   lastSubbarSignature = '';
   lastBatchSignature = '';
   cachedLayout = null;
+  lockedWaterfallKey = '';
+  lockedWaterfallColById.clear();
 }
 
 export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {

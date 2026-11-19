@@ -1322,7 +1322,9 @@
 }
 
 :is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"]) .top-header {
-  top: calc(var(--safe-top) + 14px);
+  top: calc(max(var(--safe-top), 12px) + 8px);
+  transform: none !important;
+  transition: opacity 160ms ease;
   background: transparent !important;
   background-image: none !important;
   box-shadow: none !important;
@@ -1332,11 +1334,106 @@
 
 :is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
   .top-header.is-hidden-scroll:not(:has(:focus-visible)) {
-  top: -320px !important;
-  opacity: 0;
+  display: none !important;
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  :is(.top-header .header-glass-pill, .top-header .search-omni-card, .gallery-subbar-pill) {
+  position: relative;
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  :is(.top-header .header-glass-pill, .top-header .search-omni-card, .gallery-subbar-pill, .demo-banner) {
+  background: transparent !important;
+  background-color: transparent !important;
+  background-image: none !important;
+  border-color: transparent !important;
+  box-shadow: none !important;
+  -webkit-backdrop-filter: none !important;
+  backdrop-filter: none !important;
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .top-header
+  .segmented.segmented-sliding {
+  isolation: auto;
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .top-header
+  .search-omni-card {
+  overflow: visible;
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .top-header
+  .header-right
+  .header-sync-btn.is-unsynced-danger {
+  animation: none;
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  :is(.top-header .header-glass-pill, .top-header .search-omni-card, .gallery-subbar-pill, .demo-banner)::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  background: var(--lg-bg);
+  border: 1px solid var(--lg-border);
+  box-shadow: inset 0 1px 0.5px rgba(255, 255, 255, 0.28),
+    inset 0 -0.5px 0.5px rgba(255, 255, 255, 0.08),
+    0 1px 3px rgba(0, 0, 0, 0.06);
+  -webkit-backdrop-filter: var(--lg-blur);
+  backdrop-filter: var(--lg-blur);
+  z-index: -1;
   pointer-events: none;
-  visibility: hidden;
-  transform: translateY(calc(-140% - var(--safe-top) - var(--chrome-gap)));
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  :is(.top-header.search-expanded .search-omni-card, .demo-banner)::after {
+  background: var(--lg-bg-sheet);
+  border-color: var(--border-strong);
+  -webkit-backdrop-filter: var(--lg-blur-sheet);
+  backdrop-filter: var(--lg-blur-sheet);
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .top-header
+  .header-right
+  .header-sync-btn.is-syncing::after {
+  border-color: rgba(56, 189, 248, 0.42);
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .top-header
+  .header-right
+  .header-sync-btn.is-unsynced-danger::after {
+  background: rgba(239, 68, 68, 0.20);
+  border-color: rgba(248, 113, 113, 0.58);
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])[data-theme="light"]
+  .top-header
+  .header-right
+  .header-sync-btn.is-unsynced-danger::after {
+  background: rgba(239, 68, 68, 0.14);
+  border-color: rgba(220, 38, 38, 0.48);
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
+  .top-header
+  .header-right
+  .header-sync-btn.is-unsynced-warn::after {
+  background: rgba(245, 158, 11, 0.18);
+  border-color: rgba(251, 146, 60, 0.56);
+}
+
+:is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])[data-theme="light"]
+  .top-header
+  .header-right
+  .header-sync-btn.is-unsynced-warn::after {
+  background: rgba(245, 158, 11, 0.15);
+  border-color: rgba(217, 119, 6, 0.48);
 }
 
 :is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
@@ -1376,7 +1473,8 @@
 :is(html.is-ios-device, html.ios-safari-doc-scroll, html[data-force-doc-scroll="true"])
   .compare-overlay {
   inset: 0;
-  min-height: 100lvh;
+  height: 100%;
+  height: 100dvh;
 }
 
 @media (display-mode: standalone) {
@@ -1412,7 +1510,7 @@ html.is-ios-device:not(.ios-safari-doc-scroll) .app-shell {
 }
 
 html.is-ios-device:not(.ios-safari-doc-scroll) .top-header {
-  top: calc(var(--safe-top) + 14px);
+  top: calc(max(var(--safe-top), 12px) + 8px);
 }
 
 @media (prefers-reduced-motion: reduce) {
