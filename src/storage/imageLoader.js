@@ -64,6 +64,36 @@ export function quantizeThumbSize(requestedPx = 480) {
   return 3840;
 }
 
+let avgThumbLoadMs = 130;
+const THUMB_EMA_ALPHA = 0.22;
+const MIN_THUMB_EMA_MS = 35;
+const MAX_THUMB_EMA_MS = 3000;
+
+function recordThumbLoadDuration(ms) {
+  const clamped = Math.max(MIN_THUMB_EMA_MS, Math.min(MAX_THUMB_EMA_MS, Number(ms) || 130));
+  avgThumbLoadMs = Math.max(
+    MIN_THUMB_EMA_MS,
+    Math.min(MAX_THUMB_EMA_MS, avgThumbLoadMs * (1 - THUMB_EMA_ALPHA) + clamped * THUMB_EMA_ALPHA)
+  );
+}
+
+export function getAdaptiveThumbTier(
+  requestedPx = 480,
+  { scrollSpeedPxPerSec = 0, isLookahead = false } = {}
+) {
+  const base = quantizeThumbSize(requestedPx);
+  const pending = loadQueue.pendingCount();
+  const speed = Math.abs(Number(scrollSpeedPxPerSec) || 0);
+  if (avgThumbLoadMs > 360 || speed > 1600 || pending > 16) {
+    return 240;
+  }
+  if (avgThumbLoadMs > 165 || speed > 650 || pending > 8 || isLookahead) {
+    if (avgThumbLoadMs > 260 && isLookahead) return 240;
+    return base >= 1280 ? 480 : base >= 800 ? 480 : 240;
+  }
+  return base;
+}
+
 function isBlobCacheEntry(key, val) {
   return (
     key.endsWith(':hd') ||
@@ -335,6 +365,10 @@ class ImageLoadQueue {
     return this.active === 0 && this.queue.length === 0 && !this._settling;
   }
 
+  pendingCount() {
+    return this.queue.length;
+  }
+
   onBusy(fn) {
     this._busyListeners.add(fn);
     return () => this._busyListeners.delete(fn);
@@ -368,6 +402,7 @@ class ImageLoadQueue {
       abortCtrl = null,
       priorityScore = null,
       virtualManaged = false,
+      needsFirstPaint = false,
     } = {}
   ) {
     let entryRef = null;
@@ -384,6 +419,7 @@ class ImageLoadQueue {
         abortCtrl,
         priorityScore: typeof priorityScore === 'number' ? priorityScore : null,
         virtualManaged: Boolean(virtualManaged),
+        needsFirstPaint: Boolean(needsFirstPaint),
         cancelled: false,
       };
       if (entryRef.priority) {
@@ -411,11 +447,14 @@ class ImageLoadQueue {
       }
     };
 
-    const updatePriority = (nextPriority, nextScore) => {
+    const updatePriority = (nextPriority, nextScore, nextNeedsFirstPaint) => {
       if (!entryRef || entryRef.cancelled) return;
       entryRef.priority = Boolean(nextPriority);
       if (typeof nextScore === 'number') {
         entryRef.priorityScore = nextScore;
+      }
+      if (typeof nextNeedsFirstPaint === 'boolean') {
+        entryRef.needsFirstPaint = nextNeedsFirstPaint;
       }
     };
 
@@ -426,6 +465,7 @@ class ImageLoadQueue {
     if (this.active < this.concurrency) return;
     const incomingUrgent =
       incoming.priority ||
+      incoming.needsFirstPaint ||
       (!incoming.virtualManaged &&
         typeof incoming.priorityScore !== 'number' &&
         incoming.imgEl &&
@@ -451,16 +491,25 @@ class ImageLoadQueue {
   _pickNextIndex() {
     if (this.queue.length <= 1) return 0;
     let bestIdx = 0;
+    let bestTier = Infinity;
+    let bestPriorityRank = Infinity;
     let bestScore = Infinity;
     for (let i = 0; i < this.queue.length; i += 1) {
       const entry = this.queue[i];
+      const tier = entry.needsFirstPaint ? 0 : 1;
+      const priorityRank = entry.priority ? 0 : 1;
       const hasNumericScore = typeof entry.priorityScore === 'number';
-      if (entry.priority && !hasNumericScore) return i;
-      const base = entry.priority ? 0 : 1e9;
       const score = hasNumericScore
-        ? base + entry.priorityScore
+        ? entry.priorityScore
         : scoreElementViewportPriority(entry.imgEl);
-      if (score < bestScore) {
+      if (
+        tier < bestTier ||
+        (tier === bestTier &&
+          (priorityRank < bestPriorityRank ||
+            (priorityRank === bestPriorityRank && score < bestScore)))
+      ) {
+        bestTier = tier;
+        bestPriorityRank = priorityRank;
         bestScore = score;
         bestIdx = i;
       }
@@ -821,6 +870,26 @@ function loadViaImgTag(url, signal = null) {
 
 let driveStorageFailCount = 0;
 
+async function measureThumbImgLoad(url, signal = null) {
+  const nowFn = typeof performance !== 'undefined' ? () => performance.now() : () => Date.now();
+  const startedAt = nowFn();
+  try {
+    const res = await loadViaImgTag(url, signal);
+    recordThumbLoadDuration(nowFn() - startedAt);
+    return res;
+  } catch (err) {
+    if (err?.name !== 'AbortError' && !signal?.aborted) {
+      const elapsed = nowFn() - startedAt;
+      const penaltyMs =
+        err?.message === 'Thumbnail load timeout'
+          ? Math.max(elapsed, 1500)
+          : Math.max(elapsed, 650);
+      recordThumbLoadDuration(penaltyMs);
+    }
+    throw err;
+  }
+}
+
 function isKnownExpiredThumbLink(item) {
   if (!item || !item.thumbnailLink) return false;
   if (!item.thumbnailLink.includes('drive-storage')) return false;
@@ -875,7 +944,7 @@ async function resolveImageSrc(
     !thumbUrl || isKnownExpiredThumbLink(item) || isStaleDriveStorageUrl(thumbUrl);
   if (!skipInitialThumb) {
     try {
-      await loadViaImgTag(thumbUrl, signal);
+      await measureThumbImgLoad(thumbUrl, signal);
       if (thumbUrl.includes('/drive-storage/')) driveStorageFailCount = 0;
       setObjectUrlCache(memKey, thumbUrl);
       recordBestLoaded(item.id, size, thumbUrl);
@@ -894,7 +963,7 @@ async function resolveImageSrc(
     triedLh3Url = `https://lh3.googleusercontent.com/d/${encodeURIComponent(item.id)}=s${size}`;
     if (triedLh3Url !== thumbUrl || skipInitialThumb) {
       try {
-        await lh3RateGate.run(() => loadViaImgTag(triedLh3Url, signal), signal);
+        await lh3RateGate.run(() => measureThumbImgLoad(triedLh3Url, signal), signal);
         setObjectUrlCache(memKey, triedLh3Url);
         recordBestLoaded(item.id, size, triedLh3Url);
         return { src: triedLh3Url, size };
@@ -906,7 +975,7 @@ async function resolveImageSrc(
     const fallbackUrl = `https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w${size}`;
     if (fallbackUrl !== thumbUrl) {
       try {
-        await loadViaImgTag(fallbackUrl, signal);
+        await measureThumbImgLoad(fallbackUrl, signal);
         setObjectUrlCache(memKey, fallbackUrl);
         recordBestLoaded(item.id, size, fallbackUrl);
         return { src: fallbackUrl, size };
@@ -928,7 +997,7 @@ async function resolveImageSrc(
       const freshSized = buildDriveThumbUrl(item, size);
       if (freshSized && freshSized !== triedLh3Url) {
         try {
-          await loadViaImgTag(freshSized, signal);
+          await measureThumbImgLoad(freshSized, signal);
           setObjectUrlCache(memKey, freshSized);
           recordBestLoaded(item.id, size, freshSized);
           return { src: freshSized, size };
@@ -1511,6 +1580,9 @@ export function cancelElementPhotoLoad(imgEl) {
   if (!imgEl) return;
   clearTimeout(imgEl._dlDwellTimer);
   imgEl._dlDwellTimer = 0;
+  clearTimeout(imgEl._dlUpgradeTimer);
+  imgEl._dlUpgradeTimer = 0;
+  imgEl._dlPendingUpgradeTo = 0;
   if (typeof imgEl._dlCancelQueue === 'function') {
     imgEl._dlCancelQueue();
     imgEl._dlCancelQueue = null;
@@ -1546,6 +1618,8 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
     onLoaded = null,
     virtualManaged = false,
     priorityScore = 0,
+    scrollSpeedPxPerSec = 0,
+    isLookahead = false,
   } = options;
   if (!imgEl || !item) return;
   imgEl.decoding = 'async';
@@ -1564,22 +1638,58 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
     return;
   }
 
-  const targetSize = quantizeThumbSize(size);
-  imgEl._dlTargetSize = targetSize;
+  clearTimeout(imgEl._dlUpgradeTimer);
+  imgEl._dlUpgradeTimer = 0;
+  if (isLookahead) {
+    imgEl._dlPendingUpgradeTo = 0;
+  }
+
+  const fullTargetSize = quantizeThumbSize(size);
+  const initialSize = getAdaptiveThumbTier(size, { scrollSpeedPxPerSec, isLookahead });
+  imgEl._dlTargetSize = fullTargetSize;
   registerLiveImgElement(item.id, imgEl);
 
-  const runLoad = () => {
+  const runLoad = (
+    desiredSize = fullTargetSize,
+    {
+      needsFirstPaintArg = Boolean(!isLookahead && Number(imgEl.dataset.loadedSize || 0) === 0),
+      priorityArg = eager,
+      upgradeTarget = 0,
+    } = {}
+  ) => {
     if (!imgEl.isConnected) return;
-    const desired = imgEl._dlTargetSize || targetSize;
+    const desired = desiredSize || imgEl._dlTargetSize || fullTargetSize;
     if (Number(imgEl.dataset.loadedSize || 0) >= desired || imgEl.dataset.hdLoaded === 'true') {
       return;
     }
     if (imgEl._dlInFlightSize && imgEl._dlInFlightSize >= desired) {
-      imgEl._dlUpdatePriority?.(eager, virtualManaged ? Number(priorityScore) || 0 : null);
+      if (upgradeTarget > 0) {
+        imgEl._dlPendingUpgradeTo = upgradeTarget;
+      }
+      imgEl._dlUpdatePriority?.(
+        priorityArg,
+        virtualManaged ? Number(priorityScore) || 0 : null,
+        needsFirstPaintArg
+      );
+      return;
+    }
+    if (
+      imgEl._dlInFlightSize > 0 &&
+      imgEl._dlInFlightSize < desired &&
+      Number(imgEl.dataset.loadedSize || 0) === 0 &&
+      !isLookahead
+    ) {
+      imgEl._dlPendingUpgradeTo = desired;
+      imgEl._dlUpdatePriority?.(
+        priorityArg,
+        virtualManaged ? Number(priorityScore) || 0 : null,
+        true
+      );
       return;
     }
 
     imgEl._dlCancelQueue?.();
+    imgEl._dlPendingUpgradeTo = upgradeTarget;
     const abortCtrl = typeof AbortController !== 'undefined' ? new AbortController() : null;
     imgEl._dlAbortCtrl = abortCtrl;
     imgEl._dlInFlightSize = desired;
@@ -1590,11 +1700,12 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
           allowMediaFallback: false,
         }),
       {
-        priority: eager,
+        priority: priorityArg,
         imgEl,
         abortCtrl,
         priorityScore: virtualManaged ? Number(priorityScore) || 0 : null,
         virtualManaged: Boolean(virtualManaged),
+        needsFirstPaint: Boolean(needsFirstPaintArg),
       }
     );
     imgEl._dlCancelQueue = cancel;
@@ -1620,12 +1731,38 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
           };
           imgEl.src = src;
         }
-        if (resolvedSz >= (imgEl._dlTargetSize || desired)) {
+        const targetAfter = imgEl._dlTargetSize || fullTargetSize;
+        const nextUpgrade = imgEl._dlPendingUpgradeTo || upgradeTarget || 0;
+        imgEl._dlPendingUpgradeTo = 0;
+        if (resolvedSz >= targetAfter) {
           const obs = activeObservers.get(imgEl);
           if (obs) {
             obs.disconnect();
             activeObservers.delete(imgEl);
           }
+        } else if (
+          nextUpgrade > resolvedSz &&
+          !isLookahead &&
+          imgEl.isConnected &&
+          imgEl._dlItemId === item.id
+        ) {
+          clearTimeout(imgEl._dlUpgradeTimer);
+          imgEl._dlUpgradeTimer = setTimeout(() => {
+            imgEl._dlUpgradeTimer = 0;
+            if (!imgEl.isConnected || imgEl._dlItemId !== item.id) return;
+            const latestTarget = imgEl._dlTargetSize || nextUpgrade;
+            if (
+              Number(imgEl.dataset.loadedSize || 0) >= latestTarget ||
+              imgEl.dataset.hdLoaded === 'true'
+            ) {
+              return;
+            }
+            runLoad(latestTarget, {
+              needsFirstPaintArg: false,
+              priorityArg: false,
+              upgradeTarget: 0,
+            });
+          }, 240);
         }
       })
       .catch((err) => {
@@ -1655,13 +1792,19 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
       imgEl.dataset.loadedSize = '0';
       delete imgEl.dataset.hdLoaded;
       imgEl.classList.remove('is-loaded');
-      runLoad();
+      runLoad(fullTargetSize, {
+        needsFirstPaintArg: !isLookahead,
+        priorityArg: eager,
+        upgradeTarget: 0,
+      });
     };
   };
 
+  let hasInstantHit = false;
   // Always show the sharpest already-loaded version immediately (never downgrade!)
   const best = getBestLoaded(item.id);
   if (best && best.src) {
+    hasInstantHit = true;
     const curLoaded = Number(imgEl.dataset.loadedSize || 0);
     if (!imgEl.getAttribute('src') || best.size > curLoaded) {
       imgEl.referrerPolicy = 'no-referrer';
@@ -1676,13 +1819,14 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
         card.classList.remove('is-thumb-error');
       }
     }
-    if (best.size >= targetSize) {
+    if (best.size >= fullTargetSize) {
       if (onLoaded) onLoaded();
       return;
     }
   } else if (!imgEl.getAttribute('src')) {
     const instant = getInstantCachedSrc(item);
     if (instant) {
+      hasInstantHit = true;
       imgEl.referrerPolicy = 'no-referrer';
       attachCachedErrorRetry(instant);
       imgEl.src = instant;
@@ -1695,10 +1839,28 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
     }
   }
 
-  if (Number(imgEl.dataset.loadedSize || 0) >= targetSize || imgEl.dataset.hdLoaded === 'true') {
+  if (Number(imgEl.dataset.loadedSize || 0) >= fullTargetSize || imgEl.dataset.hdLoaded === 'true') {
     if (onLoaded) onLoaded();
     return;
   }
+
+  const startStage = () => {
+    if (!imgEl.isConnected || imgEl._dlItemId !== item.id) return;
+    const hasVisibleImage = Number(imgEl.dataset.loadedSize || 0) > 0 || hasInstantHit;
+    if (!hasVisibleImage && initialSize < fullTargetSize) {
+      runLoad(initialSize, {
+        needsFirstPaintArg: !isLookahead,
+        priorityArg: eager,
+        upgradeTarget: !isLookahead ? fullTargetSize : 0,
+      });
+    } else {
+      runLoad(fullTargetSize, {
+        needsFirstPaintArg: Boolean(!isLookahead && !hasVisibleImage),
+        priorityArg: eager,
+        upgradeTarget: 0,
+      });
+    }
+  };
 
   const prevObs = activeObservers.get(imgEl);
   if (prevObs) {
@@ -1710,19 +1872,19 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
 
   if (virtualManaged) {
     if (eager) {
-      runLoad();
+      startStage();
     } else {
       loadQueue.touchActivity(170);
       imgEl._dlDwellTimer = setTimeout(() => {
         imgEl._dlDwellTimer = 0;
-        runLoad();
+        startStage();
       }, 35);
     }
     return;
   }
 
   if (eager || typeof IntersectionObserver === 'undefined') {
-    runLoad();
+    startStage();
     return;
   }
 
@@ -1737,7 +1899,7 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
           const dwellMs = onScreenNow ? 45 : 85;
           imgEl._dlDwellTimer = setTimeout(() => {
             imgEl._dlDwellTimer = 0;
-            runLoad();
+            startStage();
           }, dwellMs);
           loadQueue.touchActivity(170);
         } else {
@@ -1758,6 +1920,110 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
   activeObservers.set(imgEl, observer);
   loadQueue.touchActivity(170);
   observer.observe(imgEl);
+}
+
+let lastSyncedSwAuth = { accessToken: '', apiKey: '' };
+let swControllerListenerAttached = false;
+
+function postAuthToSwController() {
+  if (typeof navigator === 'undefined' || !navigator.serviceWorker?.controller) return;
+  try {
+    navigator.serviceWorker.controller.postMessage({
+      type: 'DL_AUTH_SYNC',
+      accessToken: lastSyncedSwAuth.accessToken,
+      apiKey: lastSyncedSwAuth.apiKey,
+    });
+  } catch {
+    // Ignore postMessage errors
+  }
+}
+
+export function syncServiceWorkerAuth({ accessToken = '', apiKey = '' } = {}) {
+  lastSyncedSwAuth = {
+    accessToken: String(accessToken || ''),
+    apiKey: String(apiKey || ''),
+  };
+  if (typeof navigator !== 'undefined' && navigator.serviceWorker && !swControllerListenerAttached) {
+    swControllerListenerAttached = true;
+    try {
+      navigator.serviceWorker.addEventListener('controllerchange', () => {
+        postAuthToSwController();
+      });
+    } catch {
+      // Ignore environments without addEventListener on serviceWorker
+    }
+  }
+  postAuthToSwController();
+}
+
+export function buildDesktopDragDownloadSpec(item, { accessToken = '', apiKey = '' } = {}) {
+  syncServiceWorkerAuth({ accessToken, apiKey });
+  const cleanedName = String(item?.name || '').replace(/[:/\\\r\n]/g, '').trim();
+  let filename = cleanedName || 'photo.jpg';
+
+  if (item?.isDemo) {
+    if (!/\.svg$/i.test(filename)) {
+      filename = filename.replace(/\.[^.]+$/, '') + '.svg';
+    }
+    return {
+      mime: 'image/svg+xml',
+      filename,
+      url: item.demoDataUrl || '',
+    };
+  }
+
+  const mime =
+    String(item?.mimeType || 'application/octet-stream').replace(/[:\r\n]/g, '').trim() ||
+    'application/octet-stream';
+
+  if (!item?.id) {
+    return { mime, filename, url: '' };
+  }
+
+  if (objectUrlCache.has(`${item.id}:media`)) {
+    return {
+      mime,
+      filename,
+      url: touchObjectUrlCache(`${item.id}:media`) || objectUrlCache.get(`${item.id}:media`),
+    };
+  }
+
+  if (
+    typeof navigator !== 'undefined' &&
+    navigator.serviceWorker?.controller &&
+    typeof window !== 'undefined'
+  ) {
+    const streamUrl = new URL(
+      './__dl_original__/' + encodeURIComponent(item.id) + '/' + encodeURIComponent(filename),
+      window.location.href
+    ).href;
+    return { mime, filename, url: streamUrl };
+  }
+
+  if (!accessToken && apiKey) {
+    return {
+      mime,
+      filename,
+      url:
+        'https://www.googleapis.com/drive/v3/files/' +
+        encodeURIComponent(item.id) +
+        '?alt=media&supportsAllDrives=true&key=' +
+        encodeURIComponent(apiKey),
+    };
+  }
+
+  if (objectUrlCache.has(`${item.id}:hd`)) {
+    const hdUrl = objectUrlCache.get(`${item.id}:hd`);
+    if (typeof hdUrl === 'string' && hdUrl.startsWith('blob:')) {
+      return { mime, filename, url: hdUrl };
+    }
+  }
+
+  return {
+    mime,
+    filename,
+    url: 'https://drive.google.com/uc?export=download&id=' + encodeURIComponent(item.id),
+  };
 }
 
 export async function fetchAuthorizedMediaBlobUrl(fileId, accessToken, apiKey = '') {
@@ -1791,6 +2057,7 @@ export async function clearImageCache() {
   bestLoadedByItem.clear();
   liveElementsByItem.clear();
   driveStorageFailCount = 0;
+  avgThumbLoadMs = 130;
   for (const url of objectUrlCache.values()) {
     if (typeof url === 'string' && url.startsWith('blob:')) {
       try {

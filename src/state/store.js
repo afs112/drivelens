@@ -329,6 +329,8 @@ export class Store {
     this._startPageToken = '';
     this._syncWatermark = '';
     this._lastFullReconcileAt = 0;
+    this._unsyncedPhotoIds = new Set();
+    this._unsyncedSchemaDirty = false;
 
     const initialLang = setLangCode(getLang());
     const prefs = loadConnectPrefs();
@@ -639,10 +641,20 @@ export class Store {
     this.toast(t('store.appInstalledToast'), 'success');
   }
 
+  _resetUnsyncedTracking() {
+    clearTimeout(this.memberSyncTimer);
+    clearTimeout(this.schemaSyncTimer);
+    this.memberSyncTimer = null;
+    this.schemaSyncTimer = null;
+    this._unsyncedPhotoIds.clear();
+    this._unsyncedSchemaDirty = false;
+  }
+
   loadDemoMode(showNotice = true, disableAutoConnect = false) {
     const wasGdrive = this.state?.mode === 'gdrive';
     this.connectSeq += 1;
     clearTimeout(this.cacheSnapshotTimer);
+    this._resetUnsyncedTracking();
     if (disableAutoConnect) {
       saveConnectPrefs({ autoConnect: false });
     }
@@ -1067,6 +1079,10 @@ export class Store {
     }
 
     const reqSeq = ++this.connectSeq;
+    const isAlbumSwitch = this.state.mode !== 'gdrive' || this.state.folderId !== cleanFolderId;
+    if (isAlbumSwitch) {
+      this._resetUnsyncedTracking();
+    }
     const existingSavedUser = getSavedOAuthUser(cleanClientId);
     const savedHint = existingSavedUser?.email || '';
     const effectiveHint = loginHint !== undefined ? loginHint : savedHint;
@@ -1296,6 +1312,10 @@ export class Store {
       this._updateUrlHash(cleanFolderId, cleanClientId);
 
       const msgKey = album.canWrite ? 'store.syncOAuthSynced' : 'store.syncReadonly';
+      const hadPendingEdits =
+        !isAlbumSwitch &&
+        album.canWrite &&
+        (this._unsyncedPhotoIds.size > 0 || this._unsyncedSchemaDirty);
       this._commitLoadedAlbumState({
         authType: 'oauth',
         folderId: cleanFolderId,
@@ -1310,6 +1330,15 @@ export class Store {
         syncMessageKey: msgKey,
         recent,
       });
+
+      if (hadPendingEdits) {
+        if (this._unsyncedPhotoIds.size > 0) {
+          this._flushMemberSync();
+        }
+        if (this._unsyncedSchemaDirty) {
+          this._flushSchemaSync();
+        }
+      }
 
       if (!cachedBeforeAuth || forceRescan) {
         this.toast(
@@ -1359,6 +1388,9 @@ export class Store {
     }
 
     const reqSeq = ++this.connectSeq;
+    if (this.state.mode !== 'gdrive' || this.state.folderId !== cleanFolderId) {
+      this._resetUnsyncedTracking();
+    }
 
     if (remember) {
       saveConnectPrefs({
@@ -1731,6 +1763,9 @@ export class Store {
     this._startPageToken = '';
     this._syncWatermark = '';
     this._lastFullReconcileAt = 0;
+    this._resetUnsyncedTracking();
+    this._unsyncedPhotoIds = new Set();
+    this._unsyncedSchemaDirty = false;
 
     this.setState({
       apiKey: '',
@@ -2102,20 +2137,33 @@ export class Store {
           ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => this._fileById.has(id)))
           : this.state.selectedPhotoIds;
 
-      const syncStatus = isOAuth
-        ? this.state.canWrite
-          ? 'synced'
-          : 'readonly'
-        : localMetaSupported
-          ? 'synced'
-          : 'readonly';
-      const syncMessageKey = isOAuth
-        ? this.state.canWrite
-          ? 'store.syncOAuthSynced'
-          : 'store.syncReadonly'
-        : localMetaSupported
-          ? 'store.syncApiKeySynced'
-          : 'store.syncApiKeyLocal';
+      const hasPendingWrite =
+        ((isOAuth && this.state.canWrite) || (!isOAuth && localMetaSupported)) &&
+        (this._unsyncedPhotoIds.size > 0 || this._unsyncedSchemaDirty);
+      const syncStatus = hasPendingWrite
+        ? this.memberSyncTimer || this.schemaSyncTimer
+          ? 'syncing'
+          : 'error'
+        : isOAuth
+          ? this.state.canWrite
+            ? 'synced'
+            : 'readonly'
+          : localMetaSupported
+            ? 'synced'
+            : 'readonly';
+      const syncMessageKey = hasPendingWrite
+        ? this.memberSyncTimer || this.schemaSyncTimer
+          ? 'store.syncSavingRatings'
+          : isOAuth
+            ? 'store.syncErrorAuth'
+            : 'store.syncErrorLocal'
+        : isOAuth
+          ? this.state.canWrite
+            ? 'store.syncOAuthSynced'
+            : 'store.syncReadonly'
+          : localMetaSupported
+            ? 'store.syncApiKeySynced'
+            : 'store.syncApiKeyLocal';
 
       const foldersChanged = nextFolders.length !== this.state.folders.length || nextFolders !== this.state.folders;
       const changeType = deltaCount > 0 || foldersChanged || metaChanged ? 'full' : 'ui-only';
@@ -2223,6 +2271,9 @@ export class Store {
     this._startPageToken = '';
     this._syncWatermark = '';
     this._lastFullReconcileAt = 0;
+    this._resetUnsyncedTracking();
+    this._unsyncedPhotoIds = new Set();
+    this._unsyncedSchemaDirty = false;
     this.setState({ accessToken: '', localMetaSupported: false, backgroundRefreshing: false });
     this.loadDemoMode(true, true);
   }
@@ -2842,10 +2893,10 @@ export class Store {
           syncMessageKey: 'store.syncSavingRatings',
           syncMessage: t('store.syncSavingRatings'),
         });
-        this.memberSyncTimer = setTimeout(
-          () => this._flushApiKeyMetaSync(),
-          APP_CONFIG.SYNC_DEBOUNCE_MS
-        );
+        this.memberSyncTimer = setTimeout(() => {
+          this.memberSyncTimer = null;
+          this._flushApiKeyMetaSync();
+        }, APP_CONFIG.SYNC_DEBOUNCE_MS);
       }
       return;
     }
@@ -2878,7 +2929,10 @@ export class Store {
         syncMessageKey: 'store.syncSavingRatings',
         syncMessage: t('store.syncSavingRatings'),
       });
-      this.memberSyncTimer = setTimeout(() => this._flushMemberSync(), APP_CONFIG.SYNC_DEBOUNCE_MS);
+      this.memberSyncTimer = setTimeout(() => {
+        this.memberSyncTimer = null;
+        this._flushMemberSync();
+      }, APP_CONFIG.SYNC_DEBOUNCE_MS);
     }
 
     if (schemaDirty) {
@@ -2888,7 +2942,10 @@ export class Store {
         syncMessageKey: 'store.syncSavingTags',
         syncMessage: t('store.syncSavingTags'),
       });
-      this.schemaSyncTimer = setTimeout(() => this._flushSchemaSync(), APP_CONFIG.SYNC_DEBOUNCE_MS);
+      this.schemaSyncTimer = setTimeout(() => {
+        this.schemaSyncTimer = null;
+        this._flushSchemaSync();
+      }, APP_CONFIG.SYNC_DEBOUNCE_MS);
     }
   }
 
@@ -2903,13 +2960,15 @@ export class Store {
     }
     const myId = this.state.currentUser.id;
     const memberRecord = this.state.membersData[myId];
+    const syncedIds = Array.from(this._unsyncedPhotoIds);
+    const sentSchema = this.state.tagSchema;
 
     try {
       const res = await saveLocalServerMeta({
         folderId: this.state.folderId,
         memberId: myId,
         memberRecord,
-        tagSchema: this.state.tagSchema,
+        tagSchema: sentSchema,
       });
 
       if (!res) {
@@ -2920,6 +2979,17 @@ export class Store {
           syncMessage: t('store.syncApiKeyLocal'),
         });
         return;
+      }
+
+      for (const id of syncedIds) {
+        const sentTs = memberRecord?.items?.[id]?.updatedAt || 0;
+        const curTs = this.state.membersData[myId]?.items?.[id]?.updatedAt || 0;
+        if (curTs <= sentTs) {
+          this._unsyncedPhotoIds.delete(id);
+        }
+      }
+      if (this.state.tagSchema === sentSchema) {
+        this._unsyncedSchemaDirty = false;
       }
 
       const mergedSchema = res.tagSchema?.tags
@@ -2961,10 +3031,24 @@ export class Store {
     if (this.state.authType === 'apikey') {
       return this._flushApiKeyMetaSync();
     }
-    if (this.state.mode !== 'gdrive' || !this.state.canWrite || !this.state.accessToken) return;
+    if (this.state.mode !== 'gdrive' || !this.state.canWrite) return;
+    if (!this.state.accessToken) {
+      if (this._unsyncedPhotoIds.size > 0 || this.state.syncStatus === 'syncing') {
+        this.setState(
+          {
+            syncStatus: 'error',
+            syncMessageKey: 'store.syncErrorAuth',
+            syncMessage: t('store.syncErrorAuth'),
+          },
+          { type: 'ui-only' }
+        );
+      }
+      return;
+    }
     const myId = this.state.currentUser.id;
     const payload = this.state.membersData[myId];
     if (!payload) return;
+    const syncedIds = Array.from(this._unsyncedPhotoIds);
 
     try {
       const res = await saveMemberMetadata({
@@ -2975,6 +3059,13 @@ export class Store {
         payload,
         accessToken: this.state.accessToken,
       });
+      for (const id of syncedIds) {
+        const sentTs = payload?.items?.[id]?.updatedAt || 0;
+        const curTs = this.state.membersData[myId]?.items?.[id]?.updatedAt || 0;
+        if (curTs <= sentTs) {
+          this._unsyncedPhotoIds.delete(id);
+        }
+      }
       this.setState(
         {
           metaFolderId: res.metaFolderId,
@@ -3000,15 +3091,32 @@ export class Store {
     if (this.state.authType === 'apikey') {
       return this._flushApiKeyMetaSync();
     }
-    if (this.state.mode !== 'gdrive' || !this.state.canWrite || !this.state.accessToken) return;
+    if (this.state.mode !== 'gdrive' || !this.state.canWrite) return;
+    if (!this.state.accessToken) {
+      if (this._unsyncedSchemaDirty || this.state.syncStatus === 'syncing') {
+        this.setState(
+          {
+            syncStatus: 'error',
+            syncMessageKey: 'store.syncTagsErrorShort',
+            syncMessage: t('store.syncTagsErrorShort'),
+          },
+          { type: 'ui-only' }
+        );
+      }
+      return;
+    }
+    const sentSchema = this.state.tagSchema;
     try {
       const res = await saveTagSchema({
         rootFolderId: this.state.folderId,
         metaFolderId: this.state.metaFolderId,
         existingFileId: this.state.tagSchemaFileId,
-        localSchema: this.state.tagSchema,
+        localSchema: sentSchema,
         accessToken: this.state.accessToken,
       });
+      if (this.state.tagSchema === sentSchema) {
+        this._unsyncedSchemaDirty = false;
+      }
       this.setState({
         metaFolderId: res.metaFolderId,
         tagSchemaFileId: res.fileId,
@@ -3028,11 +3136,143 @@ export class Store {
     }
   }
 
+  getSyncIndicatorState() {
+    const s = this.state;
+    if (s.mode !== 'gdrive') {
+      return {
+        level: 'demo',
+        badgeCount: 0,
+        isSpinning: false,
+        title: t('header.syncDemo'),
+        shortLabel: '',
+      };
+    }
+
+    const pendingCount = this._unsyncedPhotoIds.size + (this._unsyncedSchemaDirty ? 1 : 0);
+    const isReadonlyOrStaticApiKey =
+      !s.canWrite || (s.authType === 'apikey' && !s.localMetaSupported);
+    const myId = s.currentUser?.id;
+    const localOnlyEditCount = isReadonlyOrStaticApiKey
+      ? Object.keys((myId && s.membersData?.[myId]?.items) || {}).length
+      : 0;
+
+    if (s.loading || s.backgroundRefreshing || s.syncStatus === 'syncing') {
+      return {
+        level: 'syncing',
+        badgeCount: pendingCount,
+        isSpinning: true,
+        title: s.syncMessage || t('header.syncSyncing'),
+        shortLabel: '',
+      };
+    }
+
+    const isWritableOAuthMissingToken =
+      s.authType === 'oauth' && s.canWrite && !s.accessToken;
+
+    if (s.syncStatus === 'error' || (isWritableOAuthMissingToken && pendingCount > 0)) {
+      const count = Math.max(1, pendingCount);
+      return {
+        level: 'danger',
+        badgeCount: count,
+        isSpinning: false,
+        title: t('header.syncDangerTitle', { count }),
+        shortLabel: t('header.syncUnsyncedShort'),
+      };
+    }
+
+    if (isReadonlyOrStaticApiKey && (pendingCount > 0 || localOnlyEditCount > 0)) {
+      const count = pendingCount || localOnlyEditCount;
+      return {
+        level: 'warn',
+        badgeCount: count,
+        isSpinning: false,
+        title: t('header.syncLocalOnlyTitle', { count }),
+        shortLabel: t('header.syncLocalShort'),
+      };
+    }
+
+    return {
+      level: 'synced',
+      badgeCount: 0,
+      isSpinning: false,
+      title: t('header.syncHealthyTitle'),
+      shortLabel: '',
+    };
+  }
+
+  hasUnsavedCloudChanges() {
+    return Boolean(
+      this.state.mode === 'gdrive' &&
+        (this.memberSyncTimer ||
+          this.schemaSyncTimer ||
+          (this.state.canWrite &&
+            (this.state.authType === 'oauth' || this.state.localMetaSupported) &&
+            (this._unsyncedPhotoIds.size > 0 || this._unsyncedSchemaDirty)))
+    );
+  }
+
+  async retryOrSyncNow({ fullRescan = false } = {}) {
+    if (this.state.mode !== 'gdrive') {
+      return this.refreshAlbum({ fullRescan });
+    }
+
+    if (this.state.authType === 'oauth' && !this.state.accessToken) {
+      this.openModal('connect');
+      this.toast(t('toast.reauthToSync'), 'info');
+      return false;
+    }
+
+    let flushedAny = false;
+    if (this.memberSyncTimer) {
+      clearTimeout(this.memberSyncTimer);
+      this.memberSyncTimer = null;
+      await this._flushMemberSync();
+      flushedAny = true;
+    }
+    if (this.schemaSyncTimer) {
+      clearTimeout(this.schemaSyncTimer);
+      this.schemaSyncTimer = null;
+      await this._flushSchemaSync();
+      flushedAny = true;
+    }
+
+    if (this.state.authType === 'apikey' && this.state.localMetaSupported && !flushedAny) {
+      await this._flushApiKeyMetaSync();
+    }
+
+    const myItems = this.state.membersData?.[this.state.currentUser?.id]?.items || {};
+    if (
+      (!this.state.canWrite || (this.state.authType === 'apikey' && !this.state.localMetaSupported)) &&
+      (this._unsyncedPhotoIds.size > 0 || Object.keys(myItems).length > 0)
+    ) {
+      this.toast(t('toast.localOnlySyncHint'), 'info', 4200);
+      await this.refreshAlbum({ fullRescan });
+      return true;
+    }
+
+    if (this.state.authType === 'oauth' && this.state.canWrite && this.state.accessToken) {
+      if (this._unsyncedPhotoIds.size > 0) {
+        await this._flushMemberSync();
+      }
+      if (this._unsyncedSchemaDirty) {
+        await this._flushSchemaSync();
+      }
+    }
+
+    await this.refreshAlbum({ fullRescan });
+    return true;
+  }
+
   _commitLocalItemEdits(ids, myId, record) {
     if (this._itemsByPhotoIdRef !== this.state.membersData) {
       this._rebuildItemsByPhotoId(this.state.membersData);
     }
     const mutatedSet = new Set(ids);
+    if (this.state.mode === 'gdrive') {
+      for (const fid of mutatedSet) {
+        this._unsyncedPhotoIds.add(fid);
+      }
+    }
     for (const fid of mutatedSet) {
       let perPhoto = this._itemsByPhotoId.get(fid);
       if (!perPhoto) {
@@ -3168,6 +3408,9 @@ export class Store {
       },
     };
 
+    if (this.state.mode === 'gdrive') {
+      this._unsyncedSchemaDirty = true;
+    }
     this.setState({ tagSchema: nextSchema });
     this._persistChanges({ schemaDirty: true });
     this.toast(
@@ -3196,6 +3439,9 @@ export class Store {
     const nextSelectedTags = new Set(this.state.selectedTagIds);
     nextSelectedTags.delete(tagId);
 
+    if (this.state.mode === 'gdrive') {
+      this._unsyncedSchemaDirty = true;
+    }
     this.setState({
       tagSchema: nextSchema,
       selectedTagIds: nextSelectedTags,

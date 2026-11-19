@@ -1241,10 +1241,11 @@ def verify_html_css_and_dom_ids(parsed_js):
 
 
 def verify_docs():
-    """Part (d): Verify ARCHITECTURE.md and README.md exist and are non-empty."""
+    """Part (d): Verify ARCHITECTURE.md, README.md, and README.zh-CN.md exist, are non-empty, and link each other."""
     errors = []
     docs_info = {}
-    for name in ("ARCHITECTURE.md", "README.md"):
+    doc_texts = {}
+    for name in ("ARCHITECTURE.md", "README.md", "README.zh-CN.md"):
         p = ROOT_DIR / name
         if not p.is_file():
             errors.append(f"Missing documentation file: {name}")
@@ -1253,7 +1254,20 @@ def verify_docs():
         if not text.strip():
             errors.append(f"Documentation file is empty: {name}")
             continue
+        if name == "README.zh-CN.md" and len(text.strip()) <= 500:
+            errors.append(f"Documentation file is too short ({len(text.strip())} <= 500 chars): {name}")
         docs_info[name] = len(text)
+        doc_texts[name] = text
+
+    if "README.md" in doc_texts:
+        top_en = "\n".join(doc_texts["README.md"].splitlines()[:10])
+        if "README.zh-CN.md" not in top_en:
+            errors.append("README.md must link to README.zh-CN.md at the top")
+    if "README.zh-CN.md" in doc_texts:
+        top_zh = "\n".join(doc_texts["README.zh-CN.md"].splitlines()[:10])
+        if "README.md" not in top_zh:
+            errors.append("README.zh-CN.md must link to README.md at the top")
+
     return docs_info, errors
 
 
@@ -1643,7 +1657,7 @@ def verify_i18n(parsed_js):
         parts = path.relative_to(ROOT_DIR).parts
         if any(p in (".git", "__pycache__", ".local-meta") for p in parts):
             continue
-        if rel == "src/i18n.js":
+        if rel in ("src/i18n.js", "README.zh-CN.md"):
             continue
         if path.suffix.lower() in binary_exts:
             continue
@@ -1653,7 +1667,8 @@ def verify_i18n(parsed_js):
             continue
         zero_cjk_files += 1
         for lineno, line in enumerate(text.splitlines(), 1):
-            if cjk_rx.search(line):
+            line_to_check = line.replace("\u7b80\u4f53\u4e2d\u6587", "") if rel == "README.md" else line
+            if cjk_rx.search(line_to_check):
                 errors.append(f"{rel}:{lineno}: Unexpected CJK character outside src/i18n.js")
 
     return {
@@ -1894,24 +1909,24 @@ def verify_mobile_ux(parsed_js):
         if missing:
             errors.append(f"{rel_js} missing touch handler(s): {missing}")
 
-    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v10'
+    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v11'
     checks += 1
     sw_path = ROOT_DIR / "sw.js"
     if not sw_path.is_file():
         errors.append("Missing sw.js")
     else:
         sw_toks = tokenize_js(sw_path.read_text(encoding="utf-8"), filename="sw.js")
-        has_v10 = any(
+        has_v11 = any(
             sw_toks[i].kind == "IDENT"
             and sw_toks[i].value == "CACHE_NAME"
             and sw_toks[i + 1].kind == "PUNCT"
             and sw_toks[i + 1].value == "="
             and sw_toks[i + 2].kind == "STRING"
-            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v10"
+            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v11"
             for i in range(len(sw_toks) - 2)
         )
-        if not has_v10:
-            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v10'")
+        if not has_v11:
+            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v11'")
 
     # 5. albumCache.js and renderGallery.js exports
     checks += 1
@@ -2000,7 +2015,7 @@ def main():
             print(f"      - {e}")
         all_errors.extend(docs_errors)
     else:
-        print("    PASS: ARCHITECTURE.md and README.md exist and are non-empty.")
+        print("    PASS: ARCHITECTURE.md, README.md, and README.zh-CN.md exist, are non-empty, and cross-link.")
 
     # (e) start.bat ASCII + CRLF check
     bat_info, bat_errors = verify_start_bat()

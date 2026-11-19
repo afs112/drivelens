@@ -91,6 +91,18 @@ function buildHeaderSkeleton(headerEl, state) {
 
       <button
         type="button"
+        class="btn header-glass-pill header-sync-btn"
+        data-header="sync-now"
+        title=""
+        aria-label=""
+      >
+        <span class="header-sync-icon" data-sync-icon>${icon('refresh', 15)}</span>
+        <span class="header-sync-text hide-xs" data-sync-text></span>
+        <span class="sync-exclaim-badge hidden" data-sync-badge aria-hidden="true">!</span>
+      </button>
+
+      <button
+        type="button"
         class="btn btn-icon header-glass-pill"
         data-header="toggle-more"
         title="${escapeAttr(t('header.moreMenu'))}"
@@ -381,21 +393,72 @@ function updateHeaderElements(headerEl, state, store) {
     if (svg) svg.classList.toggle('spin', busy);
   }
 
+  const ind = store.getSyncIndicatorState();
+  const syncNowBtn = headerEl.querySelector('[data-header="sync-now"]');
+  if (syncNowBtn) {
+    syncNowBtn.classList.toggle('is-syncing', ind.level === 'syncing');
+    syncNowBtn.classList.toggle('is-unsynced-danger', ind.level === 'danger');
+    syncNowBtn.classList.toggle('is-unsynced-warn', ind.level === 'warn');
+    syncNowBtn.classList.toggle('is-synced', ind.level === 'synced');
+    syncNowBtn.classList.toggle('is-demo', ind.level === 'demo');
+    syncNowBtn.disabled = Boolean(state.loading);
+    syncNowBtn.title = ind.title || '';
+    syncNowBtn.setAttribute('aria-label', ind.title || t('header.refresh'));
+
+    const syncIconEl = syncNowBtn.querySelector('[data-sync-icon]');
+    if (syncIconEl) {
+      const iconName =
+        ind.isSpinning || ind.level === 'danger' || ind.level === 'warn'
+          ? 'refresh'
+          : 'cloud';
+      if (syncIconEl.dataset.iconName !== iconName) {
+        syncIconEl.dataset.iconName = iconName;
+        syncIconEl.innerHTML = icon(iconName, 15);
+      }
+      const svg = syncIconEl.querySelector('svg');
+      if (svg) svg.classList.toggle('spin', Boolean(ind.isSpinning));
+    }
+
+    const syncTextEl = syncNowBtn.querySelector('[data-sync-text]');
+    if (syncTextEl) {
+      const shortLabel = ind.shortLabel || '';
+      if (syncTextEl.textContent !== shortLabel) {
+        syncTextEl.textContent = shortLabel;
+      }
+      syncTextEl.classList.toggle('hidden', !shortLabel);
+    }
+
+    const syncBadgeEl = syncNowBtn.querySelector('[data-sync-badge]');
+    if (syncBadgeEl) {
+      const showExclaim = ind.level === 'danger' || ind.level === 'warn';
+      syncBadgeEl.classList.toggle('hidden', !showExclaim);
+    }
+  }
+
   const syncEl = headerEl.querySelector('[data-header-sync]');
   if (syncEl) {
-    const status = state.syncStatus || 'idle';
-    syncEl.className = `sync-pill ${status}`;
-    syncEl.title = state.syncMessage || '';
-    if (status === 'syncing') {
+    const pillClass =
+      ind.level === 'syncing'
+        ? 'syncing'
+        : ind.level === 'danger'
+          ? 'error'
+          : ind.level === 'warn'
+            ? 'readonly'
+            : ind.level === 'synced'
+              ? 'synced'
+              : 'idle';
+    syncEl.className = `sync-pill ${pillClass}`;
+    syncEl.title = ind.title || state.syncMessage || '';
+    if (ind.level === 'syncing') {
       syncEl.innerHTML = `${icon('refresh', 12, 'spin')}<span>${escapeHtml(t('header.syncSyncing'))}</span>`;
-    } else if (status === 'synced') {
+    } else if (ind.level === 'synced') {
       syncEl.innerHTML = `${icon('check', 12)}<span>${escapeHtml(t('header.syncSynced'))}</span>`;
-    } else if (status === 'readonly') {
-      syncEl.innerHTML = `<span>${escapeHtml(t('header.syncReadonly'))}</span>`;
-    } else if (status === 'error') {
-      syncEl.innerHTML = `${icon('alertCircle', 12)}<span>${escapeHtml(t('header.syncError'))}</span>`;
+    } else if (ind.level === 'warn') {
+      syncEl.innerHTML = `${icon('alertCircle', 12)}<span>${escapeHtml(ind.shortLabel || t('header.syncReadonly'))}</span>`;
+    } else if (ind.level === 'danger') {
+      syncEl.innerHTML = `${icon('alertCircle', 12)}<span>${escapeHtml(ind.shortLabel || t('header.syncError'))}</span>`;
     } else {
-      syncEl.innerHTML = `<span>${escapeHtml(state.mode === 'gdrive' ? t('header.syncReady') : t('header.syncDemo'))}</span>`;
+      syncEl.innerHTML = `<span>${escapeHtml(t('header.syncDemo'))}</span>`;
     }
   }
 
@@ -783,6 +846,8 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
       } else if (action === 'compare') {
         moreMenuOpen = false;
         openCompare(Array.from(store.state.selectedPhotoIds), store);
+      } else if (action === 'sync-now') {
+        store.retryOrSyncNow({ fullRescan: Boolean(e.shiftKey) });
       } else if (action === 'refresh') {
         store.refreshAlbum({ fullRescan: Boolean(e.shiftKey) });
       } else if (action === 'export') {

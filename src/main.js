@@ -1,7 +1,8 @@
 import { getCachedSession } from './api/gdrive.js';
 import { t } from './i18n.js';
 import { loadConnectPrefs, Store } from './state/store.js';
-import { updateSmartHdSchedule } from './storage/imageLoader.js';
+import { syncServiceWorkerAuth, updateSmartHdSchedule } from './storage/imageLoader.js';
+import { closePhotoContextMenu } from './ui/contextMenu.js';
 import {
   bindCompareEvents,
   closeCompare,
@@ -53,6 +54,12 @@ const mobileNavBar = document.getElementById('mobileNavBar');
 
 const store = new Store();
 
+let lastSwAccessToken = null;
+let lastSwApiKey = null;
+let lastModalRef = null;
+let lastSidebarOpen = false;
+let lastInspectorOpen = false;
+
 function syncSmartHdPipeline(visiblePhotos = store.getVisiblePhotos()) {
   const state = store.state;
   const albumKey = `${state.mode}:${state.folderId || 'demo'}`;
@@ -88,6 +95,28 @@ function syncSmartHdPipeline(visiblePhotos = store.getVisiblePhotos()) {
 }
 
 function renderAll() {
+  const nextToken = store.state.accessToken || '';
+  const nextApiKey = store.state.apiKey || '';
+  if (nextToken !== lastSwAccessToken || nextApiKey !== lastSwApiKey) {
+    lastSwAccessToken = nextToken;
+    lastSwApiKey = nextApiKey;
+    syncServiceWorkerAuth({ accessToken: nextToken, apiKey: nextApiKey });
+  }
+
+  const curModal = store.state.modal || null;
+  const curSidebarOpen = Boolean(store.state.sidebarOpen);
+  const curInspectorOpen = Boolean(store.state.inspectorOpen);
+  if (
+    (curModal && curModal !== lastModalRef) ||
+    curSidebarOpen !== lastSidebarOpen ||
+    curInspectorOpen !== lastInspectorOpen
+  ) {
+    closePhotoContextMenu();
+  }
+  lastModalRef = curModal;
+  lastSidebarOpen = curSidebarOpen;
+  lastInspectorOpen = curInspectorOpen;
+
   const visiblePhotos = store.getVisiblePhotos();
   renderHeader(topHeader, demoBanner, toastContainer, store);
   renderSidebar(sidebarPanel, store);
@@ -245,6 +274,13 @@ window.addEventListener('beforeinstallprompt', (event) => {
 
 window.addEventListener('appinstalled', () => {
   store.onAppInstalled();
+});
+
+window.addEventListener('beforeunload', (e) => {
+  if (store.hasUnsavedCloudChanges()) {
+    e.preventDefault();
+    e.returnValue = '';
+  }
 });
 
 function isEditableTarget(target) {

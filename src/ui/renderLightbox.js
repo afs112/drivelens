@@ -1,20 +1,41 @@
 import { downloadOriginalFile } from '../api/gdrive.js';
 import { t } from '../i18n.js';
 import {
+  buildDesktopDragDownloadSpec,
   fetchAuthorizedMediaBlobUrl,
   getInstantCachedSrc,
   hasCachedHdSrc,
   loadPhotoIntoElement,
   subscribeHdStatus,
 } from '../storage/imageLoader.js';
+import {
+  closePhotoContextMenu,
+  isPhotoContextMenuOpen,
+  openPhotoContextMenu,
+} from './contextMenu.js';
 import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 
 let activeLightboxPhotoId = null;
 let activeLightboxLang = '';
-let lightboxChromeHidden = true;
+let lightboxChromeHidden = false;
 let lastPhotoIndex = -1;
 let pendingSwipeOffsetPx = null;
 let isClosingAnimated = false;
+let chromeHideTimer = 0;
+let pointerInChromeZone = false;
+let lightboxHistoryPushed = false;
+let suppressPopstateCount = 0;
+let popstateBound = false;
+let globalPointerBound = false;
+let suppressClickFromMenuUntil = 0;
+let lastPointerDown = {
+  x: -9999,
+  y: -9999,
+  pointerType: 'mouse',
+  time: 0,
+  fromPointerEvent: false,
+};
+let openPointerState = null;
 
 let liveZoom = 1;
 let panX = 0;
@@ -32,6 +53,130 @@ let hdHideTimer = 0;
 let activeLightboxContainer = null;
 let activeStoreRef = null;
 let resizeBound = false;
+
+function ensureGlobalPointerTracker() {
+  if (globalPointerBound || typeof window === 'undefined') return;
+  globalPointerBound = true;
+  window.addEventListener(
+    'pointerdown',
+    (e) => {
+      if (isPhotoContextMenuOpen() && !e.target?.closest?.('.photo-context-menu')) {
+        suppressClickFromMenuUntil = Date.now() + 300;
+      }
+      lastPointerDown = {
+        x: e.clientX,
+        y: e.clientY,
+        pointerType: e.pointerType || 'mouse',
+        time: performance.now(),
+        fromPointerEvent: true,
+      };
+    },
+    { capture: true, passive: true }
+  );
+  window.addEventListener(
+    'mousedown',
+    (e) => {
+      const now = performance.now();
+      if (lastPointerDown.fromPointerEvent && now - lastPointerDown.time < 80) {
+        return;
+      }
+      if (isPhotoContextMenuOpen() && !e.target?.closest?.('.photo-context-menu')) {
+        suppressClickFromMenuUntil = Date.now() + 300;
+      }
+      lastPointerDown = {
+        x: e.clientX,
+        y: e.clientY,
+        pointerType: e.pointerType || 'mouse',
+        time: now,
+        fromPointerEvent: false,
+      };
+    },
+    { capture: true, passive: true }
+  );
+}
+
+if (typeof window !== 'undefined') {
+  ensureGlobalPointerTracker();
+}
+
+function isLightboxPopoverOpen(container) {
+  return Boolean(container?.querySelector('[data-lb-popover][aria-expanded="true"]'));
+}
+
+function clearChromeAutoHideTimer() {
+  if (chromeHideTimer) {
+    clearTimeout(chromeHideTimer);
+    chromeHideTimer = 0;
+  }
+}
+
+function setChromeHidden(container, store, hidden) {
+  lightboxChromeHidden = Boolean(hidden);
+  const rootEl = container?.querySelector('.lightbox');
+  if (rootEl) {
+    rootEl.classList.toggle('chrome-hidden', lightboxChromeHidden);
+  }
+  if (!lightboxChromeHidden && store && activeLightboxPhotoId) {
+    const visible = store.getVisiblePhotos();
+    const idx = visible.findIndex((p) => p.id === activeLightboxPhotoId);
+    renderLazyFilmstrip(container, store, visible, activeLightboxPhotoId, idx);
+  }
+}
+
+function scheduleChromeAutoHide(container, store, delayMs = 2400) {
+  clearChromeAutoHideTimer();
+  if (!store?.state?.lightboxPhotoId || lightboxChromeHidden || isClosingAnimated) return;
+  chromeHideTimer = setTimeout(() => {
+    chromeHideTimer = 0;
+    const targetContainer = container || activeLightboxContainer;
+    const targetStore = store || activeStoreRef;
+    if (!targetContainer || !targetStore?.state?.lightboxPhotoId || isClosingAnimated) return;
+    if (pointerInChromeZone || isLightboxPopoverOpen(targetContainer) || isPhotoContextMenuOpen()) {
+      return;
+    }
+    setChromeHidden(targetContainer, targetStore, true);
+  }, delayMs);
+}
+
+function pushLightboxHistoryIfNeeded() {
+  if (
+    !lightboxHistoryPushed &&
+    typeof window !== 'undefined' &&
+    typeof window.history?.pushState === 'function'
+  ) {
+    window.history.pushState({ ...(window.history.state || {}), drivelensLightbox: true }, '');
+    lightboxHistoryPushed = true;
+  }
+}
+
+function popLightboxHistoryIfNeeded() {
+  if (
+    lightboxHistoryPushed &&
+    typeof window !== 'undefined' &&
+    window.history?.state?.drivelensLightbox
+  ) {
+    lightboxHistoryPushed = false;
+    suppressPopstateCount += 1;
+    window.history.back();
+  } else {
+    lightboxHistoryPushed = false;
+  }
+}
+
+function isPointInsideActiveMedia(clientX, clientY, container) {
+  const mediaEl = container?.querySelector(
+    '.lightbox-slide.is-current .lightbox-img, .lightbox-slide.is-current video, .lightbox-slide.is-current iframe'
+  );
+  if (!mediaEl) return false;
+  const rect = mediaEl.getBoundingClientRect();
+  if (!rect.width || !rect.height) return false;
+  return (
+    clientX >= rect.left &&
+    clientX <= rect.right &&
+    clientY >= rect.top &&
+    clientY <= rect.bottom
+  );
+}
 
 function trimSlideCache(keepIds) {
   if (slideCache.size <= 7) return;
@@ -314,6 +459,7 @@ function acquireSlideElement(item, role, state, store) {
   if (imgEl) {
     imgEl.classList.toggle('lightbox-img', isCurrent);
     imgEl.classList.toggle('lightbox-adj-img', !isCurrent);
+    imgEl.draggable = isCurrent && !(isVideo && item.isDemo);
     if (!isCurrent) {
       imgEl.style.transform = '';
       imgEl.style.transition = '';
@@ -531,10 +677,15 @@ export function renderLightbox(container, store, visiblePhotos) {
   const photoId = state.lightboxPhotoId;
 
   if (!photoId) {
+    clearChromeAutoHideTimer();
+    pointerInChromeZone = false;
+    openPointerState = null;
+    closePhotoContextMenu();
+    popLightboxHistoryIfNeeded();
     activeLightboxContainer = null;
     activeLightboxPhotoId = null;
     activeLightboxLang = '';
-    lightboxChromeHidden = true;
+    lightboxChromeHidden = false;
     lastPhotoIndex = -1;
     pendingSwipeOffsetPx = null;
     isClosingAnimated = false;
@@ -550,7 +701,7 @@ export function renderLightbox(container, store, visiblePhotos) {
     return;
   }
 
-  const file = state.files.find((f) => f.id === photoId);
+  const file = store.getFileById?.(photoId) || state.files.find((f) => f.id === photoId);
   if (!file) {
     store.closeLightbox();
     return;
@@ -566,8 +717,18 @@ export function renderLightbox(container, store, visiblePhotos) {
 
   const wasClosed = activeLightboxPhotoId === null;
   if (wasClosed) {
-    lightboxChromeHidden = true;
+    lightboxChromeHidden = false;
+    pointerInChromeZone = false;
     liveZoom = state.lightboxZoom || 1;
+    openPointerState = {
+      x: lastPointerDown.x,
+      y: lastPointerDown.y,
+      openedAt: performance.now(),
+      isMouse: lastPointerDown.pointerType === 'mouse',
+      movedSinceOpen: false,
+    };
+    pushLightboxHistoryIfNeeded();
+    scheduleChromeAutoHide(container, store, 2400);
   }
 
   if (!container.querySelector('.lightbox') || activeLightboxLang !== state.lang) {
@@ -734,6 +895,9 @@ export function renderLightbox(container, store, visiblePhotos) {
 
 export function closeLightboxWithAnimation(container, store) {
   if (!store?.state?.lightboxPhotoId) return;
+  closePhotoContextMenu();
+  clearChromeAutoHideTimer();
+  popLightboxHistoryIfNeeded();
   if (!container) {
     store.closeLightbox();
     return;
@@ -777,6 +941,9 @@ export function dismissLightboxPopover(container) {
   if (panel?.contains(document.activeElement)) trigger.focus({ preventScroll: true });
   trigger.setAttribute('aria-expanded', 'false');
   panel?.classList.add('hidden');
+  if (!lightboxChromeHidden && activeLightboxContainer && activeStoreRef) {
+    scheduleChromeAutoHide(activeLightboxContainer, activeStoreRef, 2400);
+  }
   return true;
 }
 
@@ -786,6 +953,7 @@ function toggleLightboxPopover(container, trigger, store) {
   dismissLightboxPopover(container);
   if (wasOpen) return;
 
+  clearChromeAutoHideTimer();
   lightboxChromeHidden = false;
   container.querySelector('.lightbox')?.classList.remove('chrome-hidden');
   if (store && activeLightboxPhotoId) {
@@ -807,6 +975,7 @@ export function toggleLightboxInfo(container) {
 
 export function bindLightboxEvents(container, store) {
   if (!container) return;
+  ensureGlobalPointerTracker();
 
   if (!resizeBound && typeof window !== 'undefined') {
     resizeBound = true;
@@ -821,6 +990,22 @@ export function bindLightboxEvents(container, store) {
           if (cached) applySlideMediaBox(activeLightboxContainer, cached);
         }
       });
+    });
+  }
+
+  if (!popstateBound && typeof window !== 'undefined') {
+    popstateBound = true;
+    window.addEventListener('popstate', () => {
+      if (suppressPopstateCount > 0) {
+        suppressPopstateCount -= 1;
+        return;
+      }
+      if (activeStoreRef?.state?.lightboxPhotoId) {
+        lightboxHistoryPushed = false;
+        closePhotoContextMenu();
+        dismissLightboxPopover(activeLightboxContainer);
+        closeLightboxWithAnimation(activeLightboxContainer, activeStoreRef);
+      }
     });
   }
 
@@ -845,6 +1030,7 @@ export function bindLightboxEvents(container, store) {
   let mouseSwipeDragging = false;
   let mouseSwipeAxis = null;
   let mouseLastDx = 0;
+  let mouseLastDy = 0;
   let trackMoveRafId = 0;
   let pendingTrackDx = 0;
 
@@ -867,12 +1053,11 @@ export function bindLightboxEvents(container, store) {
 
   function toggleChrome() {
     if (dismissLightboxPopover(container)) return;
-    lightboxChromeHidden = !lightboxChromeHidden;
-    container.querySelector('.lightbox')?.classList.toggle('chrome-hidden', lightboxChromeHidden);
-    if (!lightboxChromeHidden && activeLightboxPhotoId) {
-      const visible = store.getVisiblePhotos();
-      const idx = visible.findIndex((p) => p.id === activeLightboxPhotoId);
-      renderLazyFilmstrip(container, store, visible, activeLightboxPhotoId, idx);
+    setChromeHidden(container, store, !lightboxChromeHidden);
+    if (lightboxChromeHidden) {
+      clearChromeAutoHideTimer();
+    } else {
+      scheduleChromeAutoHide(container, store, 2400);
     }
   }
 
@@ -910,6 +1095,9 @@ export function bindLightboxEvents(container, store) {
     if (btn) {
       clearTimeout(singleTapTimer);
       singleTapTimer = 0;
+      if (!lightboxChromeHidden && !isLightboxPopoverOpen(container)) {
+        scheduleChromeAutoHide(container, store, 2400);
+      }
       const act = btn.dataset.lb;
       const pid = store.state.lightboxPhotoId;
       if (act === 'close') closeLightboxWithAnimation(container, store);
@@ -932,7 +1120,7 @@ export function bindLightboxEvents(container, store) {
         store.setState({ inspectorOpen: true, sidebarOpen: false });
         store.closeLightbox();
       } else if (act === 'download' && pid) {
-        const file = store.state.files.find((f) => f.id === pid);
+        const file = store.getFileById?.(pid) || store.state.files.find((f) => f.id === pid);
         if (file) {
           downloadOriginalFile(file, store.state.accessToken, store.state.apiKey).catch((err) =>
             store.toast(err?.message || t('inspector.downloadFailed'), 'error')
@@ -948,7 +1136,44 @@ export function bindLightboxEvents(container, store) {
       return;
     }
 
-    if (Date.now() < suppressWrapClickUntil || didDragPan) return;
+    if (
+      Date.now() < suppressWrapClickUntil ||
+      Date.now() < suppressClickFromMenuUntil ||
+      didDragPan ||
+      isPhotoContextMenuOpen()
+    ) {
+      return;
+    }
+
+    if (
+      liveZoom <= 1.01 &&
+      openPointerState &&
+      openPointerState.isMouse &&
+      !openPointerState.movedSinceOpen &&
+      Math.hypot(e.clientX - openPointerState.x, e.clientY - openPointerState.y) <= 6
+    ) {
+      if (performance.now() - openPointerState.openedAt < 170) return;
+      clearTimeout(singleTapTimer);
+      singleTapTimer = 0;
+      closeLightboxWithAnimation(container, store);
+      return;
+    }
+
+    const insideStage =
+      Boolean(e.target.closest('.lightbox-stage')) &&
+      !e.target.closest('.lightbox-nav, button, a, .lightbox-popover, .lightbox-filmstrip');
+    if (
+      liveZoom <= 1.01 &&
+      insideStage &&
+      !e.target.closest('video, iframe') &&
+      !isPointInsideActiveMedia(e.clientX, e.clientY, container)
+    ) {
+      clearTimeout(singleTapTimer);
+      singleTapTimer = 0;
+      closeLightboxWithAnimation(container, store);
+      return;
+    }
+
     const clickedStageMedia =
       Boolean(e.target.closest('.lightbox-media-wrap, .lightbox-track')) &&
       !e.target.closest('button, a, video, iframe, .lightbox-popover');
@@ -959,6 +1184,54 @@ export function bindLightboxEvents(container, store) {
         toggleChrome();
       }, 250);
     }
+  });
+
+  container.addEventListener('contextmenu', (e) => {
+    if (!store.state.lightboxPhotoId) return;
+    if (
+      !e.target.closest('.lightbox-stage') ||
+      e.target.closest('.lightbox-nav, button, iframe, .lightbox-popover, .lightbox-filmstrip')
+    ) {
+      return;
+    }
+    const videoEl = e.target.closest('video');
+    if (videoEl) {
+      const vRect = videoEl.getBoundingClientRect();
+      if (e.clientY >= vRect.bottom - 52) return;
+    }
+    e.preventDefault();
+    clearTimeout(singleTapTimer);
+    singleTapTimer = 0;
+    clearChromeAutoHideTimer();
+    openPhotoContextMenu({
+      x: e.clientX,
+      y: e.clientY,
+      photoId: store.state.lightboxPhotoId,
+      store,
+      context: 'lightbox',
+      onCloseLightbox: () => closeLightboxWithAnimation(container, store),
+    });
+  });
+
+  container.addEventListener('dragstart', (e) => {
+    const img = e.target.closest('.lightbox-img');
+    if (!img || !store.state.lightboxPhotoId) return;
+    if (!e.altKey && (mouseSwipeDragging || isDragging)) {
+      e.preventDefault();
+      return;
+    }
+    const pid = store.state.lightboxPhotoId;
+    const file = store.getFileById?.(pid) || store.state.files.find((f) => f.id === pid);
+    if (!file || !e.dataTransfer) return;
+    const spec = buildDesktopDragDownloadSpec(file, {
+      accessToken: store.state.accessToken,
+      apiKey: store.state.apiKey,
+    });
+    if (!spec || !spec.url) return;
+    e.dataTransfer.effectAllowed = 'copy';
+    e.dataTransfer.setData('DownloadURL', `${spec.mime}:${spec.filename}:${spec.url}`);
+    e.dataTransfer.setData('text/uri-list', spec.url);
+    e.dataTransfer.setData('text/plain', spec.filename);
   });
 
   container.addEventListener('dblclick', (e) => {
@@ -993,6 +1266,7 @@ export function bindLightboxEvents(container, store) {
 
   container.addEventListener('mousedown', (e) => {
     if (e.button !== 0 || !store.state.lightboxPhotoId) return;
+    if (e.altKey || Date.now() < suppressClickFromMenuUntil || isPhotoContextMenuOpen()) return;
     if (
       !e.target.closest('.lightbox-stage') ||
       e.target.closest('.lightbox-nav, button, video, iframe')
@@ -1013,10 +1287,47 @@ export function bindLightboxEvents(container, store) {
       mouseSwipeDragging = true;
       mouseSwipeAxis = null;
       mouseLastDx = 0;
+      mouseLastDy = 0;
     }
   });
 
   window.addEventListener('mousemove', (e) => {
+    if (
+      store.state.lightboxPhotoId &&
+      openPointerState &&
+      openPointerState.isMouse &&
+      !openPointerState.movedSinceOpen &&
+      Math.hypot(e.clientX - openPointerState.x, e.clientY - openPointerState.y) > 6
+    ) {
+      openPointerState.movedSinceOpen = true;
+    }
+
+    if (
+      store.state.lightboxPhotoId &&
+      !isClosingAnimated &&
+      !isDragging &&
+      !mouseSwipeDragging &&
+      Date.now() >= suppressWrapClickUntil
+    ) {
+      const vh = window.innerHeight || container.clientHeight || 800;
+      const nearTop = e.clientY <= 72;
+      const nearBottom = e.clientY >= vh - 96;
+      const overChrome = Boolean(
+        e.target?.closest?.('.lightbox-topbar > *, .lightbox-bottom > *, .lightbox-popover')
+      );
+      const inZone = nearTop || nearBottom || overChrome;
+      const wasInZone = pointerInChromeZone;
+      pointerInChromeZone = inZone;
+      if (inZone) {
+        clearChromeAutoHideTimer();
+        if (lightboxChromeHidden) {
+          setChromeHidden(container, store, false);
+        }
+      } else if (wasInZone && !lightboxChromeHidden && !isLightboxPopoverOpen(container)) {
+        scheduleChromeAutoHide(container, store, 2400);
+      }
+    }
+
     if (isDragging) {
       if (
         Math.abs(e.clientX - (panX + dragStartX)) > 3 ||
@@ -1030,6 +1341,12 @@ export function bindLightboxEvents(container, store) {
       return;
     }
     if (!mouseSwipeDragging) return;
+    if (e.altKey) {
+      mouseSwipeDragging = false;
+      mouseSwipeAxis = null;
+      setInteracting(false);
+      return;
+    }
     const dx = e.clientX - swipeStartX;
     const dy = e.clientY - swipeStartY;
     if (!mouseSwipeAxis && (Math.abs(dx) > 6 || Math.abs(dy) > 6)) {
@@ -1045,10 +1362,27 @@ export function bindLightboxEvents(container, store) {
       }
       mouseLastDx = effDx;
       scheduleTrackTranslate(effDx);
+    } else if (mouseSwipeAxis === 'y' && liveZoom <= 1.01) {
+      mouseLastDy = dy;
+      const absDy = Math.abs(dy);
+      const curSlide = container.querySelector('.lightbox-slide.is-current');
+      const rootEl = container.querySelector('.lightbox');
+      if (curSlide) {
+        curSlide.style.transition = 'none';
+        curSlide.style.transform = `translate3d(${Math.round(dx * 0.25)}px, ${Math.round(dy)}px, 0) scale(${Math.max(0.76, 1 - absDy / 900).toFixed(3)})`;
+      }
+      if (rootEl) {
+        rootEl.style.background = `rgba(5, 7, 10, ${Math.max(0.2, 0.96 - absDy / 420).toFixed(2)})`;
+      }
     }
   });
 
-  window.addEventListener('mouseup', () => {
+  window.addEventListener('mouseup', (e) => {
+    if (e.button === 3 && store.state.lightboxPhotoId) {
+      e.preventDefault();
+      closeLightboxWithAnimation(container, store);
+      return;
+    }
     if (isDragging) {
       isDragging = false;
       setInteracting(false);
@@ -1075,6 +1409,20 @@ export function bindLightboxEvents(container, store) {
           trackEl.style.transition = 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1)';
           trackEl.style.transform = 'translate3d(0px, 0px, 0px)';
         }
+      }
+    } else if (mouseSwipeAxis === 'y' && liveZoom <= 1.01) {
+      const vy = mouseLastDy / Math.max(16, performance.now() - swipeStartTime);
+      suppressWrapClickUntil = Date.now() + 250;
+      if (Math.abs(mouseLastDy) > 68 || Math.abs(vy) > 0.55) {
+        closeLightboxWithAnimation(container, store);
+      } else {
+        const curSlide = container.querySelector('.lightbox-slide.is-current');
+        const rootEl = container.querySelector('.lightbox');
+        if (curSlide) {
+          curSlide.style.transition = 'transform 200ms cubic-bezier(0.32, 0.72, 0, 1)';
+          curSlide.style.transform = 'translate3d(0px, 0px, 0) scale(1)';
+        }
+        if (rootEl) rootEl.style.background = '';
       }
     }
     mouseSwipeAxis = null;
@@ -1165,17 +1513,18 @@ export function bindLightboxEvents(container, store) {
           }
           lastDragDx = effDx;
           scheduleTrackTranslate(effDx);
-        } else if (gestureAxis === 'y' && dy > 0) {
+        } else if (gestureAxis === 'y') {
           e.preventDefault();
           lastDragDy = dy;
+          const absDy = Math.abs(dy);
           const curSlide = container.querySelector('.lightbox-slide.is-current');
           const rootEl = container.querySelector('.lightbox');
           if (curSlide) {
             curSlide.style.transition = 'none';
-            curSlide.style.transform = `translate3d(${Math.round(dx * 0.28)}px, ${Math.round(dy)}px, 0) scale(${Math.max(0.76, 1 - dy / 900).toFixed(3)})`;
+            curSlide.style.transform = `translate3d(${Math.round(dx * 0.28)}px, ${Math.round(dy)}px, 0) scale(${Math.max(0.76, 1 - absDy / 900).toFixed(3)})`;
           }
           if (rootEl) {
-            rootEl.style.background = `rgba(5, 7, 10, ${Math.max(0.2, 0.96 - dy / 420).toFixed(2)})`;
+            rootEl.style.background = `rgba(5, 7, 10, ${Math.max(0.2, 0.96 - absDy / 420).toFixed(2)})`;
           }
         }
       }
@@ -1221,15 +1570,35 @@ export function bindLightboxEvents(container, store) {
         scheduleImageTransform(container, true);
       }
 
+      const isStageTap =
+        Boolean(e.target.closest('.lightbox-stage')) &&
+        !e.target.closest(
+          '.lightbox-nav, button, a, video, iframe, .lightbox-popover, .lightbox-filmstrip'
+        );
       const isMediaTarget =
         Boolean(e.target.closest('.lightbox-media-wrap, .lightbox-track')) &&
         !e.target.closest('button, a, video, iframe, .lightbox-popover');
 
-      if (!touchMoved && isMediaTarget && dismissLightboxPopover(container)) {
+      if (!touchMoved && isStageTap && dismissLightboxPopover(container)) {
         clearTimeout(singleTapTimer);
         singleTapTimer = 0;
         lastTapTime = 0;
         suppressWrapClickUntil = now + 350;
+        return;
+      }
+
+      if (
+        !touchMoved &&
+        isStageTap &&
+        liveZoom <= 1.01 &&
+        !isPointInsideActiveMedia(touch.clientX, touch.clientY, container)
+      ) {
+        clearTimeout(singleTapTimer);
+        singleTapTimer = 0;
+        lastTapTime = 0;
+        suppressNextDblClickUntil = now + 400;
+        suppressWrapClickUntil = now + 400;
+        closeLightboxWithAnimation(container, store);
         return;
       }
 
@@ -1284,7 +1653,9 @@ export function bindLightboxEvents(container, store) {
           }
         } else if (gestureAxis === 'y') {
           const rootEl = container.querySelector('.lightbox');
-          if (lastDragDy > 75 || dy > 80) {
+          const effectiveDy = Math.abs(dy) >= Math.abs(lastDragDy) ? dy : lastDragDy;
+          const vy = effectiveDy / Math.max(16, performance.now() - swipeStartTime);
+          if (Math.abs(lastDragDy) > 64 || Math.abs(dy) > 64 || Math.abs(vy) > 0.5) {
             closeLightboxWithAnimation(container, store);
           } else {
             const curSlide = container.querySelector('.lightbox-slide.is-current');
@@ -1320,6 +1691,10 @@ export function bindLightboxEvents(container, store) {
       const curSlide = container.querySelector('.lightbox-slide.is-current');
       if (curSlide) {
         curSlide.style.transform = '';
+      }
+      const rootEl = container.querySelector('.lightbox');
+      if (rootEl) {
+        rootEl.style.background = '';
       }
       scheduleImageTransform(container, true);
     },

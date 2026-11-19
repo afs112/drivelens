@@ -1,17 +1,21 @@
 import { getLocaleTag, t } from '../i18n.js';
 import { resolvePhotoTimestamp } from '../state/store.js';
 import {
+  buildDesktopDragDownloadSpec,
   cancelElementPhotoLoad,
+  getAdaptiveThumbTier,
   loadPhotoIntoElement,
+  preloadPhoto,
   quantizeThumbSize,
 } from '../storage/imageLoader.js';
+import { openPhotoContextMenu } from './contextMenu.js';
 import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 import { openCompare } from './renderCompare.js';
 
 const MAX_STAGE_PX = 12_000_000;
 const STAGE_BAND_PX = 65536;
-const MAX_MOUNTED_CARDS = 180;
-const MAX_FREE_CARD_POOL = 160;
+const MAX_MOUNTED_CARDS = 260;
+const MAX_FREE_CARD_POOL = 220;
 const ANCHOR_TTL_MS = 260;
 
 const monthFormatterCache = new Map();
@@ -661,6 +665,7 @@ function computeCardThumbTarget(cssBoxMaxPx) {
 
 const mountedCardsById = new Map();
 const freeCardPool = [];
+const recentLookaheadPreloads = new Map();
 let stageLayerEl = null;
 
 let cachedLayout = null;
@@ -695,16 +700,20 @@ let activeHoverPeekClear = null;
 function createCardElement(selectTitle) {
   const card = document.createElement('div');
   card.className = 'photo-card';
+  card.draggable = true;
   card.innerHTML = `
     <div class="photo-skeleton"></div>
     <button type="button" class="photo-select-btn" data-action="toggle-select" title="${escapeAttr(selectTitle)}">
       ${icon('check', 13)}
     </button>
-    <img alt="" decoding="async" />
+    <img alt="" decoding="async" draggable="false" />
     <div class="photo-overlay is-empty"></div>
   `;
 
   card._imgEl = card.querySelector('img');
+  if (card._imgEl) {
+    card._imgEl.draggable = false;
+  }
   card._overlayEl = card.querySelector('.photo-overlay');
   card._selectBtn = card.querySelector('.photo-select-btn');
   card._selectTitle = selectTitle;
@@ -712,6 +721,7 @@ function createCardElement(selectTitle) {
   card._videoDurSpan = null;
   card._authSig = '';
   card._requestedThumbSize = 0;
+  card._wasOnScreen = false;
   card._geomKey = '';
   card._selected = false;
   card._focused = false;
@@ -781,6 +791,7 @@ function recycleCard(card) {
   card._focused = false;
   card._authSig = '';
   card._requestedThumbSize = 0;
+  card._wasOnScreen = false;
   card._geomKey = '';
   card._waterfall = false;
   card._overlayMode = 'empty';
@@ -803,6 +814,7 @@ function clearAllMountedCards() {
     recycleCard(entry.el);
   }
   mountedCardsById.clear();
+  recentLookaheadPreloads.clear();
   if (stageLayerEl) {
     stageLayerEl.remove();
     stageLayerEl = null;
@@ -886,6 +898,80 @@ function selectBoundedIndices(layout, desiredIndices, onScreenMinY, onScreenMaxY
   return combined;
 }
 
+function computeDirectionalOverscan(logicalTop, vh, logicalTotalHeight, vy) {
+  const absVy = Math.abs(vy);
+  let beforeMul = 0.85;
+  let afterMul = 1.65;
+  if (absVy >= 1400) {
+    if (vy > 0) {
+      beforeMul = 0.35;
+      afterMul = 4.2;
+    } else {
+      beforeMul = 4.2;
+      afterMul = 0.45;
+    }
+  } else if (absVy >= 250) {
+    if (vy > 0) {
+      beforeMul = 0.45;
+      afterMul = 2.85;
+    } else {
+      beforeMul = 2.85;
+      afterMul = 0.55;
+    }
+  }
+  return {
+    overscanMinY: Math.max(0, logicalTop - beforeMul * vh),
+    overscanMaxY: Math.min(logicalTotalHeight, logicalTop + vh + afterMul * vh),
+  };
+}
+
+function upgradeVisibleCardsOnScrollSettle(scrollContainer, store) {
+  if (!scrollContainer || !store || store.state.loading || !activeLayout || activePhotos.length === 0) {
+    return;
+  }
+  const vh = Math.max(
+    1,
+    scrollContainer.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 800)
+  );
+  const metrics = getStageMetrics(activeLayout, vh);
+  const rawScrollTop = Math.max(0, scrollContainer.scrollTop || 0);
+  const clampedScrollTop = Math.min(rawScrollTop, metrics.maxPhysicalScroll);
+  const logicalTop = scrollTopToLogicalTop(activeLayout, clampedScrollTop, vh);
+  const onScreenMinY = logicalTop;
+  const onScreenMaxY = logicalTop + vh;
+  const viewportCenterY = logicalTop + vh * 0.5;
+  const getAccessToken = () => store.state.accessToken;
+  const getApiKey = () => store.state.apiKey;
+
+  for (const entry of mountedCardsById.values()) {
+    const card = entry.el;
+    const idx = entry.idx;
+    const file = activePhotos[idx];
+    if (!card || !card.isConnected || !card._imgEl || !file) continue;
+    const y = activeLayout.itemY[idx];
+    const h = activeLayout.itemH[idx];
+    const w = activeLayout.itemW[idx];
+    if (y + h <= onScreenMinY || y >= onScreenMaxY) continue;
+
+    const imgEl = card._imgEl;
+    if (imgEl.dataset.hdLoaded === 'true') continue;
+    const desiredThumbPx = computeCardThumbTarget(Math.max(w, h));
+    if (Number(imgEl.dataset.loadedSize || 0) < desiredThumbPx) {
+      card._requestedThumbSize = desiredThumbPx;
+      loadPhotoIntoElement(imgEl, file, {
+        size: desiredThumbPx,
+        virtualManaged: true,
+        eager: true,
+        priorityScore: Math.abs(y + h * 0.5 - viewportCenterY),
+        scrollSpeedPxPerSec: 0,
+        isLookahead: false,
+        getAccessToken,
+        getApiKey,
+      });
+    }
+  }
+}
+
 function syncVirtualViewport(
   gridEl,
   scrollContainer,
@@ -904,6 +990,8 @@ function syncVirtualViewport(
   const rawScrollTop = Math.max(0, scrollContainer.scrollTop || 0);
   const clampedScrollTop = Math.min(rawScrollTop, metrics.maxPhysicalScroll);
   const logicalTop = scrollTopToLogicalTop(layout, clampedScrollTop, vh);
+  const vy = Number(scrollContainer._dlScrollVelocityY || 0);
+  const absVy = Math.abs(vy);
 
   let windowBaseY;
   let layerPhysicalY;
@@ -925,8 +1013,12 @@ function syncVirtualViewport(
 
   const onScreenMinY = logicalTop;
   const onScreenMaxY = logicalTop + vh;
-  const overscanMinY = Math.max(0, logicalTop - 0.85 * vh);
-  const overscanMaxY = Math.min(metrics.logicalTotalHeight, logicalTop + vh + 1.35 * vh);
+  const { overscanMinY, overscanMaxY } = computeDirectionalOverscan(
+    logicalTop,
+    vh,
+    metrics.logicalTotalHeight,
+    vy
+  );
   const viewportCenterY = logicalTop + vh * 0.5;
 
   const rawDesired = queryLayoutRange(layout, overscanMinY, overscanMaxY);
@@ -998,11 +1090,14 @@ function syncVirtualViewport(
       if (forceAllMeta || patchMeta) {
         patchCardMeta(card, file, store, selectTitle);
       }
+      const enteredViewport = isOnScreen && !card._wasOnScreen;
+      card._wasOnScreen = isOnScreen;
       const loadedSize = Number(card._imgEl?.dataset.loadedSize || 0);
       if (
         card._imgEl &&
         (card._authSig !== authSig ||
-          (patchMeta && desiredThumbPx > Math.max(loadedSize, card._requestedThumbSize || 0)))
+          (patchMeta && desiredThumbPx > Math.max(loadedSize, card._requestedThumbSize || 0)) ||
+          (enteredViewport && loadedSize < desiredThumbPx && card._imgEl.dataset.hdLoaded !== 'true'))
       ) {
         card._authSig = authSig;
         card._requestedThumbSize = desiredThumbPx;
@@ -1012,6 +1107,8 @@ function syncVirtualViewport(
           size: desiredThumbPx,
           eager: isOnScreen,
           priorityScore,
+          scrollSpeedPxPerSec: absVy,
+          isLookahead: !isOnScreen,
         });
       }
     } else {
@@ -1020,6 +1117,7 @@ function syncVirtualViewport(
       patchCardMeta(card, file, store, selectTitle);
       card._authSig = authSig;
       card._requestedThumbSize = desiredThumbPx;
+      card._wasOnScreen = isOnScreen;
       mountedCardsById.set(file.id, { el: card, idx });
 
       if (!newCardsFrag) newCardsFrag = document.createDocumentFragment();
@@ -1032,6 +1130,8 @@ function syncVirtualViewport(
           size: desiredThumbPx,
           eager: isOnScreen,
           priorityScore,
+          scrollSpeedPxPerSec: absVy,
+          isLookahead: !isOnScreen,
         });
       }
     }
@@ -1048,9 +1148,53 @@ function syncVirtualViewport(
       virtualManaged: true,
       eager: req.eager,
       priorityScore: req.priorityScore,
+      scrollSpeedPxPerSec: req.scrollSpeedPxPerSec,
+      isLookahead: req.isLookahead,
       getAccessToken,
       getApiKey,
     });
+  }
+
+  // Ahead-of-DOM predictive preload strip in active scroll direction
+  if (absVy >= 180) {
+    const stripMinY = vy > 0 ? overscanMaxY : Math.max(0, overscanMinY - 1.5 * vh);
+    const stripMaxY =
+      vy > 0 ? Math.min(metrics.logicalTotalHeight, overscanMaxY + 1.5 * vh) : overscanMinY;
+    if (stripMaxY > stripMinY) {
+      const stripIndices = queryLayoutRange(layout, stripMinY, stripMaxY);
+      const nowMs = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const step = vy > 0 ? 1 : -1;
+      let k = vy > 0 ? 0 : stripIndices.length - 1;
+      let preloadedCount = 0;
+      while (k >= 0 && k < stripIndices.length && preloadedCount < 24) {
+        const idx = stripIndices[k];
+        k += step;
+        const file = visiblePhotos[idx];
+        if (!file || desiredById.has(file.id)) continue;
+        const desiredThumbPx = computeCardThumbTarget(
+          Math.max(layout.itemW[idx], layout.itemH[idx])
+        );
+        const tier = getAdaptiveThumbTier(desiredThumbPx, {
+          scrollSpeedPxPerSec: absVy,
+          isLookahead: true,
+        });
+        const prevPreload = recentLookaheadPreloads.get(file.id);
+        if (prevPreload && nowMs - prevPreload.at < 1200 && prevPreload.size >= tier) {
+          continue;
+        }
+        recentLookaheadPreloads.set(file.id, { at: nowMs, size: tier });
+        if (recentLookaheadPreloads.size > 300) {
+          const oldest = recentLookaheadPreloads.keys().next().value;
+          if (oldest !== undefined) recentLookaheadPreloads.delete(oldest);
+        }
+        preloadPhoto(file, {
+          size: tier,
+          getAccessToken,
+          getApiKey,
+        });
+        preloadedCount += 1;
+      }
+    }
   }
 }
 
@@ -1405,6 +1549,8 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
 
   let scrollVirtualRafId = 0;
   let lastScrollTop = scrollContainer.scrollTop || 0;
+  let lastScrollTimeMs = 0;
+  scrollContainer._dlScrollVelocityY = 0;
   scrollContainer.addEventListener(
     'scroll',
     () => {
@@ -1417,6 +1563,8 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
       ) {
         lastProgrammaticScrollAt = 0;
         lastScrollTop = curTopNow;
+        lastScrollTimeMs = 0;
+        scrollContainer._dlScrollVelocityY = 0;
         updateFloatingScrollState(scrollContainer, scrollContainer._dlStoreRef, false);
         return;
       }
@@ -1427,9 +1575,27 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
       if (scrollVirtualRafId) return;
       scrollVirtualRafId = requestAnimationFrame(() => {
         scrollVirtualRafId = 0;
+        const frameNow = typeof performance !== 'undefined' ? performance.now() : Date.now();
         const curTop = scrollContainer.scrollTop || 0;
         const delta = curTop - lastScrollTop;
         lastScrollTop = curTop;
+
+        const dt =
+          lastScrollTimeMs > 0 && frameNow - lastScrollTimeMs <= 250
+            ? Math.max(8, frameNow - lastScrollTimeMs)
+            : 32;
+        lastScrollTimeMs = frameNow;
+        if (Math.abs(delta) >= 0.5) {
+          const rawVy = (delta / dt) * 1000;
+          const prevVy = scrollContainer._dlScrollVelocityY || 0;
+          if (prevVy !== 0 && Math.sign(rawVy) !== Math.sign(prevVy)) {
+            scrollContainer._dlScrollVelocityY = rawVy * 0.65;
+          } else if (prevVy === 0) {
+            scrollContainer._dlScrollVelocityY = rawVy * 0.7;
+          } else {
+            scrollContainer._dlScrollVelocityY = prevVy * 0.55 + rawVy * 0.45;
+          }
+        }
 
         const curStore = scrollContainer._dlStoreRef;
         const curGrid = scrollContainer._dlGridRef;
@@ -1460,6 +1626,14 @@ function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
         }
 
         updateFloatingScrollState(scrollContainer, curStore, true);
+        clearTimeout(scrollContainer._dlVelocitySettleTimer);
+        scrollContainer._dlVelocitySettleTimer = setTimeout(() => {
+          scrollContainer._dlVelocitySettleTimer = 0;
+          scrollContainer._dlScrollVelocityY = 0;
+          lastScrollTimeMs = 0;
+          upgradeVisibleCardsOnScrollSettle(scrollContainer, scrollContainer._dlStoreRef);
+        }, 180);
+
         clearTimeout(scrollContainer._dlSettleTimer);
         scrollContainer._dlSettleTimer = setTimeout(() => {
           if (scrollSettleCallback) scrollSettleCallback();
@@ -1843,7 +2017,7 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
     let pinchLiveHeight = null;
     let wheelCommitTimer = null;
 
-    // Desktop 2-second top-left hover timer for unobtrusive checkbox reveal
+    // Desktop 200ms top-left hover timer for unobtrusive checkbox reveal
     let hoverPeekTimer = 0;
     let hoverCandidateCard = null;
     let revealedPeekCard = null;
@@ -1941,12 +2115,54 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
             revealedPeekCard = card;
             card.classList.add('is-select-peek');
           }
-        }, 2000);
+        }, 200);
       }
     });
 
     gridEl.addEventListener('mouseleave', () => {
       clearHoverPeek(false);
+    });
+
+    gridEl.addEventListener('dragstart', (e) => {
+      clearHoverPeek(false);
+      clearLongPress();
+      const card = e.target.closest('.photo-card[data-photo-id]');
+      if (!card || !e.dataTransfer) return;
+      if (e.target.closest('[data-action="toggle-select"]')) {
+        e.preventDefault();
+        return;
+      }
+      const photoId = card.dataset.photoId;
+      const file =
+        store.getFileById?.(photoId) || lastVisiblePhotos.find((p) => p.id === photoId);
+      if (!file) return;
+      const spec = buildDesktopDragDownloadSpec(file, {
+        accessToken: store.state.accessToken,
+        apiKey: store.state.apiKey,
+      });
+      if (!spec || !spec.url) return;
+      e.dataTransfer.effectAllowed = 'copy';
+      e.dataTransfer.setData('DownloadURL', `${spec.mime}:${spec.filename}:${spec.url}`);
+      e.dataTransfer.setData('text/uri-list', spec.url);
+      e.dataTransfer.setData('text/plain', spec.filename);
+    });
+
+    gridEl.addEventListener('contextmenu', (e) => {
+      if (e.shiftKey || (isTouchViewport() && window.matchMedia?.('(pointer: coarse)').matches)) {
+        return;
+      }
+      const card = e.target.closest('.photo-card[data-photo-id]');
+      if (!card) return;
+      e.preventDefault();
+      clearLongPress();
+      clearHoverPeek(false);
+      openPhotoContextMenu({
+        x: e.clientX,
+        y: e.clientY,
+        photoId: card.dataset.photoId,
+        store,
+        context: 'gallery',
+      });
     });
 
     gridEl.addEventListener(

@@ -1,4 +1,4 @@
-const CACHE_NAME = 'drivelens-shell-v10';
+const CACHE_NAME = 'drivelens-shell-v11';
 const PRECACHE_ASSETS = [
   './',
   './index.html',
@@ -14,7 +14,58 @@ const PRECACHE_ASSETS = [
   './src/constants.js',
   './src/i18n.js',
   './src/storage/albumCache.js',
+  './src/ui/contextMenu.js',
 ];
+
+let ephemeralAuth = { accessToken: '', apiKey: '' };
+
+self.addEventListener('message', (event) => {
+  if (event.data?.type === 'DL_AUTH_SYNC') {
+    ephemeralAuth = {
+      accessToken: String(event.data.accessToken || ''),
+      apiKey: String(event.data.apiKey || ''),
+    };
+  }
+});
+
+async function handleOriginalDownloadProxy(fileId, filename) {
+  const fallbackUrl =
+    'https://drive.google.com/uc?export=download&id=' + encodeURIComponent(fileId);
+  if (!ephemeralAuth.accessToken && !ephemeralAuth.apiKey) {
+    return Response.redirect(fallbackUrl, 302);
+  }
+
+  const driveUrl =
+    `https://www.googleapis.com/drive/v3/files/${encodeURIComponent(fileId)}` +
+    `?alt=media&supportsAllDrives=true` +
+    (!ephemeralAuth.accessToken && ephemeralAuth.apiKey
+      ? `&key=${encodeURIComponent(ephemeralAuth.apiKey)}`
+      : '');
+  const headers = ephemeralAuth.accessToken
+    ? { Authorization: `Bearer ${ephemeralAuth.accessToken}` }
+    : {};
+
+  try {
+    const resp = await fetch(driveUrl, { headers });
+    if (resp.ok) {
+      const safeName = String(filename || 'photo.jpg').replace(/[\r\n"]/g, '_') || 'photo.jpg';
+      const asciiSafeName = safeName.replace(/[^\x20-\x7e]/g, '_') || 'photo.jpg';
+      const outHeaders = new Headers({
+        'Content-Type': resp.headers.get('Content-Type') || 'application/octet-stream',
+        'Content-Disposition': `attachment; filename="${asciiSafeName}"; filename*=UTF-8''${encodeURIComponent(safeName)}`,
+        'Cache-Control': 'no-store',
+      });
+      const contentLength = resp.headers.get('Content-Length');
+      if (contentLength) {
+        outHeaders.set('Content-Length', contentLength);
+      }
+      return new Response(resp.body, { status: 200, headers: outHeaders });
+    }
+  } catch {
+    // Fall through to Drive download redirect
+  }
+  return Response.redirect(fallbackUrl, 302);
+}
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
@@ -46,6 +97,21 @@ self.addEventListener('fetch', (event) => {
 
   const url = new URL(req.url);
   if (url.origin !== self.location.origin) return;
+
+  const dlMatch = url.pathname.match(/\/__dl_original__\/([^/]+)\/([^/]+)$/);
+  if (dlMatch) {
+    let fileId = dlMatch[1];
+    let filename = dlMatch[2];
+    try {
+      fileId = decodeURIComponent(fileId);
+      filename = decodeURIComponent(filename);
+    } catch {
+      // Keep raw path segments if URI decoding fails
+    }
+    event.respondWith(handleOriginalDownloadProxy(fileId, filename));
+    return;
+  }
+
   if (url.pathname.includes('/api/')) return;
 
   event.respondWith(
