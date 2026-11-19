@@ -127,7 +127,7 @@ function buildHeaderSkeleton(headerEl, state) {
           ${icon('cloud', 13)}
           <span data-header-connect-label>${escapeHtml(t('header.connectDrive'))}</span>
         </button>
-        <button type="button" class="btn btn-sm" data-header="refresh" title="${escapeAttr(t('header.refresh'))}">
+        <button type="button" class="btn btn-sm" data-header="refresh" title="${escapeAttr(t('header.refreshTitle'))}">
           ${icon('refresh', 13)}
           <span>${escapeHtml(t('header.refresh'))}</span>
         </button>
@@ -376,6 +376,7 @@ function updateHeaderElements(headerEl, state, store) {
   if (refreshBtn) {
     const busy = Boolean(state.loading || state.backgroundRefreshing);
     refreshBtn.disabled = busy;
+    refreshBtn.title = t('header.refreshTitle');
     const svg = refreshBtn.querySelector('svg');
     if (svg) svg.classList.toggle('spin', busy);
   }
@@ -783,7 +784,7 @@ export function bindHeaderEvents(headerEl, bannerEl, store) {
         moreMenuOpen = false;
         openCompare(Array.from(store.state.selectedPhotoIds), store);
       } else if (action === 'refresh') {
-        store.refreshAlbum();
+        store.refreshAlbum({ fullRescan: Boolean(e.shiftKey) });
       } else if (action === 'export') {
         moreMenuOpen = false;
         store.openModal('export');

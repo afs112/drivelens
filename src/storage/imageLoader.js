@@ -1,14 +1,58 @@
-import { fetchFreshThumbnailLink, fetchWithDriveBackoff } from '../api/gdrive.js';
+import {
+  fetchBatchThumbnailLinks,
+  fetchFreshThumbnailLink,
+  fetchWithDriveBackoff,
+} from '../api/gdrive.js';
 import { APP_CONFIG } from '../constants.js';
 
 const DB_NAME = 'drivelens-img-cache';
 const STORE_NAME = 'blobs';
 const MAX_CACHE_ENTRIES = 400;
+const MAX_MEMORY_BLOB_ENTRIES = 90;
+const MAX_MEMORY_URL_ENTRIES = 3000;
+const MAX_BEST_LOADED_ENTRIES = 2500;
+const THUMB_LINK_TTL_MS = 2.5 * 60 * 60 * 1000;
+const HEALED_FLUSH_DEBOUNCE_MS = 1500;
+const REPAIR_COALESCE_MS = 80;
+const REPAIR_CHUNK_SIZE = 25;
 
 let dbPromise = null;
 const objectUrlCache = new Map();
 const bestLoadedByItem = new Map();
 const liveElementsByItem = new Map();
+
+let thumbnailLinkHealedCallback = null;
+const pendingHealedPatches = new Map();
+let healedFlushTimer = 0;
+
+export function setThumbnailLinkHealedCallback(fn) {
+  thumbnailLinkHealedCallback = typeof fn === 'function' ? fn : null;
+  if (!thumbnailLinkHealedCallback) {
+    clearTimeout(healedFlushTimer);
+    healedFlushTimer = 0;
+    pendingHealedPatches.clear();
+  }
+}
+
+function flushHealedThumbnailLinks() {
+  healedFlushTimer = 0;
+  if (!thumbnailLinkHealedCallback || pendingHealedPatches.size === 0) return;
+  const flushedMap = new Map(pendingHealedPatches);
+  pendingHealedPatches.clear();
+  try {
+    thumbnailLinkHealedCallback({ patches: flushedMap });
+  } catch {
+    // Ignore listener errors
+  }
+}
+
+function queueHealedThumbnailLink(fileId, thumbnailLink, thumbFetchedAt = Date.now()) {
+  if (!fileId || !thumbnailLink) return;
+  pendingHealedPatches.set(fileId, { thumbnailLink, thumbFetchedAt });
+  if (!thumbnailLinkHealedCallback) return;
+  clearTimeout(healedFlushTimer);
+  healedFlushTimer = setTimeout(flushHealedThumbnailLinks, HEALED_FLUSH_DEBOUNCE_MS);
+}
 
 export function quantizeThumbSize(requestedPx = 480) {
   const px = Number(requestedPx) || 480;
@@ -20,8 +64,90 @@ export function quantizeThumbSize(requestedPx = 480) {
   return 3840;
 }
 
+function isBlobCacheEntry(key, val) {
+  return (
+    key.endsWith(':hd') ||
+    key.endsWith(':media') ||
+    (typeof val === 'string' && val.startsWith('blob:'))
+  );
+}
+
+function touchObjectUrlCache(key) {
+  if (!objectUrlCache.has(key)) return undefined;
+  const val = objectUrlCache.get(key);
+  objectUrlCache.delete(key);
+  objectUrlCache.set(key, val);
+  return val;
+}
+
+function setObjectUrlCache(key, url, protectedIds = smartHdState.protectedIds) {
+  objectUrlCache.delete(key);
+  objectUrlCache.set(key, url);
+
+  let blobCount = 0;
+  for (const [k, val] of objectUrlCache.entries()) {
+    if (isBlobCacheEntry(k, val)) blobCount += 1;
+  }
+
+  if (blobCount > MAX_MEMORY_BLOB_ENTRIES) {
+    for (const [k, val] of objectUrlCache.entries()) {
+      if (!isBlobCacheEntry(k, val)) continue;
+      const sepIdx = k.lastIndexOf(':');
+      const id = sepIdx > 0 ? k.slice(0, sepIdx) : k;
+      if (protectedIds && protectedIds.has(id)) continue;
+      objectUrlCache.delete(k);
+      if (typeof val === 'string' && val.startsWith('blob:')) {
+        try {
+          URL.revokeObjectURL(val);
+        } catch {
+          // Ignore
+        }
+        if (bestLoadedByItem.get(id)?.src === val) {
+          bestLoadedByItem.delete(id);
+        }
+      }
+      blobCount -= 1;
+      if (blobCount <= MAX_MEMORY_BLOB_ENTRIES) break;
+    }
+  }
+
+  if (objectUrlCache.size > MAX_MEMORY_URL_ENTRIES) {
+    for (const [k, val] of objectUrlCache.entries()) {
+      if (isBlobCacheEntry(k, val)) continue;
+      objectUrlCache.delete(k);
+      if (objectUrlCache.size <= MAX_MEMORY_URL_ENTRIES) break;
+    }
+  }
+}
+
+function getBestLoaded(fileId) {
+  if (!fileId || !bestLoadedByItem.has(fileId)) return undefined;
+  const val = bestLoadedByItem.get(fileId);
+  bestLoadedByItem.delete(fileId);
+  bestLoadedByItem.set(fileId, val);
+  return val;
+}
+
+function removeLiveImgElement(imgEl) {
+  if (!imgEl) return;
+  const prevId = imgEl._dlItemId;
+  if (!prevId) return;
+  const set = liveElementsByItem.get(prevId);
+  if (set) {
+    set.delete(imgEl);
+    if (set.size === 0) {
+      liveElementsByItem.delete(prevId);
+    }
+  }
+  imgEl._dlItemId = '';
+}
+
 function registerLiveImgElement(fileId, imgEl) {
   if (!fileId || !imgEl) return;
+  if (imgEl._dlItemId && imgEl._dlItemId !== fileId) {
+    removeLiveImgElement(imgEl);
+  }
+  imgEl._dlItemId = fileId;
   let set = liveElementsByItem.get(fileId);
   if (!set) {
     set = new Set();
@@ -30,7 +156,10 @@ function registerLiveImgElement(fileId, imgEl) {
   set.add(imgEl);
   if (set.size > 16) {
     for (const el of set) {
-      if (!el.isConnected) set.delete(el);
+      if (!el.isConnected) {
+        set.delete(el);
+        if (el._dlItemId === fileId) el._dlItemId = '';
+      }
     }
   }
 }
@@ -40,7 +169,13 @@ function recordBestLoaded(fileId, size, src) {
   const numSize = Number(size) || 480;
   const prev = bestLoadedByItem.get(fileId);
   if (!prev || numSize >= prev.size) {
+    bestLoadedByItem.delete(fileId);
     bestLoadedByItem.set(fileId, { size: numSize, src });
+    while (bestLoadedByItem.size > MAX_BEST_LOADED_ENTRIES) {
+      const oldestKey = bestLoadedByItem.keys().next().value;
+      if (oldestKey === undefined) break;
+      bestLoadedByItem.delete(oldestKey);
+    }
   }
 
   const set = liveElementsByItem.get(fileId);
@@ -48,6 +183,7 @@ function recordBestLoaded(fileId, size, src) {
   for (const el of set) {
     if (!el.isConnected) {
       set.delete(el);
+      if (el._dlItemId === fileId) el._dlItemId = '';
       continue;
     }
     const curLoaded = Number(el.dataset.loadedSize || 0);
@@ -59,8 +195,41 @@ function recordBestLoaded(fileId, size, src) {
       }
       el.src = src;
       el.classList.add('is-loaded');
-      el.closest('.photo-card')?.classList.add('has-img');
+      const card = el.closest('.photo-card');
+      if (card) {
+        card.classList.add('has-img');
+        card.classList.remove('is-thumb-error');
+      }
     }
+  }
+}
+
+function evictCachedSrcForItem(item, staleSrc) {
+  if (!item?.id || !staleSrc) return;
+  const best = bestLoadedByItem.get(item.id);
+  if (best && best.src === staleSrc) {
+    bestLoadedByItem.delete(item.id);
+  }
+  const prefix = `${item.id}:`;
+  for (const [k, val] of objectUrlCache.entries()) {
+    if (k.startsWith(prefix) && val === staleSrc) {
+      objectUrlCache.delete(k);
+      if (typeof val === 'string' && val.startsWith('blob:')) {
+        try {
+          URL.revokeObjectURL(val);
+        } catch {
+          // Ignore
+        }
+      }
+    }
+  }
+  if (
+    staleSrc.includes('/drive-storage/') &&
+    item.thumbnailLink &&
+    item.thumbnailLink.includes('drive-storage')
+  ) {
+    item.thumbFetchedAt = 1;
+    driveStorageFailCount += 1;
   }
 }
 
@@ -191,14 +360,33 @@ class ImageLoadQueue {
     }, settleMs);
   }
 
-  enqueue(task, { priority = false, imgEl = null, abortCtrl = null } = {}) {
+  enqueue(
+    task,
+    {
+      priority = false,
+      imgEl = null,
+      abortCtrl = null,
+      priorityScore = null,
+      virtualManaged = false,
+    } = {}
+  ) {
     let entryRef = null;
     const promise = new Promise((resolve, reject) => {
       const wasIdle = this.isIdle();
       clearTimeout(this._settleTimer);
       this._settling = false;
-      entryRef = { task, resolve, reject, priority, imgEl, abortCtrl, cancelled: false };
-      if (priority) {
+      entryRef = {
+        task,
+        resolve,
+        reject,
+        priority: Boolean(priority),
+        imgEl,
+        abortCtrl,
+        priorityScore: typeof priorityScore === 'number' ? priorityScore : null,
+        virtualManaged: Boolean(virtualManaged),
+        cancelled: false,
+      };
+      if (entryRef.priority) {
         this.queue.unshift(entryRef);
       } else {
         this.queue.push(entryRef);
@@ -223,18 +411,37 @@ class ImageLoadQueue {
       }
     };
 
-    return { promise, cancel };
+    const updatePriority = (nextPriority, nextScore) => {
+      if (!entryRef || entryRef.cancelled) return;
+      entryRef.priority = Boolean(nextPriority);
+      if (typeof nextScore === 'number') {
+        entryRef.priorityScore = nextScore;
+      }
+    };
+
+    return { promise, cancel, updatePriority };
   }
 
   _maybePreemptOffScreen(incoming) {
     if (this.active < this.concurrency) return;
     const incomingUrgent =
       incoming.priority ||
-      (incoming.imgEl && scoreElementViewportPriority(incoming.imgEl) < 100000);
+      (!incoming.virtualManaged &&
+        typeof incoming.priorityScore !== 'number' &&
+        incoming.imgEl &&
+        scoreElementViewportPriority(incoming.imgEl) < 100000);
     if (!incomingUrgent) return;
 
     for (const running of this.activeEntries) {
-      if (!running.priority && running.abortCtrl && isElementStrictlyOffScreen(running.imgEl)) {
+      if (running.priority || !running.abortCtrl) continue;
+      if (running.virtualManaged || typeof running.priorityScore === 'number') {
+        if (!running.imgEl?.isConnected) {
+          running.abortCtrl.abort();
+          break;
+        }
+        continue;
+      }
+      if (isElementStrictlyOffScreen(running.imgEl)) {
         running.abortCtrl.abort();
         break;
       }
@@ -247,8 +454,12 @@ class ImageLoadQueue {
     let bestScore = Infinity;
     for (let i = 0; i < this.queue.length; i += 1) {
       const entry = this.queue[i];
-      if (entry.priority) return i;
-      const score = scoreElementViewportPriority(entry.imgEl);
+      const hasNumericScore = typeof entry.priorityScore === 'number';
+      if (entry.priority && !hasNumericScore) return i;
+      const base = entry.priority ? 0 : 1e9;
+      const score = hasNumericScore
+        ? base + entry.priorityScore
+        : scoreElementViewportPriority(entry.imgEl);
       if (score < bestScore) {
         bestScore = score;
         bestIdx = i;
@@ -280,6 +491,271 @@ class ImageLoadQueue {
 }
 
 const loadQueue = new ImageLoadQueue(APP_CONFIG.THUMBNAIL_CONCURRENCY);
+
+class RateLimitedGate {
+  constructor(maxConcurrent = 6, minIntervalMs = 125) {
+    this.maxConcurrent = maxConcurrent;
+    this.minIntervalMs = minIntervalMs;
+    this.active = 0;
+    this.lastStartAt = 0;
+    this.waiters = [];
+    this.timer = 0;
+  }
+
+  run(fn, signal = null) {
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('Aborted', 'AbortError'));
+    }
+    return new Promise((resolve, reject) => {
+      const entry = { fn, signal, resolve, reject, cancelled: false, onAbort: null };
+      const onAbort = () => {
+        if (entry.cancelled) return;
+        entry.cancelled = true;
+        const idx = this.waiters.indexOf(entry);
+        if (idx !== -1) this.waiters.splice(idx, 1);
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+      entry.onAbort = onAbort;
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.waiters.push(entry);
+      this._pump();
+    });
+  }
+
+  _pump() {
+    if (this.timer) return;
+    while (this.active < this.maxConcurrent && this.waiters.length > 0) {
+      const now = Date.now();
+      const waitMs = Math.max(0, this.lastStartAt + this.minIntervalMs - now);
+      if (waitMs > 0) {
+        this.timer = setTimeout(() => {
+          this.timer = 0;
+          this._pump();
+        }, waitMs);
+        return;
+      }
+      const entry = this.waiters.shift();
+      if (!entry || entry.cancelled) continue;
+      entry.signal?.removeEventListener('abort', entry.onAbort);
+      if (entry.signal?.aborted) {
+        entry.reject(new DOMException('Aborted', 'AbortError'));
+        continue;
+      }
+      this.lastStartAt = Date.now();
+      this.active += 1;
+      Promise.resolve()
+        .then(() => entry.fn())
+        .then(entry.resolve, entry.reject)
+        .finally(() => {
+          this.active -= 1;
+          this._pump();
+        });
+    }
+  }
+
+  clear() {
+    clearTimeout(this.timer);
+    this.timer = 0;
+    const dropped = this.waiters.splice(0);
+    for (const entry of dropped) {
+      entry.cancelled = true;
+      entry.signal?.removeEventListener('abort', entry.onAbort);
+      entry.reject(new DOMException('Aborted', 'AbortError'));
+    }
+  }
+}
+
+const lh3RateGate = new RateLimitedGate(6, 125);
+
+class ThumbnailRepairBatcher {
+  constructor(coalesceMs = REPAIR_COALESCE_MS, chunkSize = REPAIR_CHUNK_SIZE) {
+    this.coalesceMs = coalesceMs;
+    this.chunkSize = chunkSize;
+    this.pending = new Map();
+    this.inFlight = new Map();
+    this.flushTimer = 0;
+  }
+
+  enqueue({ item, token = '', key = '', signal = null }) {
+    if (!item?.id) return Promise.resolve('');
+    if (signal?.aborted) {
+      return Promise.reject(new DOMException('Aborted', 'AbortError'));
+    }
+
+    const existingInFlight = this.inFlight.get(item.id);
+    if (existingInFlight) {
+      return this._awaitWithAbort(existingInFlight, signal);
+    }
+
+    return new Promise((resolve, reject) => {
+      let entry = this.pending.get(item.id);
+      if (!entry) {
+        entry = { item, token, key, waiters: [] };
+        this.pending.set(item.id, entry);
+      } else {
+        if (token) entry.token = token;
+        if (key) entry.key = key;
+      }
+
+      const waiter = { signal, resolve, reject, onAbort: null, settled: false };
+      if (signal) {
+        waiter.onAbort = () => {
+          if (waiter.settled) return;
+          waiter.settled = true;
+          const idx = entry.waiters.indexOf(waiter);
+          if (idx !== -1) entry.waiters.splice(idx, 1);
+          if (entry.waiters.length === 0 && this.pending.get(item.id) === entry) {
+            this.pending.delete(item.id);
+          }
+          reject(new DOMException('Aborted', 'AbortError'));
+        };
+        signal.addEventListener('abort', waiter.onAbort, { once: true });
+      }
+      entry.waiters.push(waiter);
+
+      if (!this.flushTimer) {
+        this.flushTimer = setTimeout(() => {
+          this.flushTimer = 0;
+          this._flush();
+        }, this.coalesceMs);
+      }
+    });
+  }
+
+  _awaitWithAbort(promise, signal) {
+    if (!signal) return promise;
+    return new Promise((resolve, reject) => {
+      if (signal.aborted) {
+        reject(new DOMException('Aborted', 'AbortError'));
+        return;
+      }
+      let settled = false;
+      const onAbort = () => {
+        if (settled) return;
+        settled = true;
+        reject(new DOMException('Aborted', 'AbortError'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      promise.then(
+        (val) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          resolve(val);
+        },
+        (err) => {
+          if (settled) return;
+          settled = true;
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        }
+      );
+    });
+  }
+
+  _flush() {
+    if (this.pending.size === 0) return;
+    const entries = Array.from(this.pending.values());
+    this.pending.clear();
+
+    const groups = new Map();
+    for (const entry of entries) {
+      entry.waiters = entry.waiters.filter((w) => !w.settled && !w.signal?.aborted);
+      if (entry.waiters.length === 0) continue;
+      if (!entry.token && !entry.key) {
+        for (const w of entry.waiters) {
+          w.settled = true;
+          w.signal?.removeEventListener('abort', w.onAbort);
+          w.resolve('');
+        }
+        continue;
+      }
+      const authKey = `${entry.token || ''}::${entry.key || ''}`;
+      let list = groups.get(authKey);
+      if (!list) {
+        list = [];
+        groups.set(authKey, list);
+      }
+      list.push(entry);
+    }
+
+    for (const groupEntries of groups.values()) {
+      for (let i = 0; i < groupEntries.length; i += this.chunkSize) {
+        const chunk = groupEntries.slice(i, i + this.chunkSize);
+        this._dispatchChunk(chunk);
+      }
+    }
+  }
+
+  _dispatchChunk(chunkEntries) {
+    const auth = {
+      accessToken: chunkEntries[0].token || '',
+      apiKey: chunkEntries[0].key || '',
+    };
+    const items = chunkEntries.map((e) => e.item);
+    const chunkPromise = fetchBatchThumbnailLinks(items, auth)
+      .catch(() => new Map());
+
+    for (const entry of chunkEntries) {
+      const itemPromise = chunkPromise.then((linkMap) => {
+        const freshLink = linkMap instanceof Map ? linkMap.get(entry.item.id) || '' : '';
+        if (freshLink) {
+          const now = Date.now();
+          entry.item.thumbnailLink = freshLink;
+          entry.item.thumbFetchedAt = now;
+          driveStorageFailCount = 0;
+          queueHealedThumbnailLink(entry.item.id, freshLink, now);
+        }
+        return freshLink;
+      });
+
+      this.inFlight.set(entry.item.id, itemPromise);
+
+      itemPromise
+        .then((freshLink) => {
+          for (const w of entry.waiters) {
+            if (w.settled) continue;
+            w.settled = true;
+            w.signal?.removeEventListener('abort', w.onAbort);
+            if (w.signal?.aborted) {
+              w.reject(new DOMException('Aborted', 'AbortError'));
+            } else {
+              w.resolve(freshLink);
+            }
+          }
+        })
+        .catch((err) => {
+          for (const w of entry.waiters) {
+            if (w.settled) continue;
+            w.settled = true;
+            w.signal?.removeEventListener('abort', w.onAbort);
+            w.reject(err);
+          }
+        })
+        .finally(() => {
+          if (this.inFlight.get(entry.item.id) === itemPromise) {
+            this.inFlight.delete(entry.item.id);
+          }
+        });
+    }
+  }
+
+  clear() {
+    clearTimeout(this.flushTimer);
+    this.flushTimer = 0;
+    for (const entry of this.pending.values()) {
+      for (const w of entry.waiters) {
+        if (w.settled) continue;
+        w.settled = true;
+        w.signal?.removeEventListener('abort', w.onAbort);
+        w.reject(new DOMException('Aborted', 'AbortError'));
+      }
+    }
+    this.pending.clear();
+  }
+}
+
+const thumbnailRepairBatcher = new ThumbnailRepairBatcher();
 
 export function isPreviewQueueIdle() {
   return loadQueue.isIdle();
@@ -345,6 +821,13 @@ function loadViaImgTag(url, signal = null) {
 
 let driveStorageFailCount = 0;
 
+function isKnownExpiredThumbLink(item) {
+  if (!item || !item.thumbnailLink) return false;
+  if (!item.thumbnailLink.includes('drive-storage')) return false;
+  const fetchedAt = Number(item.thumbFetchedAt || 0);
+  return fetchedAt > 0 && Date.now() - fetchedAt > THUMB_LINK_TTL_MS;
+}
+
 function isStaleDriveStorageUrl(url) {
   return Boolean(url && url.includes('/drive-storage/') && driveStorageFailCount >= 2);
 }
@@ -363,28 +846,38 @@ async function fetchMediaBlobWithRetry(fileId, auth = {}, signal = null) {
   return resp.blob();
 }
 
-async function resolveImageSrc(item, size, getAccessToken, getApiKey, signal = null) {
+async function resolveImageSrc(
+  item,
+  requestedSize,
+  getAccessToken,
+  getApiKey,
+  signal = null,
+  { allowMediaFallback = false } = {}
+) {
   if (!item) return { src: '', size: 0 };
   if (item.isDemo) return { src: item.demoDataUrl || '', size: 3840 };
 
-  const best = bestLoadedByItem.get(item.id);
+  const size = requestedSize;
+  const best = getBestLoaded(item.id);
   if (best && best.size >= size) {
     return best;
   }
 
   const memKey = `${item.id}:${size}`;
-  if (objectUrlCache.has(memKey)) {
-    const cachedUrl = objectUrlCache.get(memKey);
+  const cachedUrl = touchObjectUrlCache(memKey);
+  if (cachedUrl) {
     recordBestLoaded(item.id, size, cachedUrl);
     return { src: cachedUrl, size };
   }
 
   const thumbUrl = buildDriveThumbUrl(item, size);
-  if (thumbUrl && !isStaleDriveStorageUrl(thumbUrl)) {
+  const skipInitialThumb =
+    !thumbUrl || isKnownExpiredThumbLink(item) || isStaleDriveStorageUrl(thumbUrl);
+  if (!skipInitialThumb) {
     try {
       await loadViaImgTag(thumbUrl, signal);
       if (thumbUrl.includes('/drive-storage/')) driveStorageFailCount = 0;
-      objectUrlCache.set(memKey, thumbUrl);
+      setObjectUrlCache(memKey, thumbUrl);
       recordBestLoaded(item.id, size, thumbUrl);
       return { src: thumbUrl, size };
     } catch (err) {
@@ -393,49 +886,66 @@ async function resolveImageSrc(item, size, getAccessToken, getApiKey, signal = n
     }
   }
 
-  if (item.id) {
-    const candidates = [
-      `https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w${size}`,
-      `https://lh3.googleusercontent.com/d/${encodeURIComponent(item.id)}=s${size}`,
-    ];
-    for (const candidateUrl of candidates) {
-      if (candidateUrl === thumbUrl) continue;
-      if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-      try {
-        await loadViaImgTag(candidateUrl, signal);
-        objectUrlCache.set(memKey, candidateUrl);
-        recordBestLoaded(item.id, size, candidateUrl);
-        return { src: candidateUrl, size };
-      } catch (err) {
-        if (err?.name === 'AbortError' || signal?.aborted) throw err;
-      }
-    }
-  }
-
   const token = typeof getAccessToken === 'function' ? getAccessToken() : '';
   const apiKey = typeof getApiKey === 'function' ? getApiKey() : '';
 
-  if ((token || apiKey) && item.id) {
-    const freshLink = await fetchFreshThumbnailLink(item.id, { accessToken: token, apiKey }, signal);
-    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
-    if (freshLink) {
-      item.thumbnailLink = freshLink;
-      driveStorageFailCount = 0;
-      const freshSized = buildDriveThumbUrl(item, size);
+  let triedLh3Url = '';
+  if (!token && apiKey && item.id) {
+    triedLh3Url = `https://lh3.googleusercontent.com/d/${encodeURIComponent(item.id)}=s${size}`;
+    if (triedLh3Url !== thumbUrl || skipInitialThumb) {
       try {
-        await loadViaImgTag(freshSized, signal);
-        objectUrlCache.set(memKey, freshSized);
-        recordBestLoaded(item.id, size, freshSized);
-        return { src: freshSized, size };
+        await lh3RateGate.run(() => loadViaImgTag(triedLh3Url, signal), signal);
+        setObjectUrlCache(memKey, triedLh3Url);
+        recordBestLoaded(item.id, size, triedLh3Url);
+        return { src: triedLh3Url, size };
+      } catch (err) {
+        if (err?.name === 'AbortError' || signal?.aborted) throw err;
+      }
+    }
+  } else if (!token && !apiKey && item.id) {
+    const fallbackUrl = `https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w${size}`;
+    if (fallbackUrl !== thumbUrl) {
+      try {
+        await loadViaImgTag(fallbackUrl, signal);
+        setObjectUrlCache(memKey, fallbackUrl);
+        recordBestLoaded(item.id, size, fallbackUrl);
+        return { src: fallbackUrl, size };
       } catch (err) {
         if (err?.name === 'AbortError' || signal?.aborted) throw err;
       }
     }
   }
 
+  if ((token || apiKey) && item.id) {
+    const freshLink = await thumbnailRepairBatcher.enqueue({
+      item,
+      token,
+      key: apiKey,
+      signal,
+    });
+    if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+    if (freshLink) {
+      const freshSized = buildDriveThumbUrl(item, size);
+      if (freshSized && freshSized !== triedLh3Url) {
+        try {
+          await loadViaImgTag(freshSized, signal);
+          setObjectUrlCache(memKey, freshSized);
+          recordBestLoaded(item.id, size, freshSized);
+          return { src: freshSized, size };
+        } catch (err) {
+          if (err?.name === 'AbortError' || signal?.aborted) throw err;
+        }
+      }
+    }
+  }
+
+  if (!allowMediaFallback) {
+    throw new Error('Thumbnail load failed');
+  }
+
   const cacheKey = `${item.id}:media`;
-  if (objectUrlCache.has(cacheKey)) {
-    const mediaUrl = objectUrlCache.get(cacheKey);
+  const mediaUrl = touchObjectUrlCache(cacheKey);
+  if (mediaUrl) {
     recordBestLoaded(item.id, 3840, mediaUrl);
     return { src: mediaUrl, size: 3840 };
   }
@@ -444,7 +954,7 @@ async function resolveImageSrc(item, size, getAccessToken, getApiKey, signal = n
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   if (cachedBlob) {
     const objUrl = URL.createObjectURL(cachedBlob);
-    objectUrlCache.set(cacheKey, objUrl);
+    setObjectUrlCache(cacheKey, objUrl);
     recordBestLoaded(item.id, 3840, objUrl);
     return { src: objUrl, size: 3840 };
   }
@@ -457,7 +967,7 @@ async function resolveImageSrc(item, size, getAccessToken, getApiKey, signal = n
   if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
   await setCachedBlob(cacheKey, blob);
   const objUrl = URL.createObjectURL(blob);
-  objectUrlCache.set(cacheKey, objUrl);
+  setObjectUrlCache(cacheKey, objUrl);
   recordBestLoaded(item.id, 3840, objUrl);
   return { src: objUrl, size: 3840 };
 }
@@ -470,38 +980,11 @@ const hdStatusListeners = new Set();
 const BROWSER_DECODABLE_RE = /^image\/(jpe?g|png|webp|gif|avif|bmp|svg\+xml)$/i;
 const MAX_ORIGINAL_STREAM_BYTES = 65 * 1024 * 1024;
 const MAX_IDB_HD_BLOB_BYTES = 25 * 1024 * 1024;
-const MAX_MEMORY_HD_ENTRIES = 80;
 
 function rememberHdInMemory(hdKey, fileId, url, protectedIds = null) {
-  objectUrlCache.delete(hdKey);
-  objectUrlCache.set(hdKey, url);
+  setObjectUrlCache(hdKey, url, protectedIds);
   hdCachedIds.add(fileId);
   recordBestLoaded(fileId, 3840, url);
-
-  let hdCount = 0;
-  for (const k of objectUrlCache.keys()) {
-    if (k.endsWith(':hd')) hdCount += 1;
-  }
-  if (hdCount <= MAX_MEMORY_HD_ENTRIES) return;
-
-  for (const [k, val] of objectUrlCache.entries()) {
-    if (!k.endsWith(':hd')) continue;
-    const id = k.slice(0, -3);
-    if (protectedIds && protectedIds.has(id)) continue;
-    objectUrlCache.delete(k);
-    if (typeof val === 'string' && val.startsWith('blob:')) {
-      try {
-        URL.revokeObjectURL(val);
-      } catch {
-        // Ignore
-      }
-      if (bestLoadedByItem.get(id)?.src === val) {
-        bestLoadedByItem.delete(id);
-      }
-    }
-    hdCount -= 1;
-    if (hdCount <= MAX_MEMORY_HD_ENTRIES) break;
-  }
 }
 
 function decodeImageUrl(url, signal = null) {
@@ -600,9 +1083,13 @@ async function fetchOriginalHdStream(item, auth = {}, signal = null, onProgress 
 export function hasCachedHdSrc(item) {
   if (!item) return '';
   if (item.isDemo) return item.demoDataUrl || '';
-  const best = bestLoadedByItem.get(item.id);
+  const best = getBestLoaded(item.id);
   if (best && best.size >= 3840 && best.src) return best.src;
-  return objectUrlCache.get(`${item.id}:hd`) || objectUrlCache.get(`${item.id}:media`) || '';
+  return (
+    touchObjectUrlCache(`${item.id}:hd`) ||
+    touchObjectUrlCache(`${item.id}:media`) ||
+    ''
+  );
 }
 
 export async function loadHdPhoto(
@@ -653,7 +1140,7 @@ export async function loadHdPhoto(
   try {
     const directThumb = buildDriveThumbUrl(item, 3840);
     const cdnCandidates = [
-      !isStaleDriveStorageUrl(directThumb) ? directThumb : '',
+      !isKnownExpiredThumbLink(item) && !isStaleDriveStorageUrl(directThumb) ? directThumb : '',
       `https://lh3.googleusercontent.com/d/${encodeURIComponent(item.id)}=s3840`,
       `https://drive.google.com/thumbnail?id=${encodeURIComponent(item.id)}&sz=w3840`,
     ].filter(Boolean);
@@ -683,8 +1170,11 @@ export async function loadHdPhoto(
       );
       if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
       if (freshLink) {
+        const now = Date.now();
         item.thumbnailLink = freshLink;
+        item.thumbFetchedAt = now;
         driveStorageFailCount = 0;
+        queueHealedThumbnailLink(item.id, freshLink, now);
         const freshHdUrl = buildDriveThumbUrl(item, 3840);
         try {
           await decodeImageUrl(freshHdUrl, signal);
@@ -728,6 +1218,20 @@ export async function loadHdPhoto(
       URL.revokeObjectURL(objUrl);
       throw decodeErr;
     }
+  }
+
+  const resolved = await resolveImageSrc(
+    item,
+    3840,
+    getAccessToken,
+    getApiKey,
+    signal,
+    { allowMediaFallback: true }
+  );
+  if (resolved?.src) {
+    rememberHdInMemory(hdKey, item.id, resolved.src, smartHdState.protectedIds);
+    if (onProgress) onProgress(1);
+    return { src: resolved.src, fromMemory: false };
   }
 
   throw new Error('Failed to load HD photo');
@@ -789,7 +1293,7 @@ function isEligibleHdItem(item) {
   );
 }
 
-function abortBackgroundHdJobs(predicate = null) {
+export function abortBackgroundHdJobs(predicate = null) {
   for (const [id, job] of smartHdState.activeJobs.entries()) {
     if (!predicate || predicate(job)) {
       job.abortCtrl?.abort();
@@ -968,12 +1472,12 @@ export function updateSmartHdSchedule({
 export function getInstantCachedSrc(item, sizes = [3840, 2048, 1600, 1280, 800, 600, 480, 240, 220]) {
   if (!item) return '';
   if (item.isDemo) return item.demoDataUrl || '';
-  const best = bestLoadedByItem.get(item.id);
+  const best = getBestLoaded(item.id);
   if (best && best.src) return best.src;
   const hd = hasCachedHdSrc(item);
   if (hd) return hd;
   for (const sz of sizes) {
-    const url = objectUrlCache.get(`${item.id}:${sz}`);
+    const url = touchObjectUrlCache(`${item.id}:${sz}`);
     if (url) return url;
   }
   return '';
@@ -990,9 +1494,47 @@ export function preloadPhoto(item, { size = 2048, getAccessToken = null, getApiK
     return;
   }
   const targetSize = quantizeThumbSize(size);
-  const best = bestLoadedByItem.get(item.id);
+  const best = getBestLoaded(item.id);
   if (best && best.size >= targetSize) return;
-  loadQueue.enqueue(() => resolveImageSrc(item, targetSize, getAccessToken, getApiKey)).promise.catch(() => {});
+  loadQueue
+    .enqueue(
+      () =>
+        resolveImageSrc(item, targetSize, getAccessToken, getApiKey, null, {
+          allowMediaFallback: false,
+        }),
+      {}
+    )
+    .promise.catch(() => {});
+}
+
+export function cancelElementPhotoLoad(imgEl) {
+  if (!imgEl) return;
+  clearTimeout(imgEl._dlDwellTimer);
+  imgEl._dlDwellTimer = 0;
+  if (typeof imgEl._dlCancelQueue === 'function') {
+    imgEl._dlCancelQueue();
+    imgEl._dlCancelQueue = null;
+  }
+  imgEl._dlUpdatePriority = null;
+  if (imgEl._dlAbortCtrl) {
+    try {
+      imgEl._dlAbortCtrl.abort();
+    } catch {
+      // Ignore
+    }
+    imgEl._dlAbortCtrl = null;
+  }
+  imgEl._dlInFlightSize = 0;
+  imgEl._dlTargetSize = 0;
+  imgEl._dlRetriedCachedSrc = '';
+  const obs = activeObservers.get(imgEl);
+  if (obs) {
+    obs.disconnect();
+    activeObservers.delete(imgEl);
+  }
+  removeLiveImgElement(imgEl);
+  imgEl.onload = null;
+  imgEl.onerror = null;
 }
 
 export function loadPhotoIntoElement(imgEl, item, options = {}) {
@@ -1002,15 +1544,22 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
     getApiKey = null,
     eager = false,
     onLoaded = null,
+    virtualManaged = false,
+    priorityScore = 0,
   } = options;
   if (!imgEl || !item) return;
   imgEl.decoding = 'async';
 
   if (item.isDemo) {
+    cancelElementPhotoLoad(imgEl);
     imgEl.src = item.demoDataUrl;
     imgEl.dataset.loadedSize = '3840';
     imgEl.classList.add('is-loaded');
-    imgEl.closest('.photo-card')?.classList.add('has-img');
+    const card = imgEl.closest('.photo-card');
+    if (card) {
+      card.classList.add('has-img');
+      card.classList.remove('is-thumb-error');
+    }
     if (onLoaded) onLoaded();
     return;
   }
@@ -1019,37 +1568,6 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
   imgEl._dlTargetSize = targetSize;
   registerLiveImgElement(item.id, imgEl);
 
-  // Always show the sharpest already-loaded version immediately (never downgrade!)
-  const best = bestLoadedByItem.get(item.id);
-  if (best && best.src) {
-    const curLoaded = Number(imgEl.dataset.loadedSize || 0);
-    if (!imgEl.getAttribute('src') || best.size > curLoaded) {
-      imgEl.referrerPolicy = 'no-referrer';
-      imgEl.dataset.loadedSize = String(best.size);
-      if (best.size >= 3840) imgEl.dataset.hdLoaded = 'true';
-      imgEl.src = best.src;
-      imgEl.classList.add('is-loaded');
-      imgEl.closest('.photo-card')?.classList.add('has-img');
-    }
-    if (best.size >= targetSize) {
-      if (onLoaded) onLoaded();
-      return;
-    }
-  } else if (!imgEl.getAttribute('src')) {
-    const instant = getInstantCachedSrc(item);
-    if (instant) {
-      imgEl.referrerPolicy = 'no-referrer';
-      imgEl.src = instant;
-      imgEl.classList.add('is-loaded');
-      imgEl.closest('.photo-card')?.classList.add('has-img');
-    }
-  }
-
-  if (Number(imgEl.dataset.loadedSize || 0) >= targetSize || imgEl.dataset.hdLoaded === 'true') {
-    if (onLoaded) onLoaded();
-    return;
-  }
-
   const runLoad = () => {
     if (!imgEl.isConnected) return;
     const desired = imgEl._dlTargetSize || targetSize;
@@ -1057,6 +1575,7 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
       return;
     }
     if (imgEl._dlInFlightSize && imgEl._dlInFlightSize >= desired) {
+      imgEl._dlUpdatePriority?.(eager, virtualManaged ? Number(priorityScore) || 0 : null);
       return;
     }
 
@@ -1065,11 +1584,21 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
     imgEl._dlAbortCtrl = abortCtrl;
     imgEl._dlInFlightSize = desired;
 
-    const { promise, cancel } = loadQueue.enqueue(
-      (sig) => resolveImageSrc(item, desired, getAccessToken, getApiKey, sig),
-      { priority: eager, imgEl, abortCtrl }
+    const { promise, cancel, updatePriority } = loadQueue.enqueue(
+      (sig) =>
+        resolveImageSrc(item, desired, getAccessToken, getApiKey, sig, {
+          allowMediaFallback: false,
+        }),
+      {
+        priority: eager,
+        imgEl,
+        abortCtrl,
+        priorityScore: virtualManaged ? Number(priorityScore) || 0 : null,
+        virtualManaged: Boolean(virtualManaged),
+      }
     );
     imgEl._dlCancelQueue = cancel;
+    imgEl._dlUpdatePriority = updatePriority;
 
     promise
       .then(({ src, size: resolvedSz }) => {
@@ -1078,9 +1607,15 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
         if (resolvedSz >= curSz && src) {
           imgEl.referrerPolicy = 'no-referrer';
           imgEl.dataset.loadedSize = String(resolvedSz);
+          imgEl.onerror = null;
           imgEl.onload = () => {
+            imgEl._dlRetriedCachedSrc = '';
             imgEl.classList.add('is-loaded');
-            imgEl.closest('.photo-card')?.classList.add('has-img');
+            const card = imgEl.closest('.photo-card');
+            if (card) {
+              card.classList.add('has-img');
+              card.classList.remove('is-thumb-error');
+            }
             if (onLoaded) onLoaded();
           };
           imgEl.src = src;
@@ -1094,20 +1629,74 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
         }
       })
       .catch((err) => {
-        if (err?.name === 'AbortError') return;
-        imgEl.closest('.photo-card')?.classList.add('has-img');
+        if (err?.name === 'AbortError' || abortCtrl?.signal?.aborted) return;
+        const card = imgEl.closest('.photo-card');
+        if (card) {
+          card.classList.add('has-img', 'is-thumb-error');
+        }
       })
       .finally(() => {
         if (imgEl._dlAbortCtrl === abortCtrl) {
           imgEl._dlAbortCtrl = null;
           imgEl._dlInFlightSize = 0;
           imgEl._dlCancelQueue = null;
+          imgEl._dlUpdatePriority = null;
         }
       });
   };
 
-  if (eager || typeof IntersectionObserver === 'undefined') {
-    runLoad();
+  const attachCachedErrorRetry = (assignedSrc) => {
+    if (!assignedSrc) return;
+    imgEl.onerror = () => {
+      imgEl.onerror = null;
+      if (imgEl._dlRetriedCachedSrc === assignedSrc) return;
+      imgEl._dlRetriedCachedSrc = assignedSrc;
+      evictCachedSrcForItem(item, assignedSrc);
+      imgEl.dataset.loadedSize = '0';
+      delete imgEl.dataset.hdLoaded;
+      imgEl.classList.remove('is-loaded');
+      runLoad();
+    };
+  };
+
+  // Always show the sharpest already-loaded version immediately (never downgrade!)
+  const best = getBestLoaded(item.id);
+  if (best && best.src) {
+    const curLoaded = Number(imgEl.dataset.loadedSize || 0);
+    if (!imgEl.getAttribute('src') || best.size > curLoaded) {
+      imgEl.referrerPolicy = 'no-referrer';
+      imgEl.dataset.loadedSize = String(best.size);
+      if (best.size >= 3840) imgEl.dataset.hdLoaded = 'true';
+      attachCachedErrorRetry(best.src);
+      imgEl.src = best.src;
+      imgEl.classList.add('is-loaded');
+      const card = imgEl.closest('.photo-card');
+      if (card) {
+        card.classList.add('has-img');
+        card.classList.remove('is-thumb-error');
+      }
+    }
+    if (best.size >= targetSize) {
+      if (onLoaded) onLoaded();
+      return;
+    }
+  } else if (!imgEl.getAttribute('src')) {
+    const instant = getInstantCachedSrc(item);
+    if (instant) {
+      imgEl.referrerPolicy = 'no-referrer';
+      attachCachedErrorRetry(instant);
+      imgEl.src = instant;
+      imgEl.classList.add('is-loaded');
+      const card = imgEl.closest('.photo-card');
+      if (card) {
+        card.classList.add('has-img');
+        card.classList.remove('is-thumb-error');
+      }
+    }
+  }
+
+  if (Number(imgEl.dataset.loadedSize || 0) >= targetSize || imgEl.dataset.hdLoaded === 'true') {
+    if (onLoaded) onLoaded();
     return;
   }
 
@@ -1117,6 +1706,25 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
     activeObservers.delete(imgEl);
   }
   clearTimeout(imgEl._dlDwellTimer);
+  imgEl._dlDwellTimer = 0;
+
+  if (virtualManaged) {
+    if (eager) {
+      runLoad();
+    } else {
+      loadQueue.touchActivity(170);
+      imgEl._dlDwellTimer = setTimeout(() => {
+        imgEl._dlDwellTimer = 0;
+        runLoad();
+      }, 35);
+    }
+    return;
+  }
+
+  if (eager || typeof IntersectionObserver === 'undefined') {
+    runLoad();
+    return;
+  }
 
   const observer = new IntersectionObserver(
     (entries) => {
@@ -1138,6 +1746,7 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
           if (imgEl._dlCancelQueue) {
             imgEl._dlCancelQueue();
             imgEl._dlCancelQueue = null;
+            imgEl._dlUpdatePriority = null;
             imgEl._dlInFlightSize = 0;
           }
         }
@@ -1153,24 +1762,30 @@ export function loadPhotoIntoElement(imgEl, item, options = {}) {
 
 export async function fetchAuthorizedMediaBlobUrl(fileId, accessToken, apiKey = '') {
   const cacheKey = `${fileId}:media`;
-  if (objectUrlCache.has(cacheKey)) {
-    return objectUrlCache.get(cacheKey);
+  const memUrl = touchObjectUrlCache(cacheKey);
+  if (memUrl) {
+    return memUrl;
   }
   const cachedBlob = await getCachedBlob(cacheKey);
   if (cachedBlob) {
     const objUrl = URL.createObjectURL(cachedBlob);
-    objectUrlCache.set(cacheKey, objUrl);
+    setObjectUrlCache(cacheKey, objUrl);
     return objUrl;
   }
   const blob = await fetchMediaBlobWithRetry(fileId, { accessToken, apiKey });
   await setCachedBlob(cacheKey, blob);
   const objUrl = URL.createObjectURL(blob);
-  objectUrlCache.set(cacheKey, objUrl);
+  setObjectUrlCache(cacheKey, objUrl);
   return objUrl;
 }
 
 export async function clearImageCache() {
   abortBackgroundHdJobs();
+  thumbnailRepairBatcher.clear();
+  lh3RateGate.clear();
+  clearTimeout(healedFlushTimer);
+  healedFlushTimer = 0;
+  pendingHealedPatches.clear();
   hdCachedIds.clear();
   failedHdIds.clear();
   bestLoadedByItem.clear();

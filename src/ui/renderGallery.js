@@ -1,26 +1,39 @@
 import { getLocaleTag, t } from '../i18n.js';
 import { resolvePhotoTimestamp } from '../state/store.js';
-import { loadPhotoIntoElement, quantizeThumbSize } from '../storage/imageLoader.js';
+import {
+  cancelElementPhotoLoad,
+  loadPhotoIntoElement,
+  quantizeThumbSize,
+} from '../storage/imageLoader.js';
 import { escapeAttr, escapeHtml, icon, starSectorIcon } from './icons.js';
 import { openCompare } from './renderCompare.js';
 
-const PAGE_CHUNK = 80;
+const MAX_STAGE_PX = 12_000_000;
+const STAGE_BAND_PX = 65536;
+const MAX_MOUNTED_CARDS = 180;
+const MAX_FREE_CARD_POOL = 160;
+const ANCHOR_TTL_MS = 260;
 
-const visiblePhotosIdSigCache = new WeakMap();
 const monthFormatterCache = new Map();
+const fallbackVersionMap = new WeakMap();
+let fallbackVersionSeq = 0;
 
 function getPhotoTimestampValue(file) {
   return resolvePhotoTimestamp(file);
 }
 
-function getPhotosIdSig(visiblePhotos) {
-  if (!visiblePhotos || visiblePhotos.length === 0) return '0';
-  let sig = visiblePhotosIdSigCache.get(visiblePhotos);
-  if (sig === undefined) {
-    sig = visiblePhotos.map((p) => p.id).join(',');
-    visiblePhotosIdSigCache.set(visiblePhotos, sig);
+function getPhotosVersion(store, visiblePhotos) {
+  if (typeof store?.visiblePhotosVersion === 'number') {
+    return store.visiblePhotosVersion;
   }
-  return sig;
+  if (!visiblePhotos) return 0;
+  let ver = fallbackVersionMap.get(visiblePhotos);
+  if (ver === undefined) {
+    fallbackVersionSeq += 1;
+    ver = fallbackVersionSeq;
+    fallbackVersionMap.set(visiblePhotos, ver);
+  }
+  return ver;
 }
 
 function formatMonthPillLabel(ts) {
@@ -34,8 +47,11 @@ function formatMonthPillLabel(ts) {
 }
 
 function getItemAspectRatio(file) {
-  const w = Number(file.imageMediaMetadata?.width || file.videoMediaMetadata?.width || 0);
-  const h = Number(file.imageMediaMetadata?.height || file.videoMediaMetadata?.height || 0);
+  if (typeof file?._aspect === 'number' && file._aspect > 0) {
+    return file._aspect;
+  }
+  const w = Number(file?.imageMediaMetadata?.width || file?.videoMediaMetadata?.width || 0);
+  const h = Number(file?.imageMediaMetadata?.height || file?.videoMediaMetadata?.height || 0);
   if (w > 0 && h > 0) {
     return Math.max(0.45, Math.min(2.6, w / h));
   }
@@ -126,6 +142,409 @@ export function computeWaterfallColumns(
   }
 
   return columns;
+}
+
+function computeVirtualLayout(
+  visiblePhotos,
+  layoutMode,
+  roundedWidth,
+  clampedRowHeight,
+  isMobile,
+  photosVer
+) {
+  const n = visiblePhotos.length;
+  const cacheKey = `${photosVer}|${n}|${layoutMode}|${roundedWidth}|${clampedRowHeight}|${isMobile ? 1 : 0}`;
+  if (cachedLayout && cachedLayout.cacheKey === cacheKey) {
+    return cachedLayout;
+  }
+
+  const itemX = new Float32Array(n);
+  const itemY = new Float64Array(n);
+  const itemW = new Float32Array(n);
+  const itemH = new Float32Array(n);
+
+  if (layoutMode === 'grid') {
+    const gap = isMobile ? 3 : 8;
+    const safeWidth = Math.max(240, roundedWidth);
+    const minCard = isMobile
+      ? Math.max(98, Math.round(clampedRowHeight * 0.5))
+      : Math.max(130, clampedRowHeight - 20);
+    const cols = Math.max(1, Math.floor((safeWidth + gap) / (minCard + gap)));
+    const step = (safeWidth + gap) / cols;
+    const colXs = new Float32Array(cols);
+    const colWs = new Float32Array(cols);
+    for (let c = 0; c < cols; c += 1) {
+      const x = Math.round(c * step);
+      const nextX = c === cols - 1 ? safeWidth + gap : Math.round((c + 1) * step);
+      colXs[c] = x;
+      colWs[c] = Math.max(48, nextX - x - gap);
+    }
+    const cellSize = Math.max(60, Math.round((safeWidth - gap * (cols - 1)) / cols));
+    const rowStride = cellSize + gap;
+
+    for (let i = 0; i < n; i += 1) {
+      const c = i % cols;
+      const r = (i - c) / cols;
+      itemX[i] = colXs[c];
+      itemY[i] = r * rowStride;
+      itemW[i] = colWs[c];
+      itemH[i] = cellSize;
+    }
+
+    const totalRows = n > 0 ? Math.ceil(n / cols) : 0;
+    const logicalTotalHeight = totalRows > 0 ? totalRows * rowStride - gap : 0;
+
+    cachedLayout = {
+      cacheKey,
+      mode: 'grid',
+      count: n,
+      containerWidth: roundedWidth,
+      targetHeight: clampedRowHeight,
+      isMobile,
+      gap,
+      logicalTotalHeight,
+      itemX,
+      itemY,
+      itemW,
+      itemH,
+      cols,
+      cellSize,
+      rowStride,
+    };
+    return cachedLayout;
+  }
+
+  if (layoutMode === 'waterfall') {
+    const gap = isMobile ? 4 : 10;
+    const safeWidth = Math.max(220, roundedWidth);
+    let colCount;
+    if (isMobile) {
+      if (safeWidth < 260 || clampedRowHeight >= 275) colCount = 1;
+      else if (clampedRowHeight >= 190) colCount = 2;
+      else if (clampedRowHeight >= 152) colCount = 3;
+      else colCount = 4;
+    } else {
+      const tNorm = (clampedRowHeight - 130) / 190;
+      const desiredColWidth = Math.round(135 + tNorm * 340);
+      colCount = Math.max(
+        2,
+        Math.min(9, Math.round((safeWidth + gap) / (desiredColWidth + gap)))
+      );
+    }
+
+    const step = (safeWidth + gap) / colCount;
+    const colXs = new Float32Array(colCount);
+    const colWs = new Float32Array(colCount);
+    for (let c = 0; c < colCount; c += 1) {
+      const x = Math.round(c * step);
+      const nextX = c === colCount - 1 ? safeWidth + gap : Math.round((c + 1) * step);
+      colXs[c] = x;
+      colWs[c] = Math.max(60, nextX - x - gap);
+    }
+
+    const colHeights = new Float64Array(colCount);
+    const colIndices = Array.from({ length: colCount }, () => []);
+    const colTops = Array.from({ length: colCount }, () => []);
+    const colBottoms = Array.from({ length: colCount }, () => []);
+
+    for (let i = 0; i < n; i += 1) {
+      let minCol = 0;
+      let minH = colHeights[0];
+      for (let c = 1; c < colCount; c += 1) {
+        if (colHeights[c] < minH) {
+          minH = colHeights[c];
+          minCol = c;
+        }
+      }
+      const ratio = getItemAspectRatio(visiblePhotos[i]);
+      const cw = colWs[minCol];
+      const h = Math.max(88, Math.round(cw / ratio));
+      const y = minH;
+
+      itemX[i] = colXs[minCol];
+      itemY[i] = y;
+      itemW[i] = cw;
+      itemH[i] = h;
+
+      colIndices[minCol].push(i);
+      colTops[minCol].push(y);
+      colBottoms[minCol].push(y + h);
+      colHeights[minCol] = y + h + gap;
+    }
+
+    let maxColH = 0;
+    for (let c = 0; c < colCount; c += 1) {
+      if (colHeights[c] > maxColH) maxColH = colHeights[c];
+    }
+    const logicalTotalHeight = n > 0 ? Math.max(0, maxColH - gap) : 0;
+
+    cachedLayout = {
+      cacheKey,
+      mode: 'waterfall',
+      count: n,
+      containerWidth: roundedWidth,
+      targetHeight: clampedRowHeight,
+      isMobile,
+      gap,
+      logicalTotalHeight,
+      itemX,
+      itemY,
+      itemW,
+      itemH,
+      colCount,
+      colIndices,
+      colTops,
+      colBottoms,
+    };
+    return cachedLayout;
+  }
+
+  // Justified layout (default)
+  const gap = isMobile ? 4 : 8;
+  const safeWidth = Math.max(260, roundedWidth);
+  const effectiveRowHeight = isMobile
+    ? Math.round(Math.max(105, clampedRowHeight * 0.62))
+    : clampedRowHeight;
+
+  const rowStarts = [];
+  const rowEnds = [];
+  const rowTops = [];
+  const rowBottoms = [];
+
+  let rowStart = 0;
+  let sumRatios = 0;
+  let y = 0;
+
+  for (let i = 0; i < n; i += 1) {
+    const ratio = getItemAspectRatio(visiblePhotos[i]);
+    sumRatios += ratio;
+    const countInRow = i - rowStart + 1;
+    const naturalRowWidth = sumRatios * effectiveRowHeight + gap * (countInRow - 1);
+
+    if (naturalRowWidth >= safeWidth) {
+      const exactHeight = (safeWidth - gap * (countInRow - 1)) / sumRatios;
+      const rowH = Math.max(40, Math.round(exactHeight));
+      let x = 0;
+
+      for (let k = rowStart; k <= i; k += 1) {
+        const kRatio = getItemAspectRatio(visiblePhotos[k]);
+        const w =
+          k === i
+            ? Math.max(48, Math.round(safeWidth - x))
+            : Math.max(48, Math.floor(kRatio * exactHeight));
+        itemX[k] = x;
+        itemY[k] = y;
+        itemW[k] = w;
+        itemH[k] = rowH;
+        x += w + gap;
+      }
+
+      rowStarts.push(rowStart);
+      rowEnds.push(i + 1);
+      rowTops.push(y);
+      rowBottoms.push(y + rowH);
+
+      y += rowH + gap;
+      rowStart = i + 1;
+      sumRatios = 0;
+    }
+  }
+
+  if (rowStart < n) {
+    const countInRow = n - rowStart;
+    const naturalHeight = (safeWidth - gap * (countInRow - 1)) / Math.max(0.01, sumRatios);
+    const rowH = Math.max(40, Math.round(Math.min(naturalHeight, effectiveRowHeight * 1.15)));
+    let x = 0;
+
+    for (let k = rowStart; k < n; k += 1) {
+      const kRatio = getItemAspectRatio(visiblePhotos[k]);
+      const w = Math.max(48, Math.round(kRatio * rowH));
+      itemX[k] = x;
+      itemY[k] = y;
+      itemW[k] = w;
+      itemH[k] = rowH;
+      x += w + gap;
+    }
+
+    rowStarts.push(rowStart);
+    rowEnds.push(n);
+    rowTops.push(y);
+    rowBottoms.push(y + rowH);
+    y += rowH + gap;
+  }
+
+  const rowCount = rowStarts.length;
+  const logicalTotalHeight = n > 0 ? Math.max(0, y - gap) : 0;
+
+  cachedLayout = {
+    cacheKey,
+    mode: 'justified',
+    count: n,
+    containerWidth: roundedWidth,
+    targetHeight: clampedRowHeight,
+    isMobile,
+    gap,
+    logicalTotalHeight,
+    itemX,
+    itemY,
+    itemW,
+    itemH,
+    rowCount,
+    rowStartIdx: Int32Array.from(rowStarts),
+    rowEndIdx: Int32Array.from(rowEnds),
+    rowTop: Float64Array.from(rowTops),
+    rowBottom: Float64Array.from(rowBottoms),
+  };
+  return cachedLayout;
+}
+
+function lowerBoundGreater(arr, len, target) {
+  let lo = 0;
+  let hi = len;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid] > target) {
+      hi = mid;
+    } else {
+      lo = mid + 1;
+    }
+  }
+  return lo;
+}
+
+function upperBoundLess(arr, len, target) {
+  let lo = 0;
+  let hi = len;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (arr[mid] < target) {
+      lo = mid + 1;
+    } else {
+      hi = mid;
+    }
+  }
+  return lo - 1;
+}
+
+function queryLayoutRange(layout, minY, maxY) {
+  const n = layout.count;
+  if (n === 0 || maxY < 0 || minY > layout.logicalTotalHeight) return [];
+
+  if (layout.mode === 'grid') {
+    const totalRows = Math.ceil(n / layout.cols);
+    const startRow = Math.max(0, Math.floor(minY / layout.rowStride));
+    const endRow = Math.min(totalRows - 1, Math.floor(maxY / layout.rowStride));
+    if (endRow < startRow) return [];
+    const startIdx = startRow * layout.cols;
+    const endIdx = Math.min(n - 1, (endRow + 1) * layout.cols - 1);
+    const out = new Array(endIdx - startIdx + 1);
+    for (let i = startIdx, j = 0; i <= endIdx; i += 1, j += 1) {
+      out[j] = i;
+    }
+    return out;
+  }
+
+  if (layout.mode === 'justified') {
+    const rLen = layout.rowCount;
+    if (rLen === 0) return [];
+    const r0 = lowerBoundGreater(layout.rowBottom, rLen, minY);
+    if (r0 >= rLen) return [];
+    const r1 = upperBoundLess(layout.rowTop, rLen, maxY);
+    if (r1 < r0) return [];
+    const startIdx = layout.rowStartIdx[r0];
+    const endIdx = layout.rowEndIdx[r1] - 1;
+    const out = new Array(endIdx - startIdx + 1);
+    for (let i = startIdx, j = 0; i <= endIdx; i += 1, j += 1) {
+      out[j] = i;
+    }
+    return out;
+  }
+
+  // Waterfall
+  const out = [];
+  for (let c = 0; c < layout.colCount; c += 1) {
+    const bottoms = layout.colBottoms[c];
+    const tops = layout.colTops[c];
+    const indices = layout.colIndices[c];
+    const len = indices.length;
+    if (len === 0) continue;
+    let k = lowerBoundGreater(bottoms, len, minY);
+    while (k < len && tops[k] < maxY) {
+      out.push(indices[k]);
+      k += 1;
+    }
+  }
+  out.sort((a, b) => a - b);
+  return out;
+}
+
+function getStageMetrics(layout, vh) {
+  const logicalTotalHeight = layout.logicalTotalHeight;
+  const isScaled = logicalTotalHeight > MAX_STAGE_PX;
+  const physicalTotalHeight = isScaled ? MAX_STAGE_PX : logicalTotalHeight;
+  const maxPhysicalScroll = Math.max(0, physicalTotalHeight - vh);
+  const maxLogicalScroll = Math.max(0, logicalTotalHeight - vh);
+  return {
+    logicalTotalHeight,
+    physicalTotalHeight,
+    isScaled,
+    maxPhysicalScroll,
+    maxLogicalScroll,
+  };
+}
+
+function scrollTopToLogicalTop(layout, scrollTop, vh) {
+  const m = getStageMetrics(layout, vh);
+  const clampedScroll = Math.max(0, Math.min(m.maxPhysicalScroll, scrollTop));
+  if (!m.isScaled || m.maxPhysicalScroll <= 0 || m.maxLogicalScroll <= 0) {
+    return Math.max(0, Math.min(m.maxLogicalScroll, clampedScroll));
+  }
+  return (clampedScroll / m.maxPhysicalScroll) * m.maxLogicalScroll;
+}
+
+function logicalTopToScrollTop(layout, logicalTop, vh) {
+  const m = getStageMetrics(layout, vh);
+  const clampedLogical = Math.max(0, Math.min(m.maxLogicalScroll, logicalTop));
+  if (!m.isScaled || m.maxLogicalScroll <= 0 || m.maxPhysicalScroll <= 0) {
+    return Math.max(0, Math.min(m.maxPhysicalScroll, clampedLogical));
+  }
+  return (clampedLogical / m.maxLogicalScroll) * m.maxPhysicalScroll;
+}
+
+function findAnchorItemIndexAtY(layout, targetY) {
+  if (!layout || layout.count === 0) return -1;
+  const y = Math.max(0, Math.min(layout.logicalTotalHeight, targetY));
+  if (y <= 0) return 0;
+
+  let candidates = queryLayoutRange(layout, y, y + 0.5);
+  if (candidates.length === 0) {
+    const pad = layout.gap + 8;
+    candidates = queryLayoutRange(
+      layout,
+      Math.max(0, y - pad),
+      Math.min(layout.logicalTotalHeight, y + pad)
+    );
+  }
+  if (candidates.length === 0) {
+    return y >= layout.logicalTotalHeight ? layout.count - 1 : 0;
+  }
+
+  let bestIdx = candidates[0];
+  let bestDist = Infinity;
+  for (let i = 0; i < candidates.length; i += 1) {
+    const idx = candidates[i];
+    const top = layout.itemY[idx];
+    const bottom = top + layout.itemH[idx];
+    if (y >= top && y <= bottom) {
+      return idx;
+    }
+    const dist = y < top ? top - y : y - bottom;
+    if (dist < bestDist) {
+      bestDist = dist;
+      bestIdx = idx;
+    }
+  }
+  return bestIdx;
 }
 
 function formatDuration(ms) {
@@ -240,107 +659,400 @@ function computeCardThumbTarget(cssBoxMaxPx) {
   return quantizeThumbSize(Math.round((Number(cssBoxMaxPx) || 260) * dpr));
 }
 
-function acquirePhotoCard(
-  file,
-  store,
-  styleAttr = '',
-  isWaterfall = false,
-  patchMeta = true,
-  cssBoxMaxPx = 280
-) {
-  let card = cardPool.get(file.id);
-  if (!card) {
-    const isVideo = file.mimeType && file.mimeType.startsWith('video/');
-    const dur = isVideo ? formatDuration(file.videoMediaMetadata?.durationMillis) : '';
+const mountedCardsById = new Map();
+const freeCardPool = [];
+let stageLayerEl = null;
 
-    card = document.createElement('div');
-    card.className = 'photo-card';
-    card.dataset.photoId = file.id;
-    card.innerHTML = `
-      <div class="photo-skeleton"></div>
-      <button type="button" class="photo-select-btn" data-action="toggle-select" title="${escapeAttr(t('gallery.toggleSelect'))}">
-        ${icon('check', 13)}
-      </button>
-      ${isVideo ? `<span class="photo-video-badge">${icon('video', 11)}<span>${dur || escapeHtml(t('gallery.video'))}</span></span>` : ''}
-      <img alt="${escapeAttr(file.name)}" decoding="async" />
-      <div class="photo-overlay is-empty"></div>
-    `;
-
-    card._imgEl = card.querySelector('img');
-    card._overlayEl = card.querySelector('.photo-overlay');
-    card._selectBtn = card.querySelector('.photo-select-btn');
-    card._selectTitle = card._selectBtn?.title || '';
-    card._styleAttr = null;
-    card._loadedKey = '';
-    card._requestedThumbSize = 0;
-    card._selected = false;
-    card._focused = false;
-    card._overlayMode = 'empty';
-    card._overlaySig = '';
-    card._waterfall = false;
-
-    cardPool.set(file.id, card);
-  }
-
-  const tsStr = String(getPhotoTimestampValue(file));
-  if (card.dataset.ts !== tsStr) {
-    card.dataset.ts = tsStr;
-  }
-
-  if (card._styleAttr !== styleAttr) {
-    card.style.cssText = styleAttr;
-    card._styleAttr = styleAttr;
-  }
-
-  if (card._waterfall !== isWaterfall) {
-    card.classList.toggle('waterfall-card', isWaterfall);
-    card._waterfall = isWaterfall;
-  }
-
-  // Upgrade thumbnail tier only on committed renders (patchMeta === true), never mid-slider drag
-  const desiredSize = patchMeta
-    ? Math.max(card._requestedThumbSize || 480, computeCardThumbTarget(cssBoxMaxPx))
-    : card._requestedThumbSize || 480;
-
-  const authSig = `${file.id}|${file.thumbnailLink || ''}|${Boolean(store.state.accessToken)}|${Boolean(store.state.apiKey)}`;
-  const loadKey = `${authSig}|${desiredSize}`;
-  if (card._imgEl && (card._loadedKey !== loadKey || (patchMeta && desiredSize > card._requestedThumbSize))) {
-    card._loadedKey = loadKey;
-    card._requestedThumbSize = desiredSize;
-    loadPhotoIntoElement(card._imgEl, file, {
-      size: desiredSize,
-      getAccessToken: () => store.state.accessToken,
-      getApiKey: () => store.state.apiKey,
-    });
-  }
-
-  if (patchMeta) {
-    patchCardMeta(card, file, store, t('gallery.toggleSelect'));
-  }
-
-  return card;
-}
-
-const cardPool = new Map();
-const rowPool = [];
-const colPool = [];
+let cachedLayout = null;
+let activeLayout = null;
+let activePhotos = [];
+let activePhotosVer = 0;
+let lastAnchorFilterKey = '';
 
 let pooledAlbumKey = '';
 let lastSubbarSignature = '';
 let lastBatchSignature = '';
 let lastGridSignature = '';
 let lastFilterKey = '';
-let renderedLimit = PAGE_CHUNK;
 let lastVisiblePhotos = [];
 let lastContainerWidth = 0;
 let lastIsMobile = false;
 let lastRenderedMode = '';
-let sentinelEl = null;
-let loadMoreObserver = null;
+let lastStageHeightAttr = '';
+let lastStageTransform = '';
+
 let previewRafId = 0;
 let pendingPreviewHeight = null;
+let pendingPreviewFocalY = null;
 let mobileSelectMode = false;
 let scrollSettleCallback = null;
+let gestureAnchor = null;
+let lastProgrammaticScrollTop = -1;
+let lastProgrammaticScrollAt = 0;
+
+let activeHoverPeekClear = null;
+
+function createCardElement(selectTitle) {
+  const card = document.createElement('div');
+  card.className = 'photo-card';
+  card.innerHTML = `
+    <div class="photo-skeleton"></div>
+    <button type="button" class="photo-select-btn" data-action="toggle-select" title="${escapeAttr(selectTitle)}">
+      ${icon('check', 13)}
+    </button>
+    <img alt="" decoding="async" />
+    <div class="photo-overlay is-empty"></div>
+  `;
+
+  card._imgEl = card.querySelector('img');
+  card._overlayEl = card.querySelector('.photo-overlay');
+  card._selectBtn = card.querySelector('.photo-select-btn');
+  card._selectTitle = selectTitle;
+  card._videoBadgeEl = null;
+  card._videoDurSpan = null;
+  card._authSig = '';
+  card._requestedThumbSize = 0;
+  card._geomKey = '';
+  card._selected = false;
+  card._focused = false;
+  card._overlayMode = 'empty';
+  card._overlaySig = '';
+  card._waterfall = false;
+  return card;
+}
+
+function acquireFreeCard(file, selectTitle) {
+  const card = freeCardPool.length > 0 ? freeCardPool.pop() : createCardElement(selectTitle);
+  card.dataset.photoId = file.id;
+  card.dataset.ts = String(getPhotoTimestampValue(file));
+  if (card._imgEl) {
+    card._imgEl.alt = file.name || '';
+  }
+
+  const isVideo = Boolean(file.mimeType && file.mimeType.startsWith('video/'));
+  if (isVideo) {
+    const dur = formatDuration(file.videoMediaMetadata?.durationMillis);
+    const labelText = dur || t('gallery.video');
+    if (!card._videoBadgeEl) {
+      const badge = document.createElement('span');
+      badge.className = 'photo-video-badge';
+      badge.innerHTML = `${icon('video', 11)}<span></span>`;
+      card._videoBadgeEl = badge;
+      card._videoDurSpan = badge.querySelector('span');
+    }
+    if (card._videoDurSpan && card._videoDurSpan.textContent !== labelText) {
+      card._videoDurSpan.textContent = labelText;
+    }
+    if (card._videoBadgeEl.parentElement !== card && card._imgEl) {
+      card.insertBefore(card._videoBadgeEl, card._imgEl);
+    }
+  } else if (card._videoBadgeEl && card._videoBadgeEl.parentElement === card) {
+    card._videoBadgeEl.remove();
+  }
+
+  return card;
+}
+
+function recycleCard(card) {
+  if (!card) return;
+  if (activeHoverPeekClear) {
+    activeHoverPeekClear(card);
+  }
+  const imgEl = card._imgEl;
+  if (imgEl) {
+    cancelElementPhotoLoad(imgEl);
+    imgEl.removeAttribute('src');
+    imgEl.dataset.loadedSize = '0';
+    delete imgEl.dataset.hdLoaded;
+    delete imgEl._dlRetriedCachedSrc;
+    imgEl.classList.remove('is-loaded');
+  }
+  card.classList.remove(
+    'is-loaded',
+    'has-img',
+    'is-selected',
+    'is-focused',
+    'is-select-peek',
+    'is-thumb-error',
+    'waterfall-card'
+  );
+  card.style.removeProperty('--select-btn-top');
+  card._selected = false;
+  card._focused = false;
+  card._authSig = '';
+  card._requestedThumbSize = 0;
+  card._geomKey = '';
+  card._waterfall = false;
+  card._overlayMode = 'empty';
+  card._overlaySig = '';
+  if (card._overlayEl) {
+    card._overlayEl.className = 'photo-overlay is-empty';
+    card._overlayEl.innerHTML = '';
+  }
+  if (card._videoBadgeEl && card._videoBadgeEl.parentElement === card) {
+    card._videoBadgeEl.remove();
+  }
+  card.remove();
+  if (freeCardPool.length < MAX_FREE_CARD_POOL) {
+    freeCardPool.push(card);
+  }
+}
+
+function clearAllMountedCards() {
+  for (const entry of mountedCardsById.values()) {
+    recycleCard(entry.el);
+  }
+  mountedCardsById.clear();
+  if (stageLayerEl) {
+    stageLayerEl.remove();
+    stageLayerEl = null;
+  }
+  lastStageHeightAttr = '';
+  lastStageTransform = '';
+}
+
+function applyCardGeometry(card, x, relY, w, h, isWaterfall) {
+  const geomKey = `${x}|${relY}|${w}|${h}`;
+  if (card._geomKey !== geomKey) {
+    card.style.width = `${w}px`;
+    card.style.height = `${h}px`;
+    card.style.transform = `translate3d(${x}px, ${relY}px, 0)`;
+    card._geomKey = geomKey;
+  }
+  if (card._waterfall !== isWaterfall) {
+    card.classList.toggle('waterfall-card', isWaterfall);
+    card._waterfall = isWaterfall;
+  }
+}
+
+function ensureStageDom(gridEl, physicalTotalHeight) {
+  if (!stageLayerEl) {
+    stageLayerEl = document.createElement('div');
+    stageLayerEl.className = 'virtual-stage-layer';
+  }
+  gridEl.classList.add('is-virtual-stage');
+  const nextHeightStr = `${Math.ceil(physicalTotalHeight)}px`;
+  if (lastStageHeightAttr !== nextHeightStr || gridEl.style.height !== nextHeightStr) {
+    gridEl.style.height = nextHeightStr;
+    lastStageHeightAttr = nextHeightStr;
+  }
+  if (stageLayerEl.parentElement !== gridEl || gridEl.childElementCount !== 1) {
+    gridEl.replaceChildren(stageLayerEl);
+  }
+}
+
+function setScrollTopProgrammatically(scrollContainer, targetScrollTop) {
+  const rounded = Math.max(0, Math.round(targetScrollTop));
+  if (Math.abs((scrollContainer.scrollTop || 0) - rounded) < 0.5) return;
+  scrollContainer.scrollTop = rounded;
+  lastProgrammaticScrollTop = scrollContainer.scrollTop;
+  lastProgrammaticScrollAt =
+    typeof performance !== 'undefined' ? performance.now() : Date.now();
+}
+
+function selectBoundedIndices(layout, desiredIndices, onScreenMinY, onScreenMaxY, viewportCenterY) {
+  if (desiredIndices.length <= MAX_MOUNTED_CARDS) {
+    return desiredIndices;
+  }
+  const onScreen = [];
+  const offScreen = [];
+  for (let i = 0; i < desiredIndices.length; i += 1) {
+    const idx = desiredIndices[i];
+    const top = layout.itemY[idx];
+    const bottom = top + layout.itemH[idx];
+    if (bottom > onScreenMinY && top < onScreenMaxY) {
+      onScreen.push(idx);
+    } else {
+      offScreen.push(idx);
+    }
+  }
+
+  const distToCenter = (idx) => {
+    const center = layout.itemY[idx] + layout.itemH[idx] * 0.5;
+    return Math.abs(center - viewportCenterY);
+  };
+
+  if (onScreen.length >= MAX_MOUNTED_CARDS) {
+    onScreen.sort((a, b) => distToCenter(a) - distToCenter(b));
+    const sliced = onScreen.slice(0, MAX_MOUNTED_CARDS);
+    sliced.sort((a, b) => a - b);
+    return sliced;
+  }
+
+  offScreen.sort((a, b) => distToCenter(a) - distToCenter(b));
+  const extra = MAX_MOUNTED_CARDS - onScreen.length;
+  const combined = onScreen.concat(offScreen.slice(0, extra));
+  combined.sort((a, b) => a - b);
+  return combined;
+}
+
+function syncVirtualViewport(
+  gridEl,
+  scrollContainer,
+  store,
+  layout,
+  visiblePhotos,
+  { patchMeta = true, forceAllMeta = false } = {}
+) {
+  if (!gridEl || !scrollContainer || !layout || layout.count === 0) return;
+
+  const vh = Math.max(
+    1,
+    scrollContainer.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 800)
+  );
+  const metrics = getStageMetrics(layout, vh);
+  const rawScrollTop = Math.max(0, scrollContainer.scrollTop || 0);
+  const clampedScrollTop = Math.min(rawScrollTop, metrics.maxPhysicalScroll);
+  const logicalTop = scrollTopToLogicalTop(layout, clampedScrollTop, vh);
+
+  let windowBaseY;
+  let layerPhysicalY;
+  if (metrics.isScaled) {
+    windowBaseY = logicalTop;
+    layerPhysicalY = clampedScrollTop;
+  } else {
+    windowBaseY = Math.floor(logicalTop / STAGE_BAND_PX) * STAGE_BAND_PX;
+    layerPhysicalY = windowBaseY;
+  }
+
+  ensureStageDom(gridEl, metrics.physicalTotalHeight);
+
+  const layerTransform = `translate3d(0, ${layerPhysicalY}px, 0)`;
+  if (lastStageTransform !== layerTransform) {
+    stageLayerEl.style.transform = layerTransform;
+    lastStageTransform = layerTransform;
+  }
+
+  const onScreenMinY = logicalTop;
+  const onScreenMaxY = logicalTop + vh;
+  const overscanMinY = Math.max(0, logicalTop - 0.85 * vh);
+  const overscanMaxY = Math.min(metrics.logicalTotalHeight, logicalTop + vh + 1.35 * vh);
+  const viewportCenterY = logicalTop + vh * 0.5;
+
+  const rawDesired = queryLayoutRange(layout, overscanMinY, overscanMaxY);
+  const desiredIndices = selectBoundedIndices(
+    layout,
+    rawDesired,
+    onScreenMinY,
+    onScreenMaxY,
+    viewportCenterY
+  );
+
+  const desiredById = new Map();
+  for (let i = 0; i < desiredIndices.length; i += 1) {
+    const idx = desiredIndices[i];
+    const file = visiblePhotos[idx];
+    if (file) {
+      desiredById.set(file.id, idx);
+    }
+  }
+
+  // Evict cards outside overscan window
+  for (const [photoId, entry] of mountedCardsById.entries()) {
+    if (!desiredById.has(photoId)) {
+      recycleCard(entry.el);
+      mountedCardsById.delete(photoId);
+    }
+  }
+
+  const selectTitle = t('gallery.toggleSelect');
+  const isWaterfall = layout.mode === 'waterfall';
+  const hasToken = Boolean(store.state.accessToken);
+  const hasKey = Boolean(store.state.apiKey);
+  const getAccessToken = () => store.state.accessToken;
+  const getApiKey = () => store.state.apiKey;
+
+  let newCardsFrag = null;
+  const pendingLoads = [];
+
+  for (let i = 0; i < desiredIndices.length; i += 1) {
+    const idx = desiredIndices[i];
+    const file = visiblePhotos[idx];
+    if (!file) continue;
+
+    const x = layout.itemX[idx];
+    const y = layout.itemY[idx];
+    const w = layout.itemW[idx];
+    const h = layout.itemH[idx];
+    const relY = metrics.isScaled
+      ? Math.round((y - windowBaseY) * 100) / 100
+      : Math.round(y - windowBaseY);
+    const isOnScreen = y + h > onScreenMinY && y < onScreenMaxY;
+    const priorityScore = Math.abs(y + h * 0.5 - viewportCenterY);
+    const desiredThumbPx = computeCardThumbTarget(Math.max(w, h));
+    const authSig = `${file.id}|${file.thumbnailLink || ''}|${hasToken}|${hasKey}`;
+
+    const existing = mountedCardsById.get(file.id);
+    if (existing) {
+      const card = existing.el;
+      existing.idx = idx;
+      if (card.parentElement !== stageLayerEl) {
+        if (!newCardsFrag) newCardsFrag = document.createDocumentFragment();
+        newCardsFrag.appendChild(card);
+      }
+      applyCardGeometry(card, x, relY, w, h, isWaterfall);
+      const tsStr = String(getPhotoTimestampValue(file));
+      if (card.dataset.ts !== tsStr) {
+        card.dataset.ts = tsStr;
+      }
+      if (forceAllMeta || patchMeta) {
+        patchCardMeta(card, file, store, selectTitle);
+      }
+      const loadedSize = Number(card._imgEl?.dataset.loadedSize || 0);
+      if (
+        card._imgEl &&
+        (card._authSig !== authSig ||
+          (patchMeta && desiredThumbPx > Math.max(loadedSize, card._requestedThumbSize || 0)))
+      ) {
+        card._authSig = authSig;
+        card._requestedThumbSize = desiredThumbPx;
+        pendingLoads.push({
+          imgEl: card._imgEl,
+          file,
+          size: desiredThumbPx,
+          eager: isOnScreen,
+          priorityScore,
+        });
+      }
+    } else {
+      const card = acquireFreeCard(file, selectTitle);
+      applyCardGeometry(card, x, relY, w, h, isWaterfall);
+      patchCardMeta(card, file, store, selectTitle);
+      card._authSig = authSig;
+      card._requestedThumbSize = desiredThumbPx;
+      mountedCardsById.set(file.id, { el: card, idx });
+
+      if (!newCardsFrag) newCardsFrag = document.createDocumentFragment();
+      newCardsFrag.appendChild(card);
+
+      if (card._imgEl) {
+        pendingLoads.push({
+          imgEl: card._imgEl,
+          file,
+          size: desiredThumbPx,
+          eager: isOnScreen,
+          priorityScore,
+        });
+      }
+    }
+  }
+
+  if (newCardsFrag) {
+    stageLayerEl.appendChild(newCardsFrag);
+  }
+
+  for (let i = 0; i < pendingLoads.length; i += 1) {
+    const req = pendingLoads[i];
+    loadPhotoIntoElement(req.imgEl, req.file, {
+      size: req.size,
+      virtualManaged: true,
+      eager: req.eager,
+      priorityScore: req.priorityScore,
+      getAccessToken,
+      getApiKey,
+    });
+  }
+}
 
 export function setGalleryScrollSettleCallback(fn) {
   scrollSettleCallback = typeof fn === 'function' ? fn : null;
@@ -350,21 +1062,42 @@ export function getCurrentPageSmartTargets(scrollContainer, store, visiblePhotos
   if (!store || !Array.isArray(visiblePhotos) || visiblePhotos.length === 0) {
     return { ratedPageItems: [], restPageItems: [] };
   }
-  const limit = Math.min(renderedLimit, visiblePhotos.length);
-  const pageSlice = visiblePhotos.slice(0, limit);
-  const maxScroll = scrollContainer
-    ? Math.max(1, scrollContainer.scrollHeight - scrollContainer.clientHeight)
-    : 1;
-  const ratio = scrollContainer ? Math.min(1, Math.max(0, scrollContainer.scrollTop / maxScroll)) : 0;
-  const approxCenterIdx = Math.round(ratio * Math.max(0, pageSlice.length - 1));
+
+  const len = visiblePhotos.length;
+  let start = 0;
+  let end = Math.min(len - 1, 59);
+  let centerIdx = Math.round((start + end) * 0.5);
+
+  if (activeLayout && activeLayout.count === len && scrollContainer) {
+    const vh = Math.max(1, scrollContainer.clientHeight || 800);
+    const logicalTop = scrollTopToLogicalTop(activeLayout, scrollContainer.scrollTop || 0, vh);
+    const onScreen = queryLayoutRange(activeLayout, logicalTop, logicalTop + vh);
+    if (onScreen.length > 0) {
+      const minIdx = onScreen[0];
+      const maxIdx = onScreen[onScreen.length - 1];
+      centerIdx = Math.round((minIdx + maxIdx) * 0.5);
+      start = Math.max(0, minIdx - 10);
+      end = Math.min(len - 1, maxIdx + 10);
+      if (end - start + 1 > 60) {
+        start = Math.max(0, centerIdx - 30);
+        end = Math.min(len - 1, start + 59);
+      }
+    }
+  } else if (scrollContainer && scrollContainer.scrollHeight > scrollContainer.clientHeight) {
+    const maxScroll = Math.max(1, scrollContainer.scrollHeight - scrollContainer.clientHeight);
+    const ratio = Math.min(1, Math.max(0, scrollContainer.scrollTop / maxScroll));
+    centerIdx = Math.round(ratio * Math.max(0, len - 1));
+    start = Math.max(0, centerIdx - 30);
+    end = Math.min(len - 1, start + 59);
+  }
 
   const ratedCandidates = [];
   const restCandidates = [];
-  for (let i = 0; i < pageSlice.length; i += 1) {
-    const file = pageSlice[i];
+  for (let i = start; i <= end; i += 1) {
+    const file = visiblePhotos[i];
     if (!file || file.isDemo || (file.mimeType && file.mimeType.startsWith('video/'))) continue;
     const meta = store.getAggregatedItemMeta(file.id);
-    const dist = Math.abs(i - approxCenterIdx);
+    const dist = Math.abs(i - centerIdx);
     if (meta.ratingCount > 0 || meta.favoriteCount > 0) {
       ratedCandidates.push({
         file,
@@ -454,14 +1187,17 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
         : state.ratingScope === 'member'
           ? t('gallery.prefixMember')
           : t('gallery.prefixAvg');
-    chips.push({ label: `${prefix} ≥ ${state.minRating}`, clear: 'minRating' });
+    chips.push({ label: `${prefix} >= ${state.minRating}`, clear: 'minRating' });
   }
   for (const tid of state.selectedTagIds) {
     const tag = schemaTags[tid];
     if (tag) chips.push({ label: t('gallery.chipTag', { name: tag.name }), clear: `tag:${tid}` });
   }
   if (state.searchQuery.trim()) {
-    chips.push({ label: t('gallery.chipSearch', { q: state.searchQuery.trim() }), clear: 'search' });
+    chips.push({
+      label: t('gallery.chipSearch', { q: state.searchQuery.trim() }),
+      clear: 'search',
+    });
   }
 
   if (chips.length === 0) {
@@ -507,9 +1243,6 @@ export function renderGallerySubbar(subbarEl, store, visiblePhotos) {
 export function renderBatchBar(batchBarEl, store, visiblePhotos) {
   if (!batchBarEl) return;
   const count = store.state.selectedPhotoIds.size;
-  if (count === 0 && mobileSelectMode) {
-    // Keep checkbox mode only if explicitly entered; batch bar floats only when >= 1 selected
-  }
   const batchSig = count === 0 ? '0' : `${store.state.lang}|${count}|${visiblePhotos.length}`;
   if (batchSig === lastBatchSignature && (count === 0 || batchBarEl.childElementCount > 0)) {
     return;
@@ -557,32 +1290,6 @@ function isTouchViewport() {
   return window.innerWidth <= 860 || Boolean(window.matchMedia?.('(pointer: coarse)').matches);
 }
 
-function syncContainerChildren(containerEl, nextChildren) {
-  const existing = containerEl.children;
-  let same = existing.length === nextChildren.length;
-  if (same) {
-    for (let i = 0; i < existing.length; i += 1) {
-      if (existing[i] !== nextChildren[i]) {
-        same = false;
-        break;
-      }
-    }
-  }
-  if (same) return;
-  const frag = document.createDocumentFragment();
-  for (let i = 0; i < nextChildren.length; i += 1) {
-    frag.appendChild(nextChildren[i]);
-  }
-  containerEl.replaceChildren(frag);
-}
-
-function teardownLoadMoreObserver() {
-  if (loadMoreObserver) {
-    loadMoreObserver.disconnect();
-    loadMoreObserver = null;
-  }
-}
-
 function buildFilterKey(state) {
   const tags =
     state.selectedTagIds && state.selectedTagIds.size > 0
@@ -607,35 +1314,18 @@ function buildFilterKey(state) {
   ].join('|');
 }
 
-function buildGridSignature(state, isMobile, rowHeight, roundedWidth, visiblePhotos, limit) {
-  return `${state.lang}|${isMobile ? 'm' : 'd'}|${state.layoutMode}|${rowHeight}|${roundedWidth}|${limit}|${visiblePhotos.length}|${getPhotosIdSig(visiblePhotos)}`;
+function buildGridSignature(state, isMobile, rowHeight, roundedWidth, photosVer, count) {
+  return `${state.lang}|${isMobile ? 'm' : 'd'}|${state.layoutMode}|${rowHeight}|${roundedWidth}|${photosVer}|${count}|${Boolean(state.accessToken)}|${Boolean(state.apiKey)}`;
 }
 
 function findSampleCardTimestamp(scrollContainer) {
-  const rect = scrollContainer.getBoundingClientRect();
-  if (!rect.width || !rect.height) return 0;
-  const sampleY = rect.top + Math.min(130, Math.max(68, Math.round(rect.height * 0.24)));
-  const sampleXs = [
-    rect.left + Math.round(rect.width * 0.25),
-    rect.left + Math.round(rect.width * 0.5),
-    rect.left + Math.round(rect.width * 0.75),
-  ];
-  for (const sx of sampleXs) {
-    if (typeof document.elementsFromPoint === 'function') {
-      const stack = document.elementsFromPoint(sx, sampleY);
-      for (const el of stack) {
-        if (el.classList?.contains('photo-card') && el.dataset.ts) {
-          const v = Number(el.dataset.ts);
-          if (v > 0) return v;
-        }
-      }
-    } else {
-      const hit = document.elementFromPoint(sx, sampleY)?.closest('.photo-card[data-ts]');
-      const v = hit ? Number(hit.dataset.ts || 0) : 0;
-      if (v > 0) return v;
-    }
-  }
-  return 0;
+  if (!activeLayout || activeLayout.count === 0 || activePhotos.length === 0) return 0;
+  const vh = Math.max(1, scrollContainer?.clientHeight || 800);
+  const logicalTop = scrollTopToLogicalTop(activeLayout, scrollContainer?.scrollTop || 0, vh);
+  const probeY = Math.min(activeLayout.logicalTotalHeight, logicalTop + 72);
+  const idx = findAnchorItemIndexAtY(activeLayout, probeY);
+  if (idx < 0 || idx >= activePhotos.length) return 0;
+  return getPhotoTimestampValue(activePhotos[idx]);
 }
 
 function updateFloatingScrollState(scrollContainer, store, fromActiveScroll = false) {
@@ -681,16 +1371,18 @@ function updateFloatingScrollState(scrollContainer, store, fromActiveScroll = fa
   }
 }
 
-function ensureGalleryFloatingUi(scrollContainer, store) {
+function ensureGalleryFloatingUi(gridEl, scrollContainer, store) {
   const host = scrollContainer.parentElement;
   if (!host) return;
   scrollContainer._dlStoreRef = store;
+  scrollContainer._dlGridRef = gridEl;
   if (scrollContainer._dlFloatingAttached) {
     updateFloatingScrollState(scrollContainer, store, false);
     return;
   }
 
   const pillEl = document.createElement('div');
+  pillEl.id = 'galleryMonthPill';
   pillEl.className = 'gallery-month-pill';
   pillEl.setAttribute('aria-hidden', 'true');
 
@@ -711,17 +1403,48 @@ function ensureGalleryFloatingUi(scrollContainer, store) {
   scrollContainer._dlBackTopBtn = backBtn;
   scrollContainer._dlFloatingAttached = true;
 
-  let scrollRafId = 0;
+  let scrollVirtualRafId = 0;
   let lastScrollTop = scrollContainer.scrollTop || 0;
   scrollContainer.addEventListener(
     'scroll',
     () => {
-      if (scrollRafId) return;
-      scrollRafId = requestAnimationFrame(() => {
-        scrollRafId = 0;
-        const curTop = scrollContainer.scrollTop;
+      const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
+      const curTopNow = scrollContainer.scrollTop || 0;
+      if (
+        lastProgrammaticScrollAt > 0 &&
+        now - lastProgrammaticScrollAt < 80 &&
+        Math.abs(curTopNow - lastProgrammaticScrollTop) <= 2
+      ) {
+        lastProgrammaticScrollAt = 0;
+        lastScrollTop = curTopNow;
+        updateFloatingScrollState(scrollContainer, scrollContainer._dlStoreRef, false);
+        return;
+      }
+
+      // User scroll clears any pending zoom/resize gesture anchor
+      gestureAnchor = null;
+
+      if (scrollVirtualRafId) return;
+      scrollVirtualRafId = requestAnimationFrame(() => {
+        scrollVirtualRafId = 0;
+        const curTop = scrollContainer.scrollTop || 0;
         const delta = curTop - lastScrollTop;
         lastScrollTop = curTop;
+
+        const curStore = scrollContainer._dlStoreRef;
+        const curGrid = scrollContainer._dlGridRef;
+        if (
+          curGrid &&
+          curStore &&
+          !curStore.state.loading &&
+          activeLayout &&
+          activePhotos.length > 0
+        ) {
+          syncVirtualViewport(curGrid, scrollContainer, curStore, activeLayout, activePhotos, {
+            patchMeta: true,
+            forceAllMeta: false,
+          });
+        }
 
         const topHeaderEl = document.getElementById('topHeader');
         const overlayOpen = Boolean(
@@ -736,7 +1459,7 @@ function ensureGalleryFloatingUi(scrollContainer, store) {
           topHeaderEl?.classList.add('is-hidden-scroll');
         }
 
-        updateFloatingScrollState(scrollContainer, scrollContainer._dlStoreRef, true);
+        updateFloatingScrollState(scrollContainer, curStore, true);
         clearTimeout(scrollContainer._dlSettleTimer);
         scrollContainer._dlSettleTimer = setTimeout(() => {
           if (scrollSettleCallback) scrollSettleCallback();
@@ -757,127 +1480,96 @@ function hideGalleryFloatingUi(scrollContainer) {
   document.getElementById('mobileNavBar')?.classList.remove('has-back-top');
 }
 
-function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, targetHeight, patchMeta) {
+function applyGalleryGeometry(
+  gridEl,
+  scrollContainer,
+  store,
+  visiblePhotos,
+  targetHeight,
+  patchMeta,
+  focalScreenY = null
+) {
   const state = store.state;
   const { layoutMode, lang } = state;
+  const clampedRowHeight = Math.max(130, Math.min(320, Math.round(Number(targetHeight) || 210)));
   const isMobile = scrollContainer.clientWidth <= 600;
-  const containerWidth = Math.max(240, gridEl.clientWidth);
+  const containerWidth = Math.max(
+    240,
+    gridEl.clientWidth || Math.max(0, scrollContainer.clientWidth - 4)
+  );
   const roundedWidth = Math.round(containerWidth);
-  const gap = window.innerWidth <= 860 ? 2 : 3;
-  const effectiveRowHeight = isMobile
-    ? Math.round(Math.max(105, targetHeight * 0.62))
-    : targetHeight;
+  const photosVer = getPhotosVersion(store, visiblePhotos);
+  const filterKey = buildFilterKey(state);
 
-  const limit = Math.min(renderedLimit, visiblePhotos.length);
-  const windowedPhotos =
-    limit < visiblePhotos.length ? visiblePhotos.slice(0, limit) : visiblePhotos;
+  const vh = Math.max(
+    1,
+    scrollContainer.clientHeight || (typeof window !== 'undefined' ? window.innerHeight : 800)
+  );
+  const prevLayout = activeLayout;
+  const prevPhotos = activePhotos;
+  const prevScrollTop = Math.max(0, scrollContainer.scrollTop || 0);
+  const now = typeof performance !== 'undefined' ? performance.now() : Date.now();
 
-  let wrapperEl = null;
+  let anchorToApply = null;
+  const canPreserveAnchor = Boolean(
+    prevLayout &&
+      prevLayout.count > 0 &&
+      (activePhotosVer === photosVer || filterKey === lastAnchorFilterKey)
+  );
 
-  if (layoutMode === 'waterfall') {
-    const columns = computeWaterfallColumns(
-      windowedPhotos,
-      containerWidth,
-      targetHeight,
-      gap,
-      isMobile
-    );
-    const existingWrapper =
-      lastRenderedMode === 'waterfall' &&
-      gridEl.firstElementChild?.classList.contains('waterfall-gallery')
-        ? gridEl.firstElementChild
-        : null;
-    wrapperEl = existingWrapper || document.createElement('div');
-    wrapperEl.className = 'waterfall-gallery';
-
-    const colNodes = [];
-    for (let i = 0; i < columns.length; i += 1) {
-      let colEl = colPool[i];
-      if (!colEl) {
-        colEl = document.createElement('div');
-        colEl.className = 'waterfall-column';
-        colPool[i] = colEl;
+  if (canPreserveAnchor) {
+    if (
+      gestureAnchor &&
+      gestureAnchor.expiresAt > now &&
+      gestureAnchor.photosVer === photosVer
+    ) {
+      gestureAnchor.expiresAt = now + ANCHOR_TTL_MS;
+      if (focalScreenY !== null) {
+        gestureAnchor.focalScreenY = focalScreenY;
       }
-      const colItems = columns[i];
-      const colCards = new Array(colItems.length);
-      for (let j = 0; j < colItems.length; j += 1) {
-        const cell = colItems[j];
-        colCards[j] = acquirePhotoCard(
-          cell.item,
-          store,
-          `width:100%;height:${cell.height}px;`,
-          true,
-          patchMeta,
-          Math.max(cell.width, cell.height)
-        );
+      anchorToApply = gestureAnchor;
+    } else if (prevScrollTop <= 4 && focalScreenY === null) {
+      anchorToApply = { pinTop: true };
+    } else {
+      const focal = focalScreenY !== null ? focalScreenY : Math.min(110, vh * 0.25);
+      const prevLogicalTop = scrollTopToLogicalTop(prevLayout, prevScrollTop, vh);
+      const probeLogicalY = Math.max(
+        0,
+        Math.min(prevLayout.logicalTotalHeight, prevLogicalTop + focal)
+      );
+      const anchorIdx = findAnchorItemIndexAtY(prevLayout, probeLogicalY);
+      if (anchorIdx >= 0 && prevPhotos[anchorIdx]) {
+        const itemTop = prevLayout.itemY[anchorIdx];
+        const itemH = Math.max(1, prevLayout.itemH[anchorIdx]);
+        const offsetRatio = Math.max(0, Math.min(1, (probeLogicalY - itemTop) / itemH));
+        gestureAnchor = {
+          photoId: prevPhotos[anchorIdx].id,
+          index: anchorIdx,
+          offsetRatio,
+          focalScreenY: focal,
+          photosVer,
+          expiresAt: now + ANCHOR_TTL_MS,
+        };
+        anchorToApply = gestureAnchor;
       }
-      syncContainerChildren(colEl, colCards);
-      colNodes.push(colEl);
     }
-    syncContainerChildren(wrapperEl, colNodes);
-  } else if (layoutMode === 'grid') {
-    const existingWrapper =
-      lastRenderedMode === 'grid' &&
-      gridEl.firstElementChild?.classList.contains('square-gallery')
-        ? gridEl.firstElementChild
-        : null;
-    wrapperEl = existingWrapper || document.createElement('div');
-    wrapperEl.className = 'square-gallery';
-    const minCard = isMobile
-      ? Math.max(98, Math.round(targetHeight * 0.5))
-      : Math.max(130, targetHeight - 20);
-    const colEst = Math.max(1, Math.floor((containerWidth + gap) / (minCard + gap)));
-    const approxCellW = Math.round(containerWidth / colEst);
-    const nextCols = `repeat(auto-fill, minmax(${minCard}px, 1fr))`;
-    if (wrapperEl.style.gridTemplateColumns !== nextCols) {
-      wrapperEl.style.gridTemplateColumns = nextCols;
-    }
-
-    const cards = new Array(windowedPhotos.length);
-    for (let i = 0; i < windowedPhotos.length; i += 1) {
-      cards[i] = acquirePhotoCard(windowedPhotos[i], store, '', false, patchMeta, approxCellW);
-    }
-    syncContainerChildren(wrapperEl, cards);
   } else {
-    const rows = computeJustifiedRows(windowedPhotos, containerWidth, effectiveRowHeight, gap);
-    const existingWrapper =
-      lastRenderedMode === 'justified' &&
-      gridEl.firstElementChild?.classList.contains('justified-gallery')
-        ? gridEl.firstElementChild
-        : null;
-    wrapperEl = existingWrapper || document.createElement('div');
-    wrapperEl.className = 'justified-gallery';
-
-    const rowNodes = [];
-    for (let i = 0; i < rows.length; i += 1) {
-      let rowEl = rowPool[i];
-      if (!rowEl) {
-        rowEl = document.createElement('div');
-        rowEl.className = 'justified-row';
-        rowPool[i] = rowEl;
-      }
-      const row = rows[i];
-      const nextHeightPx = `${row.height}px`;
-      if (rowEl.style.height !== nextHeightPx) {
-        rowEl.style.height = nextHeightPx;
-      }
-      const rowCards = new Array(row.items.length);
-      for (let j = 0; j < row.items.length; j += 1) {
-        const cell = row.items[j];
-        rowCards[j] = acquirePhotoCard(
-          cell.item,
-          store,
-          `width:${cell.width}px;height:${row.height}px;`,
-          false,
-          patchMeta,
-          Math.max(cell.width, row.height)
-        );
-      }
-      syncContainerChildren(rowEl, rowCards);
-      rowNodes.push(rowEl);
-    }
-    syncContainerChildren(wrapperEl, rowNodes);
+    gestureAnchor = null;
   }
+
+  const nextLayout = computeVirtualLayout(
+    visiblePhotos,
+    layoutMode,
+    roundedWidth,
+    clampedRowHeight,
+    isMobile,
+    photosVer
+  );
+
+  activeLayout = nextLayout;
+  activePhotos = visiblePhotos;
+  activePhotosVer = photosVer;
+  lastAnchorFilterKey = filterKey;
 
   lastRenderedMode = layoutMode;
   lastContainerWidth = roundedWidth;
@@ -885,38 +1577,46 @@ function applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, tar
   lastGridSignature = buildGridSignature(
     { ...state, lang },
     isMobile,
-    targetHeight,
+    clampedRowHeight,
     roundedWidth,
-    visiblePhotos,
-    renderedLimit
+    photosVer,
+    visiblePhotos.length
   );
 
-  const hasMore = visiblePhotos.length > limit;
-  if (hasMore) {
-    if (!sentinelEl) {
-      sentinelEl = document.createElement('div');
-      sentinelEl.className = 'gallery-load-sentinel';
-      sentinelEl.setAttribute('aria-hidden', 'true');
+  const metrics = getStageMetrics(nextLayout, vh);
+  ensureStageDom(gridEl, metrics.physicalTotalHeight);
+
+  if (anchorToApply) {
+    let targetScrollTop = 0;
+    if (!anchorToApply.pinTop) {
+      let newIdx = anchorToApply.index;
+      if (visiblePhotos[newIdx]?.id !== anchorToApply.photoId) {
+        newIdx = visiblePhotos.findIndex((p) => p.id === anchorToApply.photoId);
+      }
+      if (newIdx >= 0 && newIdx < nextLayout.count) {
+        anchorToApply.index = newIdx;
+        const maxLogical = Math.max(0, nextLayout.logicalTotalHeight - vh);
+        const targetLogicalTop = Math.max(
+          0,
+          Math.min(
+            maxLogical,
+            nextLayout.itemY[newIdx] +
+              anchorToApply.offsetRatio * nextLayout.itemH[newIdx] -
+              anchorToApply.focalScreenY
+          )
+        );
+        targetScrollTop = logicalTopToScrollTop(nextLayout, targetLogicalTop, vh);
+      } else {
+        targetScrollTop = prevScrollTop;
+      }
     }
-    syncContainerChildren(gridEl, [wrapperEl, sentinelEl]);
-    teardownLoadMoreObserver();
-    if (typeof IntersectionObserver !== 'undefined') {
-      loadMoreObserver = new IntersectionObserver(
-        (entries) => {
-          if (!entries.some((entry) => entry.isIntersecting)) return;
-          if (renderedLimit >= lastVisiblePhotos.length) return;
-          renderedLimit = Math.min(lastVisiblePhotos.length, renderedLimit + PAGE_CHUNK);
-          renderGalleryGrid(gridEl, scrollContainer, store, lastVisiblePhotos);
-          if (scrollSettleCallback) scrollSettleCallback();
-        },
-        { root: scrollContainer, rootMargin: '600px 0px', threshold: 0 }
-      );
-      loadMoreObserver.observe(sentinelEl);
-    }
-  } else {
-    teardownLoadMoreObserver();
-    syncContainerChildren(gridEl, [wrapperEl]);
+    setScrollTopProgrammatically(scrollContainer, targetScrollTop);
   }
+
+  syncVirtualViewport(gridEl, scrollContainer, store, nextLayout, visiblePhotos, {
+    patchMeta,
+    forceAllMeta: patchMeta,
+  });
 }
 
 export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos) {
@@ -925,25 +1625,32 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
   const albumKey = `${store.state.mode}:${store.state.folderId || 'demo'}`;
   if (albumKey !== pooledAlbumKey) {
     pooledAlbumKey = albumKey;
-    cardPool.clear();
-    rowPool.length = 0;
-    colPool.length = 0;
+    clearAllMountedCards();
+    freeCardPool.length = 0;
+    cachedLayout = null;
+    activeLayout = null;
+    activePhotos = [];
+    activePhotosVer = 0;
+    gestureAnchor = null;
     lastRenderedMode = '';
     lastGridSignature = '';
   }
 
   if (store.state.selectedPhotoIds.size === 0 && mobileSelectMode) {
-    // Auto-exit multi-select once all selections are cleared
     mobileSelectMode = false;
   }
   const selectActive = mobileSelectMode || store.state.selectedPhotoIds.size > 0;
   gridEl.classList.toggle('gallery-select-active', selectActive);
 
   if (store.state.loading) {
-    teardownLoadMoreObserver();
+    clearAllMountedCards();
+    activeLayout = null;
+    activePhotos = [];
     lastVisiblePhotos = [];
     lastRenderedMode = '';
     lastGridSignature = '__loading__';
+    gridEl.classList.remove('is-virtual-stage');
+    gridEl.style.height = '';
     gridEl.innerHTML = `
       <div class="empty-state">
         <div class="spin" style="color:var(--accent)">${icon('refresh', 28)}</div>
@@ -955,10 +1662,14 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
   }
 
   if (visiblePhotos.length === 0) {
-    teardownLoadMoreObserver();
+    clearAllMountedCards();
+    activeLayout = null;
+    activePhotos = [];
     lastVisiblePhotos = [];
     lastRenderedMode = '';
     lastGridSignature = '__empty__';
+    gridEl.classList.remove('is-virtual-stage');
+    gridEl.style.height = '';
     gridEl.innerHTML = `
       <div class="empty-state">
         ${icon('image', 36)}
@@ -971,61 +1682,79 @@ export function renderGalleryGrid(gridEl, scrollContainer, store, visiblePhotos)
     return;
   }
 
-  ensureGalleryFloatingUi(scrollContainer, store);
+  ensureGalleryFloatingUi(gridEl, scrollContainer, store);
   lastVisiblePhotos = visiblePhotos;
+  lastFilterKey = buildFilterKey(store.state);
 
-  const filterKey = buildFilterKey(store.state);
-  if (filterKey !== lastFilterKey) {
-    lastFilterKey = filterKey;
-    renderedLimit = PAGE_CHUNK;
-  } else {
-    renderedLimit = Math.min(
-      Math.max(renderedLimit, PAGE_CHUNK),
-      Math.max(PAGE_CHUNK, visiblePhotos.length)
-    );
-  }
-
-  const { rowHeight } = store.state;
+  const rowHeight = Math.max(130, Math.min(320, Math.round(Number(store.state.rowHeight) || 210)));
   const isMobile = scrollContainer.clientWidth <= 600;
-  const containerWidth = Math.max(240, gridEl.clientWidth);
+  const containerWidth = Math.max(
+    240,
+    gridEl.clientWidth || Math.max(0, scrollContainer.clientWidth - 4)
+  );
   const roundedWidth = Math.round(containerWidth);
+  const photosVer = getPhotosVersion(store, visiblePhotos);
   const sig = buildGridSignature(
     store.state,
     isMobile,
     rowHeight,
     roundedWidth,
-    visiblePhotos,
-    renderedLimit
+    photosVer,
+    visiblePhotos.length
   );
 
-  if (sig === lastGridSignature && lastRenderedMode) {
+  if (sig === lastGridSignature && lastRenderedMode && stageLayerEl && stageLayerEl.isConnected) {
     const selectTitle = t('gallery.toggleSelect');
-    const limit = Math.min(renderedLimit, visiblePhotos.length);
-    for (let i = 0; i < limit; i += 1) {
-      const file = visiblePhotos[i];
-      const card = cardPool.get(file.id);
-      if (card) {
-        patchCardMeta(card, file, store, selectTitle);
+    const lastChange = store.lastChange;
+    if (lastChange?.type === 'meta-only' && lastChange.photoIds) {
+      for (const pid of lastChange.photoIds) {
+        const entry = mountedCardsById.get(pid);
+        if (entry && visiblePhotos[entry.idx]) {
+          patchCardMeta(entry.el, visiblePhotos[entry.idx], store, selectTitle);
+        }
+      }
+    } else {
+      for (const entry of mountedCardsById.values()) {
+        if (visiblePhotos[entry.idx]) {
+          patchCardMeta(entry.el, visiblePhotos[entry.idx], store, selectTitle);
+        }
       }
     }
     return;
   }
 
-  applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, rowHeight, true);
+  applyGalleryGeometry(gridEl, scrollContainer, store, visiblePhotos, rowHeight, true, null);
 }
 
-export function previewGalleryRowHeight(gridEl, scrollContainer, store, nextHeight) {
+export function previewGalleryRowHeight(
+  gridEl,
+  scrollContainer,
+  store,
+  nextHeight,
+  focalScreenY = null
+) {
   if (!gridEl || !scrollContainer || !store) return;
   const clamped = Math.max(130, Math.min(320, Math.round(Number(nextHeight) || 210)));
   pendingPreviewHeight = clamped;
+  pendingPreviewFocalY = focalScreenY;
   if (previewRafId) return;
   previewRafId = requestAnimationFrame(() => {
     previewRafId = 0;
     if (pendingPreviewHeight === null) return;
     const heightToApply = pendingPreviewHeight;
+    const focalToApply = pendingPreviewFocalY;
     pendingPreviewHeight = null;
+    pendingPreviewFocalY = null;
     if (store.state.loading || lastVisiblePhotos.length === 0) return;
-    applyGalleryGeometry(gridEl, scrollContainer, store, lastVisiblePhotos, heightToApply, false);
+    applyGalleryGeometry(
+      gridEl,
+      scrollContainer,
+      store,
+      lastVisiblePhotos,
+      heightToApply,
+      false,
+      focalToApply
+    );
   });
 }
 
@@ -1034,36 +1763,22 @@ export function relayoutGalleryOnResize(gridEl, scrollContainer, store) {
   if (store.state.loading || lastVisiblePhotos.length === 0) return;
 
   const isMobile = scrollContainer.clientWidth <= 600;
-  const containerWidth = Math.max(240, gridEl.clientWidth);
+  const containerWidth = Math.max(
+    240,
+    gridEl.clientWidth || Math.max(0, scrollContainer.clientWidth - 4)
+  );
   const roundedWidth = Math.round(containerWidth);
   if (roundedWidth === lastContainerWidth && isMobile === lastIsMobile) return;
 
   const targetHeight = Math.max(130, Math.min(320, Number(store.state.rowHeight || 210)));
-
-  if (
-    store.state.layoutMode === 'grid' &&
-    lastRenderedMode === 'grid' &&
-    isMobile === lastIsMobile
-  ) {
-    lastContainerWidth = roundedWidth;
-    lastGridSignature = buildGridSignature(
-      store.state,
-      isMobile,
-      targetHeight,
-      roundedWidth,
-      lastVisiblePhotos,
-      renderedLimit
-    );
-    return;
-  }
-
-  applyGalleryGeometry(gridEl, scrollContainer, store, lastVisiblePhotos, targetHeight, true);
+  applyGalleryGeometry(gridEl, scrollContainer, store, lastVisiblePhotos, targetHeight, true, null);
 }
 
 export function resetGallerySignature() {
   lastGridSignature = '';
   lastSubbarSignature = '';
   lastBatchSignature = '';
+  cachedLayout = null;
 }
 
 export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
@@ -1133,6 +1848,19 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
     let hoverCandidateCard = null;
     let revealedPeekCard = null;
 
+    activeHoverPeekClear = (card) => {
+      if (hoverCandidateCard === card) {
+        if (hoverPeekTimer) {
+          clearTimeout(hoverPeekTimer);
+          hoverPeekTimer = 0;
+        }
+        hoverCandidateCard = null;
+      }
+      if (revealedPeekCard === card) {
+        revealedPeekCard = null;
+      }
+    };
+
     function clearHoverPeek(keepRevealed = false) {
       if (hoverPeekTimer) {
         clearTimeout(hoverPeekTimer);
@@ -1158,6 +1886,14 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
       if (topSlider && topSlider.value !== str) topSlider.value = str;
       const sizeBadge = document.querySelector('[data-more-size-px]');
       if (sizeBadge) sizeBadge.textContent = `${str}px`;
+    }
+
+    function resolveScrollContainer() {
+      return (
+        gridEl.closest('.gallery-scroll') ||
+        document.getElementById('galleryScroll') ||
+        gridEl.parentElement
+      );
     }
 
     gridEl.addEventListener('mousemove', (e) => {
@@ -1265,7 +2001,13 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
           );
           pinchLiveHeight = nextH;
           syncRangeSliders(nextH);
-          previewGalleryRowHeight(gridEl, document.getElementById('galleryScroll'), store, nextH);
+          const sc = resolveScrollContainer();
+          const rect = sc?.getBoundingClientRect?.();
+          const midY = (e.touches[0].clientY + e.touches[1].clientY) * 0.5;
+          const focalY = rect
+            ? Math.max(0, Math.min(sc.clientHeight || 1, midY - rect.top))
+            : null;
+          previewGalleryRowHeight(gridEl, sc, store, nextH, focalY);
           return;
         }
         if (!longPressTimer || e.touches.length !== 1) return;
@@ -1306,7 +2048,12 @@ export function bindGalleryEvents(subbarEl, batchBarEl, gridEl, store) {
           pendingPreviewHeight !== null ? pendingPreviewHeight : store.state.rowHeight || 210;
         const nextH = Math.max(130, Math.min(320, Math.round(base + (e.deltaY < 0 ? 18 : -18))));
         syncRangeSliders(nextH);
-        previewGalleryRowHeight(gridEl, document.getElementById('galleryScroll'), store, nextH);
+        const sc = resolveScrollContainer();
+        const rect = sc?.getBoundingClientRect?.();
+        const focalY = rect
+          ? Math.max(0, Math.min(sc.clientHeight || 1, e.clientY - rect.top))
+          : null;
+        previewGalleryRowHeight(gridEl, sc, store, nextH, focalY);
         clearTimeout(wheelCommitTimer);
         wheelCommitTimer = setTimeout(() => {
           store.setRowHeight(nextH);

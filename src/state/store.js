@@ -9,12 +9,14 @@ import {
 } from '../demo/demoAlbum.js';
 import {
   authenticateGoogle,
+  buildDriveWebViewLink,
   clearSession,
   getCachedSession,
   getSavedOAuthUser,
   loadSharedAlbum,
   loadSharedAlbumWithApiKey,
   parseDriveFolderId,
+  syncAlbumIncremental,
 } from '../api/gdrive.js';
 import {
   loadAlbumMetadata,
@@ -27,17 +29,19 @@ import {
 } from '../api/metaSync.js';
 
 import {
+  applyCachedAlbumDelta,
   clearAllAlbumCaches,
   getCachedAlbum,
+  patchCachedThumbnailLinks,
+  saveCachedAlbumMetaOnly,
   setCachedAlbum,
 } from '../storage/albumCache.js';
-import { clearImageCache } from '../storage/imageLoader.js';
+import { clearImageCache, setThumbnailLinkHealedCallback } from '../storage/imageLoader.js';
 
 const THEME_KEY = 'drivelens_theme';
 const RECENT_KEY = 'drivelens_recent_v1';
 const SETTINGS_KEY = 'drivelens_connect_prefs_v1';
 const UI_PREFS_KEY = 'drivelens_ui_prefs_v1';
-const ALBUM_CACHE_TTL_MS = 30 * 60 * 1000;
 const VALID_LAYOUT_MODES = ['justified', 'waterfall', 'grid'];
 const VALID_SORT_MODES = [
   'dateDesc',
@@ -188,6 +192,58 @@ function saveUiPrefs(patch) {
 }
 
 const photoTimestampCache = new WeakMap();
+const collatorCache = new Map();
+const EMPTY_ARRAY = Object.freeze([]);
+const EMPTY_META = Object.freeze({
+  myRating: 0,
+  myFavorite: false,
+  myNote: '',
+  avgRating: 0,
+  ratingCount: 0,
+  favoriteCount: 0,
+  ratingsByMember: EMPTY_ARRAY,
+  notesByMember: EMPTY_ARRAY,
+  activeTagIds: EMPTY_ARRAY,
+});
+const UI_ONLY_STATE_KEYS = new Set([
+  'sidebarOpen',
+  'inspectorOpen',
+  'modal',
+  'toasts',
+  'rowHeight',
+  'theme',
+  'lightboxPhotoId',
+  'lightboxZoom',
+  'canInstallPwa',
+  'syncStatus',
+  'syncMessageKey',
+  'syncMessage',
+  'loadingText',
+  'backgroundRefreshing',
+]);
+const SELECTION_ONLY_STATE_KEYS = new Set([
+  'selectedPhotoIds',
+  'lastClickedPhotoId',
+  'focusedPhotoId',
+]);
+
+function getNameCollator(locale) {
+  let col = collatorCache.get(locale);
+  if (!col) {
+    col = new Intl.Collator(locale, { numeric: true, sensitivity: 'base' });
+    collatorCache.set(locale, col);
+  }
+  return col;
+}
+
+function normalizeAspectRatio(file) {
+  const w = Number(file?.imageMediaMetadata?.width || file?.videoMediaMetadata?.width || 0);
+  const h = Number(file?.imageMediaMetadata?.height || file?.videoMediaMetadata?.height || 0);
+  if (w > 0 && h > 0) {
+    return Math.max(0.45, Math.min(2.6, w / h));
+  }
+  return 1.5;
+}
 
 function parseDateString(raw) {
   if (!raw) return 0;
@@ -227,6 +283,7 @@ function parseFilenameTimestamp(name) {
 
 export function resolvePhotoTimestamp(file) {
   if (!file || typeof file !== 'object') return 0;
+  if (typeof file._ts === 'number') return file._ts;
   const key = `${file.imageMediaMetadata?.time || ''}|${file.name || ''}|${file.modifiedTime || ''}|${file.createdTime || ''}`;
   const cached = photoTimestampCache.get(file);
   if (cached && cached.key === key) return cached.ts;
@@ -262,6 +319,16 @@ export class Store {
     this._aggMetaCache = new Map();
     this._aggMetaRefs = null;
     this._visiblePhotosCache = null;
+    this._fileById = new Map();
+    this._itemsByPhotoId = new Map();
+    this._itemsByPhotoIdRef = null;
+    this._libraryStatsCache = null;
+    this.visiblePhotosVersion = 0;
+    this._changeSeq = 0;
+    this.lastChange = { type: 'full', photoIds: null, seq: 0 };
+    this._startPageToken = '';
+    this._syncWatermark = '';
+    this._lastFullReconcileAt = 0;
 
     const initialLang = setLangCode(getLang());
     const prefs = loadConnectPrefs();
@@ -332,7 +399,85 @@ export class Store {
     if (typeof document !== 'undefined') {
       document.documentElement.setAttribute('data-theme', this.state.theme);
     }
+    setThumbnailLinkHealedCallback(({ patches }) => {
+      if (!patches || !(patches instanceof Map) || patches.size === 0) return;
+      for (const [fileId, info] of patches.entries()) {
+        const file = this._fileById.get(fileId);
+        if (file && info) {
+          if (typeof info === 'string') {
+            file.thumbnailLink = info;
+            file.thumbFetchedAt = Date.now();
+          } else if (info.thumbnailLink) {
+            file.thumbnailLink = info.thumbnailLink;
+            file.thumbFetchedAt = Number(info.thumbFetchedAt || Date.now());
+          }
+        }
+      }
+      if (this.state.mode === 'gdrive' && this.state.folderId) {
+        const authType = this.state.authType === 'oauth' ? 'oauth' : 'apikey';
+        patchCachedThumbnailLinks(authType, this.state.folderId, patches).catch(() => {});
+      }
+    });
     this.loadDemoMode(false);
+  }
+
+  _normalizeFileRecord(f) {
+    if (!f || typeof f !== 'object') return f;
+    if (typeof f._ts !== 'number') {
+      f._ts = resolvePhotoTimestamp(f);
+    }
+    if (typeof f._aspect !== 'number') {
+      f._aspect = normalizeAspectRatio(f);
+    }
+    if (typeof f._isVideo !== 'boolean') {
+      f._isVideo = Boolean(f.mimeType && f.mimeType.startsWith('video/'));
+    }
+    if (!f.webViewLink && !f.isDemo && f.id) {
+      f.webViewLink = buildDriveWebViewLink(f.id);
+    }
+    return f;
+  }
+
+  _rebuildFileIndex(files) {
+    const map = new Map();
+    const list = Array.isArray(files) ? files : [];
+    for (let i = 0; i < list.length; i += 1) {
+      const f = this._normalizeFileRecord(list[i]);
+      if (f && f.id) {
+        map.set(f.id, f);
+      }
+    }
+    this._fileById = map;
+    this._libraryStatsCache = null;
+  }
+
+  getFileById(id) {
+    if (!id) return null;
+    return this._fileById.get(id) || null;
+  }
+
+  _rebuildItemsByPhotoId(membersData) {
+    const map = new Map();
+    const entries = Object.entries(membersData || {});
+    for (let m = 0; m < entries.length; m += 1) {
+      const [memberId, record] = entries[m];
+      const items = record?.items;
+      if (!items || typeof items !== 'object') continue;
+      const itemEntries = Object.entries(items);
+      for (let i = 0; i < itemEntries.length; i += 1) {
+        const [photoId, item] = itemEntries[i];
+        if (!item || typeof item !== 'object') continue;
+        let perPhoto = map.get(photoId);
+        if (!perPhoto) {
+          perPhoto = new Map();
+          map.set(photoId, perPhoto);
+        }
+        perPhoto.set(memberId, item);
+      }
+    }
+    this._itemsByPhotoId = map;
+    this._itemsByPhotoIdRef = membersData;
+    this._libraryStatsCache = null;
   }
 
   subscribe(fn) {
@@ -342,12 +487,41 @@ export class Store {
 
   emit() {
     for (const fn of this.listeners) {
-      fn(this.state);
+      fn(this.state, this.lastChange);
     }
   }
 
-  setState(patch) {
+  setState(patch, changeInfo = null) {
+    const prevFiles = this.state?.files;
     this.state = { ...this.state, ...patch };
+    if (Object.prototype.hasOwnProperty.call(patch, 'files')) {
+      const nextFiles = this.state.files;
+      const skipRebuild = Boolean(changeInfo && changeInfo._skipFileIndexRebuild);
+      if (
+        !skipRebuild &&
+        (nextFiles !== prevFiles ||
+          (Array.isArray(nextFiles) && nextFiles.length !== this._fileById.size))
+      ) {
+        this._rebuildFileIndex(nextFiles);
+      }
+    }
+
+    let type = changeInfo?.type || null;
+    if (!type) {
+      const keys = Object.keys(patch || {});
+      if (keys.length > 0 && keys.every((k) => UI_ONLY_STATE_KEYS.has(k))) {
+        type = 'ui-only';
+      } else if (keys.length > 0 && keys.every((k) => SELECTION_ONLY_STATE_KEYS.has(k))) {
+        type = 'selection-only';
+      } else {
+        type = 'full';
+      }
+    }
+    this.lastChange = {
+      type,
+      photoIds: changeInfo?.photoIds || null,
+      seq: ++this._changeSeq,
+    };
     this.emit();
   }
 
@@ -397,6 +571,9 @@ export class Store {
 
     if (this.state.mode === 'demo') {
       const localized = localizeDemoState(this.state, lang);
+      for (const f of localized.files || []) {
+        if (f && typeof f === 'object') delete f._searchHaystack;
+      }
       nextPatch = {
         ...nextPatch,
         rootFolder: localized.rootFolder,
@@ -478,6 +655,10 @@ export class Store {
     const persona =
       personas.find((p) => p.id === demo.activePersonaId) || personas[0];
     const firstPhoto = demo.files[0]?.id || null;
+
+    this._startPageToken = '';
+    this._syncWatermark = '';
+    this._lastFullReconcileAt = 0;
 
     this.setState({
       mode: 'demo',
@@ -622,6 +803,10 @@ export class Store {
         ? this.state.lightboxPhotoId
         : null;
 
+    this._startPageToken = cached.startPageToken || '';
+    this._syncWatermark = cached.syncWatermark || '';
+    this._lastFullReconcileAt = Number(cached.lastFullReconcileAt || 0);
+
     this.setState({
       mode: 'gdrive',
       authType,
@@ -700,37 +885,53 @@ export class Store {
         items: {},
       };
     }
+    const isSameArray = batch.files === this.state.files;
+    if (isSameArray && Array.isArray(batch.newFiles)) {
+      for (let i = 0; i < batch.newFiles.length; i += 1) {
+        const norm = this._normalizeFileRecord(batch.newFiles[i]);
+        if (norm && norm.id) {
+          this._fileById.set(norm.id, norm);
+        }
+      }
+      this._libraryStatsCache = null;
+    }
     const curFolderIds = new Set((batch.folders || []).map((f) => f.id));
-    const curFileIds = new Set(batch.files.map((f) => f.id));
-    this.setState({
-      mode: 'gdrive',
-      authType,
-      folderId,
-      ...(clientId ? { clientId } : {}),
-      ...(apiKey ? { apiKey } : {}),
-      ...(user ? { currentUser: user } : {}),
-      loading: false,
-      loadingText: '',
-      backgroundRefreshing: true,
-      syncStatus: 'syncing',
-      syncMessageKey: 'store.syncStreamingAlbum',
-      syncMessage: t('store.syncStreamingAlbum'),
-      rootFolder: batch.rootFolder,
-      folders: batch.folders,
-      files: batch.files,
-      metaFolderId: batch.metaFolderId || this.state.metaFolderId,
-      canWrite: Boolean(batch.canWrite),
-      membersData,
-      activeFolderId:
-        this.state.activeFolderId && curFolderIds.has(this.state.activeFolderId)
-          ? this.state.activeFolderId
-          : batch.rootFolder.id,
-      focusedPhotoId:
-        this.state.focusedPhotoId && curFileIds.has(this.state.focusedPhotoId)
-          ? this.state.focusedPhotoId
-          : batch.files[0]?.id || null,
-      modal: null,
-    });
+    const focusedValid =
+      this.state.focusedPhotoId &&
+      (isSameArray ? this._fileById.has(this.state.focusedPhotoId) : batch.files.some((f) => f.id === this.state.focusedPhotoId));
+
+    this.setState(
+      {
+        mode: 'gdrive',
+        authType,
+        folderId,
+        ...(clientId ? { clientId } : {}),
+        ...(apiKey ? { apiKey } : {}),
+        ...(user ? { currentUser: user } : {}),
+        loading: false,
+        loadingText: '',
+        backgroundRefreshing: true,
+        syncStatus: 'syncing',
+        syncMessageKey: 'store.syncStreamingAlbum',
+        syncMessage: t('store.syncStreamingAlbum'),
+        rootFolder: batch.rootFolder,
+        folders: batch.folders,
+        files: batch.files,
+        metaFolderId: batch.metaFolderId || this.state.metaFolderId,
+        canWrite: Boolean(batch.canWrite),
+        membersData,
+        activeFolderId:
+          this.state.activeFolderId && curFolderIds.has(this.state.activeFolderId)
+            ? this.state.activeFolderId
+            : batch.rootFolder.id,
+        focusedPhotoId: focusedValid ? this.state.focusedPhotoId : batch.files[0]?.id || null,
+        modal: null,
+      },
+      {
+        type: 'full',
+        _skipFileIndexRebuild: isSameArray && Array.isArray(batch.newFiles),
+      }
+    );
   }
 
   _commitLoadedAlbumState({
@@ -749,64 +950,75 @@ export class Store {
   }) {
     const sameActiveAlbum = this.state.mode === 'gdrive' && this.state.folderId === folderId;
     const folderIds = new Set(album.folders.map((f) => f.id));
-    const fileIds = new Set(album.files.map((f) => f.id));
+    const alreadyIndexed =
+      album.files === this.state.files && this._fileById.size === album.files.length;
+    if (!alreadyIndexed) {
+      this._rebuildFileIndex(album.files);
+    }
     const nextSelectedIds = sameActiveAlbum
-      ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => fileIds.has(id)))
+      ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => this._fileById.has(id)))
       : new Set();
 
-    this.setState({
-      mode: 'gdrive',
-      authType,
-      localMetaSupported,
-      loading: false,
-      loadingText: '',
-      backgroundRefreshing: false,
-      cacheRestoredAt: Date.now(),
-      syncStatus,
-      syncMessageKey,
-      syncMessage: t(syncMessageKey),
-      rootFolder: album.rootFolder,
-      folders: album.folders,
-      files: album.files,
-      metaFolderId: album.metaFolderId || null,
-      canWrite,
-      tagSchemaFileId,
-      tagSchema,
-      memberFilesById,
-      membersData,
-      activeFolderId:
-        sameActiveAlbum && folderIds.has(this.state.activeFolderId)
-          ? this.state.activeFolderId
-          : album.rootFolder.id,
-      selectedPhotoIds: nextSelectedIds,
-      lastClickedPhotoId:
-        sameActiveAlbum && fileIds.has(this.state.lastClickedPhotoId)
-          ? this.state.lastClickedPhotoId
-          : null,
-      focusedPhotoId:
-        sameActiveAlbum && fileIds.has(this.state.focusedPhotoId)
-          ? this.state.focusedPhotoId
-          : album.files[0]?.id || null,
-      lightboxPhotoId:
-        sameActiveAlbum && fileIds.has(this.state.lightboxPhotoId)
-          ? this.state.lightboxPhotoId
-          : null,
-      ...(sameActiveAlbum
-        ? {}
-        : {
-            quickView: 'all',
-            minRating: 0,
-            memberFilterId: null,
-            ratingScope: 'avg',
-            selectedTagIds: new Set(),
-            searchQuery: '',
-          }),
-      recentAlbums: recent,
-      modal: null,
-    });
+    this._startPageToken = album.startPageToken || '';
+    this._syncWatermark = album.syncWatermark || new Date().toISOString();
+    this._lastFullReconcileAt = Date.now();
+
+    this.setState(
+      {
+        mode: 'gdrive',
+        authType,
+        localMetaSupported,
+        loading: false,
+        loadingText: '',
+        backgroundRefreshing: false,
+        cacheRestoredAt: Date.now(),
+        syncStatus,
+        syncMessageKey,
+        syncMessage: t(syncMessageKey),
+        rootFolder: album.rootFolder,
+        folders: album.folders,
+        files: album.files,
+        metaFolderId: album.metaFolderId || null,
+        canWrite,
+        tagSchemaFileId,
+        tagSchema,
+        memberFilesById,
+        membersData,
+        activeFolderId:
+          sameActiveAlbum && folderIds.has(this.state.activeFolderId)
+            ? this.state.activeFolderId
+            : album.rootFolder.id,
+        selectedPhotoIds: nextSelectedIds,
+        lastClickedPhotoId:
+          sameActiveAlbum && this._fileById.has(this.state.lastClickedPhotoId)
+            ? this.state.lastClickedPhotoId
+            : null,
+        focusedPhotoId:
+          sameActiveAlbum && this._fileById.has(this.state.focusedPhotoId)
+            ? this.state.focusedPhotoId
+            : album.files[0]?.id || null,
+        lightboxPhotoId:
+          sameActiveAlbum && this._fileById.has(this.state.lightboxPhotoId)
+            ? this.state.lightboxPhotoId
+            : null,
+        ...(sameActiveAlbum
+          ? {}
+          : {
+              quickView: 'all',
+              minRating: 0,
+              memberFilterId: null,
+              ratingScope: 'avg',
+              selectedTagIds: new Set(),
+              searchQuery: '',
+            }),
+        recentAlbums: recent,
+        modal: null,
+      },
+      { type: 'full', _skipFileIndexRebuild: true }
+    );
   }
 
-  _scheduleAlbumCacheUpdate() {
+  _scheduleAlbumMetaOnlyCacheUpdate() {
     if (this.state.mode !== 'gdrive' || !this.state.folderId || !this.state.rootFolder) {
       return;
     }
@@ -817,10 +1029,7 @@ export class Store {
       if (this.state.mode !== 'gdrive' || this.state.folderId !== folderId || !this.state.rootFolder) {
         return;
       }
-      setCachedAlbum(authType, folderId, {
-        rootFolder: this.state.rootFolder,
-        folders: this.state.folders,
-        files: this.state.files,
+      saveCachedAlbumMetaOnly(authType, folderId, {
         metaFolderId: this.state.metaFolderId,
         canWrite: this.state.canWrite,
         tagSchemaFileId: this.state.tagSchemaFileId,
@@ -828,6 +1037,9 @@ export class Store {
         memberFilesById: this.state.memberFilesById,
         membersData: this.state.membersData,
         localMetaSupported: this.state.localMetaSupported,
+        startPageToken: this._startPageToken || '',
+        syncWatermark: this._syncWatermark || '',
+        lastFullReconcileAt: this._lastFullReconcileAt || 0,
       }).catch(() => {});
     }, 300);
   }
@@ -883,38 +1095,33 @@ export class Store {
     const cachedBeforeAuth = !forceRescan ? await getCachedAlbum('oauth', cleanFolderId) : null;
     if (reqSeq !== this.connectSeq) return false;
 
-    const isFreshCache =
-      Boolean(cachedBeforeAuth) &&
-      Date.now() - Number(cachedBeforeAuth.savedAt || 0) < ALBUM_CACHE_TTL_MS &&
-      cachedBeforeAuth.files.length > 0;
+    const hasUsableCache = Boolean(cachedBeforeAuth && cachedBeforeAuth.files?.length > 0);
 
     let keepVisible =
-      Boolean(cachedBeforeAuth) ||
+      hasUsableCache ||
       (this.state.mode === 'gdrive' &&
         this.state.folderId === cleanFolderId &&
         this.state.files.length > 0);
 
-    if (cachedBeforeAuth) {
+    if (hasUsableCache) {
       this._hydrateFromAlbumCache(cachedBeforeAuth, {
         authType: 'oauth',
         folderId: cleanFolderId,
         clientId: cleanClientId,
         user: existingSavedUser || this.state.currentUser,
-        syncStatus: isFreshCache ? (cachedBeforeAuth.canWrite ? 'synced' : 'readonly') : 'syncing',
-        syncMessageKey: isFreshCache ? 'store.syncFromCacheReady' : 'store.syncCachedRevalidating',
-        backgroundRefreshing: !isFreshCache,
+        syncStatus: 'syncing',
+        syncMessageKey: 'store.syncCachedRevalidating',
+        backgroundRefreshing: true,
       });
       this._updateUrlHash(cleanFolderId, cleanClientId);
-      if (!isFreshCache) {
-        this.toast(
-          t('store.loadedFromCacheToast', {
-            name: cachedBeforeAuth.rootFolder.name,
-            count: cachedBeforeAuth.files.length,
-          }),
-          'info',
-          2400
-        );
-      }
+      this.toast(
+        t('store.loadedFromCacheToast', {
+          name: cachedBeforeAuth.rootFolder.name,
+          count: cachedBeforeAuth.files.length,
+        }),
+        'info',
+        2400
+      );
     } else {
       this.setState({
         loading: !keepVisible,
@@ -965,8 +1172,8 @@ export class Store {
         savedOAuthUser: nextSavedUser,
       });
 
-      // Cache-first fast path: skip directory scan when cache is fresh; sync metadata lightly
-      if (isFreshCache) {
+      // Cache-first fast path: hydrate immediately and run background incremental sync
+      if (hasUsableCache) {
         const recent = this._recordRecentAlbum({
           folderId: cleanFolderId,
           name: cachedBeforeAuth.rootFolder.name,
@@ -974,48 +1181,8 @@ export class Store {
           clientId: cleanClientId,
           remember,
         });
-        this.setState({ recentAlbums: recent });
-        if (cachedBeforeAuth.metaFolderId) {
-          loadAlbumMetadata(cachedBeforeAuth.metaFolderId, session.accessToken)
-            .then(async (meta) => {
-              if (reqSeq !== this.connectSeq) return;
-              const { mergedMembers, mergedSchema } = this._mergeFreshWithLocalEdits(
-                this.state.membersData,
-                meta.membersData || {},
-                this.state.tagSchema,
-                meta.tagSchema || { version: 1, tags: {} },
-                session.user.id
-              );
-              const myId = session.user.id;
-              if (!mergedMembers[myId]) {
-                mergedMembers[myId] = {
-                  version: 1,
-                  member: { ...session.user, updatedAt: Date.now() },
-                  items: {},
-                };
-              }
-              this.setState({
-                tagSchemaFileId: meta.tagSchemaFileId,
-                memberFilesById: meta.memberFilesById,
-                tagSchema: mergedSchema,
-                membersData: mergedMembers,
-              });
-              await setCachedAlbum('oauth', cleanFolderId, {
-                rootFolder: this.state.rootFolder,
-                folders: this.state.folders,
-                files: this.state.files,
-                metaFolderId: this.state.metaFolderId,
-                canWrite: this.state.canWrite,
-                tagSchemaFileId: meta.tagSchemaFileId,
-                tagSchema: mergedSchema,
-                memberFilesById: meta.memberFilesById,
-                membersData: mergedMembers,
-                localMetaSupported: false,
-                savedAt: cachedBeforeAuth.savedAt,
-              });
-            })
-            .catch(() => {});
-        }
+        this.setState({ recentAlbums: recent }, { type: 'ui-only' });
+        this._performIncrementalSync({ reqSeq, showToast: false }).catch(() => {});
         return true;
       }
 
@@ -1119,6 +1286,9 @@ export class Store {
         memberFilesById: meta.memberFilesById,
         membersData,
         localMetaSupported: false,
+        startPageToken: album.startPageToken || '',
+        syncWatermark: album.syncWatermark || new Date().toISOString(),
+        lastFullReconcileAt: Date.now(),
       };
       await setCachedAlbum('oauth', cleanFolderId, savedSnapshot);
       if (reqSeq !== this.connectSeq) return false;
@@ -1223,94 +1393,39 @@ export class Store {
     const cached = !forceRescan ? await getCachedAlbum('apikey', cleanFolderId) : null;
     if (reqSeq !== this.connectSeq) return false;
 
-    const isFreshCache =
-      Boolean(cached) &&
-      Date.now() - Number(cached.savedAt || 0) < ALBUM_CACHE_TTL_MS &&
-      cached.files.length > 0;
+    const hasUsableCache = Boolean(cached && cached.files?.length > 0);
 
     const keepVisible =
-      Boolean(cached) ||
+      hasUsableCache ||
       (this.state.mode === 'gdrive' &&
         this.state.folderId === cleanFolderId &&
         this.state.files.length > 0);
 
-    if (cached) {
+    if (hasUsableCache) {
       this._hydrateFromAlbumCache(cached, {
         authType: 'apikey',
         folderId: cleanFolderId,
         apiKey: cleanApiKey,
         user,
-        syncStatus: isFreshCache ? (cached.localMetaSupported ? 'synced' : 'readonly') : 'syncing',
-        syncMessageKey: isFreshCache ? 'store.syncFromCacheReady' : 'store.syncCachedRevalidating',
-        backgroundRefreshing: !isFreshCache,
+        syncStatus: 'syncing',
+        syncMessageKey: 'store.syncCachedRevalidating',
+        backgroundRefreshing: true,
+      });
+      const recent = this._recordRecentAlbum({
+        folderId: cleanFolderId,
+        name: cached.rootFolder.name,
+        authType: 'apikey',
+        apiKey: cleanApiKey,
+        remember,
       });
       this.setState({
         nickname: cleanNick,
         rememberCredentials: remember,
         ...(remember ? {} : { savedOAuthUser: null }),
         accessToken: '',
+        recentAlbums: recent,
       });
       this._updateUrlHash(cleanFolderId, '');
-
-      if (isFreshCache) {
-        const recent = this._recordRecentAlbum({
-          folderId: cleanFolderId,
-          name: cached.rootFolder.name,
-          authType: 'apikey',
-          apiKey: cleanApiKey,
-          remember,
-        });
-        this.setState({ recentAlbums: recent });
-        loadLocalServerMeta(cleanFolderId)
-          .then(async (serverMeta) => {
-            if (reqSeq !== this.connectSeq || !serverMeta) return;
-            let tagSchema = serverMeta.tagSchema?.tags
-              ? { version: 1, tags: serverMeta.tagSchema.tags }
-              : { version: 1, tags: {} };
-            let membersData =
-              serverMeta.membersData && typeof serverMeta.membersData === 'object'
-                ? { ...serverMeta.membersData }
-                : {};
-            const merged = this._mergeFreshWithLocalEdits(
-              this.state.membersData,
-              membersData,
-              this.state.tagSchema,
-              tagSchema,
-              user.id
-            );
-            membersData = merged.mergedMembers;
-            tagSchema = merged.mergedSchema;
-            if (!membersData[user.id]) {
-              membersData[user.id] = {
-                version: 1,
-                member: { ...user, updatedAt: Date.now() },
-                items: {},
-              };
-            }
-            this.setState({
-              localMetaSupported: true,
-              tagSchema,
-              membersData,
-              syncStatus: 'synced',
-            });
-            await setCachedAlbum('apikey', cleanFolderId, {
-              rootFolder: this.state.rootFolder,
-              folders: this.state.folders,
-              files: this.state.files,
-              metaFolderId: null,
-              canWrite: true,
-              tagSchemaFileId: null,
-              tagSchema,
-              memberFilesById: {},
-              membersData,
-              localMetaSupported: true,
-              savedAt: cached.savedAt,
-            });
-          })
-          .catch(() => {});
-        return true;
-      }
-
       this.toast(
         t('store.loadedFromCacheToast', {
           name: cached.rootFolder.name,
@@ -1319,6 +1434,8 @@ export class Store {
         'info',
         2400
       );
+      this._performIncrementalSync({ reqSeq, showToast: false }).catch(() => {});
+      return true;
     } else {
       this.setState({
         loading: !keepVisible,
@@ -1453,6 +1570,9 @@ export class Store {
         memberFilesById: {},
         membersData,
         localMetaSupported,
+        startPageToken: '',
+        syncWatermark: album.syncWatermark || new Date().toISOString(),
+        lastFullReconcileAt: Date.now(),
       });
       if (reqSeq !== this.connectSeq) return false;
 
@@ -1608,6 +1728,10 @@ export class Store {
     const defaultNick = t('store.defaultNickname');
     const wasGdrive = this.state.mode === 'gdrive';
 
+    this._startPageToken = '';
+    this._syncWatermark = '';
+    this._lastFullReconcileAt = 0;
+
     this.setState({
       apiKey: '',
       clientId: '',
@@ -1631,9 +1755,447 @@ export class Store {
     this.toast(t('store.credsClearedToast'), 'info');
   }
 
-  async refreshAlbum() {
+  async _performIncrementalSync({ reqSeq, showToast = false } = {}) {
+    if (this.state.mode !== 'gdrive' || !this.state.folderId || !this.state.rootFolder) {
+      return false;
+    }
+    const authType = this.state.authType === 'oauth' ? 'oauth' : 'apikey';
+    const isOAuth = authType === 'oauth';
+    const folderId = this.state.folderId;
+    let accessToken = this.state.accessToken;
+
+    if (isOAuth && !accessToken) {
+      const cachedSess = this.state.clientId ? getCachedSession(this.state.clientId) : null;
+      if (cachedSess?.accessToken) {
+        accessToken = cachedSess.accessToken;
+        this.setState({ accessToken }, { type: 'ui-only' });
+      } else if (showToast && this.state.clientId) {
+        const sess = await authenticateGoogle(this.state.clientId, {
+          prompt: '',
+          loginHint: this.state.savedOAuthUser?.email || '',
+          remember: this.state.rememberCredentials,
+        });
+        if (reqSeq !== this.connectSeq) return false;
+        accessToken = sess.accessToken;
+        this.setState(
+          { accessToken, currentUser: sess.user },
+          { type: 'ui-only' }
+        );
+      } else {
+        this.setState(
+          {
+            backgroundRefreshing: false,
+            syncStatus: 'readonly',
+            syncMessageKey: 'store.syncCachedSessionExpired',
+            syncMessage: t('store.syncCachedSessionExpired'),
+          },
+          { type: 'ui-only' }
+        );
+        return false;
+      }
+    }
+
+    this.setState(
+      {
+        backgroundRefreshing: true,
+        syncStatus: 'syncing',
+        syncMessageKey: 'store.syncIncremental',
+        syncMessage: t('store.syncIncremental'),
+      },
+      { type: 'ui-only' }
+    );
+
+    try {
+      const watermark =
+        this._syncWatermark ||
+        (this.state.cacheRestoredAt ? new Date(this.state.cacheRestoredAt).toISOString() : '');
+
+      const res = await syncAlbumIncremental({
+        rootFolder: this.state.rootFolder,
+        existingFolders: this.state.folders,
+        existingFileIds: new Set(this._fileById.keys()),
+        auth: isOAuth ? { accessToken } : { apiKey: this.state.apiKey },
+        startPageToken: this._startPageToken || '',
+        syncWatermark: watermark,
+        lastFullReconcileAt: this._lastFullReconcileAt || 0,
+        forceFullReconcile: false,
+        captureMetaFolder: isOAuth,
+      });
+      if (reqSeq !== this.connectSeq) return false;
+
+      if (res?.mode === 'fallback-full') {
+        if (res.fullResult) {
+          const fullAlbum = {
+            rootFolder: res.fullResult.rootFolder || this.state.rootFolder,
+            folders: res.fullResult.folders || this.state.folders,
+            files: res.fullResult.files || [],
+            metaFolderId: res.fullResult.metaFolderId ?? this.state.metaFolderId,
+            canWrite:
+              typeof res.fullResult.canWrite === 'boolean'
+                ? res.fullResult.canWrite
+                : this.state.canWrite,
+            startPageToken: res.nextStartPageToken || res.fullResult.startPageToken || '',
+            syncWatermark:
+              res.nextWatermark || res.fullResult.syncWatermark || new Date().toISOString(),
+          };
+
+          let membersData = this.state.membersData || {};
+          let tagSchema = this.state.tagSchema || { version: 1, tags: {} };
+          let tagSchemaFileId = this.state.tagSchemaFileId;
+          let memberFilesById = this.state.memberFilesById || {};
+          let localMetaSupported = this.state.localMetaSupported;
+          const myId = this.state.currentUser?.id;
+
+          if (isOAuth && fullAlbum.metaFolderId) {
+            const meta = await loadAlbumMetadata(fullAlbum.metaFolderId, accessToken);
+            if (reqSeq !== this.connectSeq) return false;
+            const merged = this._mergeFreshWithLocalEdits(
+              membersData,
+              meta.membersData || {},
+              tagSchema,
+              meta.tagSchema || { version: 1, tags: {} },
+              myId
+            );
+            membersData = merged.mergedMembers;
+            tagSchema = merged.mergedSchema;
+            tagSchemaFileId = meta.tagSchemaFileId;
+            memberFilesById = meta.memberFilesById;
+          } else if (!isOAuth) {
+            const serverMeta = await loadLocalServerMeta(folderId);
+            if (reqSeq !== this.connectSeq) return false;
+            if (serverMeta) {
+              localMetaSupported = true;
+              const merged = this._mergeFreshWithLocalEdits(
+                membersData,
+                serverMeta.membersData || {},
+                tagSchema,
+                serverMeta.tagSchema?.tags ? { version: 1, tags: serverMeta.tagSchema.tags } : { version: 1, tags: {} },
+                myId
+              );
+              membersData = merged.mergedMembers;
+              tagSchema = merged.mergedSchema;
+            }
+          }
+
+          await setCachedAlbum(authType, folderId, {
+            rootFolder: fullAlbum.rootFolder,
+            folders: fullAlbum.folders,
+            files: fullAlbum.files,
+            metaFolderId: fullAlbum.metaFolderId,
+            canWrite: fullAlbum.canWrite,
+            tagSchemaFileId,
+            tagSchema,
+            memberFilesById,
+            membersData,
+            localMetaSupported,
+            startPageToken: fullAlbum.startPageToken,
+            syncWatermark: fullAlbum.syncWatermark,
+            lastFullReconcileAt: Number(res.lastFullReconcileAt || Date.now()),
+          });
+          if (reqSeq !== this.connectSeq) return false;
+
+          const msgKey = isOAuth
+            ? fullAlbum.canWrite
+              ? 'store.syncOAuthSynced'
+              : 'store.syncReadonly'
+            : localMetaSupported
+              ? 'store.syncApiKeySynced'
+              : 'store.syncApiKeyLocal';
+
+          this._commitLoadedAlbumState({
+            authType,
+            folderId,
+            album: fullAlbum,
+            tagSchema,
+            tagSchemaFileId,
+            memberFilesById,
+            membersData,
+            canWrite: fullAlbum.canWrite,
+            localMetaSupported,
+            syncStatus: isOAuth ? (fullAlbum.canWrite ? 'synced' : 'readonly') : localMetaSupported ? 'synced' : 'readonly',
+            syncMessageKey: msgKey,
+            recent: this.state.recentAlbums,
+          });
+          if (showToast) {
+            this.toast(
+              t('store.loadedAlbumToast', {
+                name: fullAlbum.rootFolder.name,
+                count: fullAlbum.files.length,
+              }),
+              'success'
+            );
+          }
+          return true;
+        }
+
+        if (isOAuth) {
+          return this.connectGoogleDrive({
+            clientId: this.state.clientId,
+            folderInput: folderId,
+            reuseSession: true,
+            rememberCredentials: this.state.rememberCredentials,
+            forceRescan: true,
+          });
+        }
+        return this.connectWithApiKey({
+          apiKey: this.state.apiKey,
+          folderInput: folderId,
+          nickname: this.state.nickname || this.state.currentUser?.name,
+          rememberCredentials: this.state.rememberCredentials,
+          forceRescan: true,
+        });
+      }
+
+      if (res.nextStartPageToken !== undefined && res.nextStartPageToken !== null) {
+        this._startPageToken = res.nextStartPageToken;
+      }
+      if (res.nextWatermark) {
+        this._syncWatermark = res.nextWatermark;
+      }
+      if (res.lastFullReconcileAt) {
+        this._lastFullReconcileAt = Number(res.lastFullReconcileAt);
+      }
+
+      const removedSet = new Set(res.removedFileIds || []);
+      const upsertedMap = new Map();
+      const normalizedUpserted = [];
+      for (const rawFile of res.upsertedFiles || []) {
+        const norm = this._normalizeFileRecord(rawFile);
+        if (norm && norm.id) {
+          upsertedMap.set(norm.id, norm);
+          normalizedUpserted.push(norm);
+        }
+      }
+      const deltaCount = upsertedMap.size + removedSet.size;
+
+      let nextFiles = this.state.files;
+      if (deltaCount > 0) {
+        nextFiles = [];
+        const pendingReplace = new Map(upsertedMap);
+        for (let i = 0; i < this.state.files.length; i += 1) {
+          const f = this.state.files[i];
+          if (removedSet.has(f.id)) continue;
+          const replacement = pendingReplace.get(f.id);
+          if (replacement) {
+            nextFiles.push(replacement);
+            pendingReplace.delete(f.id);
+          } else {
+            nextFiles.push(f);
+          }
+        }
+        for (const added of pendingReplace.values()) {
+          nextFiles.push(added);
+        }
+      }
+
+      const nextFolders =
+        Array.isArray(res.folders) && res.folders.length > 0 ? res.folders : this.state.folders;
+      const nextMetaFolderId = res.metaFolderId || this.state.metaFolderId;
+
+      let membersData = this.state.membersData || {};
+      let tagSchema = this.state.tagSchema || { version: 1, tags: {} };
+      let tagSchemaFileId = this.state.tagSchemaFileId;
+      let memberFilesById = this.state.memberFilesById || {};
+      let localMetaSupported = this.state.localMetaSupported;
+      let metaChanged = false;
+      const myId = this.state.currentUser?.id;
+
+      if (isOAuth && nextMetaFolderId) {
+        try {
+          const meta = await loadAlbumMetadata(nextMetaFolderId, accessToken);
+          if (reqSeq !== this.connectSeq) return false;
+          const merged = this._mergeFreshWithLocalEdits(
+            membersData,
+            meta.membersData || {},
+            tagSchema,
+            meta.tagSchema || { version: 1, tags: {} },
+            myId
+          );
+          membersData = merged.mergedMembers;
+          tagSchema = merged.mergedSchema;
+          tagSchemaFileId = meta.tagSchemaFileId;
+          memberFilesById = meta.memberFilesById;
+          if (myId && !membersData[myId]) {
+            membersData[myId] = {
+              version: 1,
+              member: { ...this.state.currentUser, updatedAt: Date.now() },
+              items: {},
+            };
+          }
+          metaChanged = true;
+        } catch {
+          // Non-fatal; keep existing local metadata
+        }
+      } else if (!isOAuth) {
+        try {
+          const serverMeta = await loadLocalServerMeta(folderId);
+          if (reqSeq !== this.connectSeq) return false;
+          if (serverMeta) {
+            localMetaSupported = true;
+            const remoteSchema = serverMeta.tagSchema?.tags
+              ? { version: 1, tags: serverMeta.tagSchema.tags }
+              : { version: 1, tags: {} };
+            const remoteMembers =
+              serverMeta.membersData && typeof serverMeta.membersData === 'object'
+                ? { ...serverMeta.membersData }
+                : {};
+            const merged = this._mergeFreshWithLocalEdits(
+              membersData,
+              remoteMembers,
+              tagSchema,
+              remoteSchema,
+              myId
+            );
+            membersData = merged.mergedMembers;
+            tagSchema = merged.mergedSchema;
+            if (myId && !membersData[myId]) {
+              membersData[myId] = {
+                version: 1,
+                member: { ...this.state.currentUser, updatedAt: Date.now() },
+                items: {},
+              };
+            }
+            try {
+              localStorage.setItem(
+                `drivelens_apikey_meta_${folderId}`,
+                JSON.stringify({ tagSchema, membersData })
+              );
+            } catch {
+              // Ignore
+            }
+            metaChanged = true;
+          }
+        } catch {
+          // Non-fatal
+        }
+      }
+
+      const metaPatch = {
+        rootFolder: this.state.rootFolder,
+        folders: nextFolders,
+        metaFolderId: nextMetaFolderId,
+        canWrite: this.state.canWrite,
+        tagSchemaFileId,
+        tagSchema,
+        memberFilesById,
+        membersData,
+        localMetaSupported,
+        startPageToken: this._startPageToken,
+        syncWatermark: this._syncWatermark,
+        lastFullReconcileAt: this._lastFullReconcileAt,
+      };
+
+      await applyCachedAlbumDelta(authType, folderId, {
+        upsertedFiles: normalizedUpserted,
+        removedFileIds: res.removedFileIds || [],
+        metaPatch,
+      }).catch(() => {});
+      if (reqSeq !== this.connectSeq) return false;
+
+      if (deltaCount > 0) {
+        this._rebuildFileIndex(nextFiles);
+      }
+
+      const folderIds = new Set(nextFolders.map((f) => f.id));
+      const nextSelectedIds =
+        removedSet.size > 0
+          ? new Set(Array.from(this.state.selectedPhotoIds).filter((id) => this._fileById.has(id)))
+          : this.state.selectedPhotoIds;
+
+      const syncStatus = isOAuth
+        ? this.state.canWrite
+          ? 'synced'
+          : 'readonly'
+        : localMetaSupported
+          ? 'synced'
+          : 'readonly';
+      const syncMessageKey = isOAuth
+        ? this.state.canWrite
+          ? 'store.syncOAuthSynced'
+          : 'store.syncReadonly'
+        : localMetaSupported
+          ? 'store.syncApiKeySynced'
+          : 'store.syncApiKeyLocal';
+
+      const foldersChanged = nextFolders.length !== this.state.folders.length || nextFolders !== this.state.folders;
+      const changeType = deltaCount > 0 || foldersChanged || metaChanged ? 'full' : 'ui-only';
+
+      this.setState(
+        {
+          backgroundRefreshing: false,
+          cacheRestoredAt: Date.now(),
+          syncStatus,
+          syncMessageKey,
+          syncMessage: t(syncMessageKey),
+          folders: nextFolders,
+          files: nextFiles,
+          metaFolderId: nextMetaFolderId,
+          tagSchemaFileId,
+          tagSchema,
+          memberFilesById,
+          membersData,
+          localMetaSupported,
+          activeFolderId: folderIds.has(this.state.activeFolderId)
+            ? this.state.activeFolderId
+            : this.state.rootFolder.id,
+          selectedPhotoIds: nextSelectedIds,
+          lastClickedPhotoId: this._fileById.has(this.state.lastClickedPhotoId)
+            ? this.state.lastClickedPhotoId
+            : null,
+          focusedPhotoId: this._fileById.has(this.state.focusedPhotoId)
+            ? this.state.focusedPhotoId
+            : nextFiles[0]?.id || null,
+          lightboxPhotoId: this._fileById.has(this.state.lightboxPhotoId)
+            ? this.state.lightboxPhotoId
+            : null,
+        },
+        { type: changeType, _skipFileIndexRebuild: true }
+      );
+
+      if (showToast) {
+        if (deltaCount > 0) {
+          this.toast(t('toast.syncUpdated', { count: deltaCount }), 'success');
+        } else {
+          this.toast(t('toast.syncUpToDate'), 'info');
+        }
+      }
+      return true;
+    } catch (err) {
+      if (reqSeq !== this.connectSeq) return false;
+      this.setState(
+        {
+          backgroundRefreshing: false,
+          syncStatus: showToast ? 'error' : 'readonly',
+          syncMessageKey: showToast
+            ? isOAuth
+              ? 'store.syncErrorAuth'
+              : 'store.syncErrorLocal'
+            : 'store.syncOfflineCached',
+          syncMessage: t(
+            showToast
+              ? isOAuth
+                ? 'store.syncErrorAuth'
+                : 'store.syncErrorLocal'
+              : 'store.syncOfflineCached'
+          ),
+        },
+        { type: 'ui-only' }
+      );
+      if (showToast) {
+        this.toast(err?.message || t('store.connectFailed'), 'error', 5000);
+      }
+      return false;
+    }
+  }
+
+  async refreshAlbum({ fullRescan = false } = {}) {
     if (this.state.mode !== 'gdrive') {
       this.toast(t('store.refreshDemoNotice'), 'info');
+      return;
+    }
+    if (!fullRescan && this.state.files.length > 0 && this.state.rootFolder) {
+      const reqSeq = ++this.connectSeq;
+      await this._performIncrementalSync({ reqSeq, showToast: true });
       return;
     }
     if (this.state.authType === 'apikey') {
@@ -1658,6 +2220,9 @@ export class Store {
   disconnectGoogleDrive() {
     this.connectSeq += 1;
     clearSession();
+    this._startPageToken = '';
+    this._syncWatermark = '';
+    this._lastFullReconcileAt = 0;
     this.setState({ accessToken: '', localMetaSupported: false, backgroundRefreshing: false });
     this.loadDemoMode(true, true);
   }
@@ -1738,20 +2303,27 @@ export class Store {
     const membersData = this.state.membersData || {};
     const tagSchema = this.state.tagSchema;
     const myId = this.state.currentUser?.id || 'me';
-    const refs = this._aggMetaRefs;
-    if (
-      !refs ||
-      refs.membersData !== membersData ||
-      refs.tagSchema !== tagSchema ||
-      refs.myId !== myId
-    ) {
+
+    if (this._itemsByPhotoIdRef !== membersData) {
+      this._rebuildItemsByPhotoId(membersData);
       this._aggMetaCache.clear();
       this._aggMetaRefs = { membersData, tagSchema, myId };
-    } else if (this._aggMetaCache.has(fileId)) {
-      return this._aggMetaCache.get(fileId);
+    } else {
+      const refs = this._aggMetaRefs;
+      if (!refs || refs.tagSchema !== tagSchema || refs.myId !== myId) {
+        this._aggMetaCache.clear();
+        this._aggMetaRefs = { membersData, tagSchema, myId };
+      }
     }
 
-    const membersEntries = Object.entries(membersData);
+    const perPhoto = this._itemsByPhotoId.get(fileId);
+    if (!perPhoto || perPhoto.size === 0) {
+      return EMPTY_META;
+    }
+
+    const cached = this._aggMetaCache.get(fileId);
+    if (cached) return cached;
+
     const ratingsByMember = [];
     const notesByMember = [];
     const tagLatest = new Map();
@@ -1763,9 +2335,12 @@ export class Store {
     let myFavorite = false;
     let myNote = '';
 
-    for (const [memberId, record] of membersEntries) {
-      const memberInfo = record?.member || { id: memberId, name: memberId, color: '#60a5fa' };
-      const item = record?.items?.[fileId];
+    for (const [memberId, item] of perPhoto.entries()) {
+      const memberInfo = membersData[memberId]?.member || {
+        id: memberId,
+        name: memberId,
+        color: '#60a5fa',
+      };
       const rating = Number(item?.rating || 0);
       const favorite = Boolean(item?.favorite);
       const note = String(item?.note || '');
@@ -1812,7 +2387,7 @@ export class Store {
       }
     }
 
-    const schemaTags = this.state.tagSchema?.tags || {};
+    const schemaTags = tagSchema?.tags || {};
     const activeTagIds = [];
     for (const [tagId, status] of tagLatest.entries()) {
       const def = schemaTags[tagId];
@@ -1821,9 +2396,11 @@ export class Store {
       }
     }
 
-    ratingsByMember.sort((a, b) =>
-      a.member.id === myId ? -1 : b.member.id === myId ? 1 : b.rating - a.rating
-    );
+    if (ratingsByMember.length > 1) {
+      ratingsByMember.sort((a, b) =>
+        a.member.id === myId ? -1 : b.member.id === myId ? 1 : b.rating - a.rating
+      );
+    }
 
     const result = {
       myRating,
@@ -1837,6 +2414,50 @@ export class Store {
       activeTagIds,
     };
     this._aggMetaCache.set(fileId, result);
+    return result;
+  }
+
+  getLibraryStats() {
+    const files = this.state.files || [];
+    const totalCount = files.length;
+    const membersData = this.state.membersData || {};
+    const tagSchema = this.state.tagSchema;
+    const myId = this.state.currentUser?.id || 'me';
+
+    if (this._itemsByPhotoIdRef !== membersData) {
+      this._rebuildItemsByPhotoId(membersData);
+    }
+
+    const cached = this._libraryStatsCache;
+    if (
+      cached &&
+      cached.files === files &&
+      cached.filesLen === totalCount &&
+      cached.membersData === membersData &&
+      cached.tagSchema === tagSchema &&
+      cached.myId === myId
+    ) {
+      return cached.result;
+    }
+
+    let favTotal = 0;
+    let ratedExistingCount = 0;
+    for (const photoId of this._itemsByPhotoId.keys()) {
+      if (!this._fileById.has(photoId)) continue;
+      const meta = this.getAggregatedItemMeta(photoId);
+      if (meta.favoriteCount > 0) favTotal += 1;
+      if (meta.ratingCount > 0) ratedExistingCount += 1;
+    }
+    const unratedTotal = Math.max(0, totalCount - ratedExistingCount);
+    const result = { totalCount, favTotal, unratedTotal };
+    this._libraryStatsCache = {
+      files,
+      filesLen: totalCount,
+      membersData,
+      tagSchema,
+      myId,
+      result,
+    };
     return result;
   }
 
@@ -1880,9 +2501,14 @@ export class Store {
   }
 
   getTagCounts() {
+    const membersData = this.state.membersData || {};
+    if (this._itemsByPhotoIdRef !== membersData) {
+      this._rebuildItemsByPhotoId(membersData);
+    }
     const counts = {};
-    for (const file of this.state.files) {
-      const meta = this.getAggregatedItemMeta(file.id);
+    for (const photoId of this._itemsByPhotoId.keys()) {
+      if (!this._fileById.has(photoId)) continue;
+      const meta = this.getAggregatedItemMeta(photoId);
       for (const tagId of meta.activeTagIds) {
         counts[tagId] = (counts[tagId] || 0) + 1;
       }
@@ -1915,6 +2541,17 @@ export class Store {
     const myId = currentUser?.id || '';
     const tagList = Array.from(selectedTagIds);
     const tagKey = tagList.length > 0 ? [...tagList].sort().join(',') : '';
+    const query = searchQuery.trim().toLowerCase();
+    const dependsOnMeta =
+      quickView === 'favorites' ||
+      quickView === 'unrated' ||
+      minRating > 0 ||
+      Boolean(memberFilterId) ||
+      tagList.length > 0 ||
+      sortBy === 'ratingDesc' ||
+      sortBy === 'ratingAsc' ||
+      Boolean(query);
+
     const cached = this._visiblePhotosCache;
     if (
       cached &&
@@ -1922,9 +2559,10 @@ export class Store {
       cached.filesLen === files.length &&
       cached.folders === folders &&
       cached.foldersLen === folders.length &&
-      cached.membersData === membersData &&
-      cached.tagSchema === tagSchema &&
-      cached.myId === myId &&
+      (!dependsOnMeta ||
+        (cached.membersData === membersData &&
+          cached.tagSchema === tagSchema &&
+          cached.myId === myId)) &&
       cached.activeFolderId === activeFolderId &&
       cached.includeSubfolders === includeSubfolders &&
       cached.quickView === quickView &&
@@ -1948,25 +2586,40 @@ export class Store {
         : new Set([activeFolderId])
       : null;
 
-    const query = searchQuery.trim().toLowerCase();
     const schemaTags = tagSchema?.tags || {};
     const locale = getLocaleTag();
+    const sortByRating = sortBy === 'ratingDesc' || sortBy === 'ratingAsc';
+    const nameCollator =
+      sortBy === 'nameAsc' || sortBy === 'nameDesc' ? getNameCollator(locale) : null;
+    const activeTagSet = tagList.length > 0 ? new Set(tagList) : null;
+    const memberItemsMap =
+      ratingScope === 'member' && memberFilterId
+        ? membersData?.[memberFilterId]?.items || null
+        : null;
 
     const matched = [];
-    for (const file of files) {
+    for (let i = 0; i < files.length; i += 1) {
+      const file = files[i];
       if (allowedFolderIds && !allowedFolderIds.has(file.parentId)) continue;
 
-      const isVideo = Boolean(file.mimeType && file.mimeType.startsWith('video/'));
+      const isVideo =
+        typeof file._isVideo === 'boolean'
+          ? file._isVideo
+          : Boolean(file.mimeType && file.mimeType.startsWith('video/'));
       if (mediaFilter === 'photo' && isVideo) continue;
       if (mediaFilter === 'video' && !isVideo) continue;
 
       if (aspectFilter && aspectFilter !== 'all') {
-        const w = Number(file.imageMediaMetadata?.width || file.videoMediaMetadata?.width || 0);
-        const h = Number(file.imageMediaMetadata?.height || file.videoMediaMetadata?.height || 0);
-        const ratio = w > 0 && h > 0 ? w / h : 1.5;
+        const ratio =
+          typeof file._aspect === 'number' ? file._aspect : normalizeAspectRatio(file);
         if (aspectFilter === 'landscape' && ratio <= 1.08) continue;
         if (aspectFilter === 'portrait' && ratio >= 0.92) continue;
         if (aspectFilter === 'square' && (ratio < 0.92 || ratio > 1.08)) continue;
+      }
+
+      if (!dependsOnMeta) {
+        matched.push(file);
+        continue;
       }
 
       const meta = this.getAggregatedItemMeta(file.id);
@@ -1975,7 +2628,7 @@ export class Store {
       if (quickView === 'unrated' && meta.ratingCount > 0) continue;
 
       if (ratingScope === 'member' && memberFilterId) {
-        const memberItem = this.state.membersData?.[memberFilterId]?.items?.[file.id];
+        const memberItem = memberItemsMap?.[file.id];
         const mRating = Number(memberItem?.rating || 0);
         const mFav = Boolean(memberItem?.favorite);
         const mNote = String(memberItem?.note || '').trim();
@@ -1989,59 +2642,110 @@ export class Store {
         if (targetScore < minRating) continue;
       }
 
-      if (tagList.length > 0) {
-        const activeSet = new Set(meta.activeTagIds);
-        const ok =
-          tagMatchMode === 'AND'
-            ? tagList.every((tid) => activeSet.has(tid))
-            : tagList.some((tid) => activeSet.has(tid));
-        if (!ok) continue;
+      if (activeTagSet) {
+        const itemTags = meta.activeTagIds;
+        if (tagMatchMode === 'AND') {
+          if (itemTags.length < tagList.length) continue;
+          const itemSet = new Set(itemTags);
+          let allOk = true;
+          for (let k = 0; k < tagList.length; k += 1) {
+            if (!itemSet.has(tagList[k])) {
+              allOk = false;
+              break;
+            }
+          }
+          if (!allOk) continue;
+        } else {
+          let anyOk = false;
+          for (let k = 0; k < itemTags.length; k += 1) {
+            if (activeTagSet.has(itemTags[k])) {
+              anyOk = true;
+              break;
+            }
+          }
+          if (!anyOk) continue;
+        }
       }
 
       if (query) {
-        const exif = file.imageMediaMetadata || {};
-        const camText = `${exif.cameraMake || ''} ${exif.cameraModel || ''} ${exif.focalLength ? `${exif.focalLength}mm` : ''} ${exif.isoSpeed ? `iso${exif.isoSpeed}` : ''}`;
-        const notesText = meta.notesByMember.map((n) => n.note).join(' ');
-        const tagNames = meta.activeTagIds.map((id) => schemaTags[id]?.name || '').join(' ');
-        const ts = getPhotoTimestamp(file);
-        const dateStr = ts > 0 ? new Date(ts).toISOString().slice(0, 10) : '';
-        const dateSlash = dateStr ? dateStr.replace(/-/g, '/') : '';
-        const haystack = `${file.name} ${camText} ${notesText} ${tagNames} ${dateStr} ${dateSlash}`.toLowerCase();
-        if (!haystack.includes(query)) continue;
+        let baseHaystack = file._searchHaystack;
+        if (typeof baseHaystack !== 'string') {
+          const exif = file.imageMediaMetadata || {};
+          const camText = `${exif.cameraMake || ''} ${exif.cameraModel || ''} ${exif.focalLength ? `${exif.focalLength}mm` : ''} ${exif.isoSpeed ? `iso${exif.isoSpeed}` : ''}`;
+          const ts = getPhotoTimestamp(file);
+          const dateStr = ts > 0 ? new Date(ts).toISOString().slice(0, 10) : '';
+          const dateSlash = dateStr ? dateStr.replace(/-/g, '/') : '';
+          baseHaystack = `${file.name || ''} ${camText} ${dateStr} ${dateSlash}`.toLowerCase();
+          file._searchHaystack = baseHaystack;
+        }
+        if (!baseHaystack.includes(query)) {
+          let extraMatch = false;
+          if (meta.notesByMember.length > 0) {
+            for (let k = 0; k < meta.notesByMember.length; k += 1) {
+              if (meta.notesByMember[k].note.toLowerCase().includes(query)) {
+                extraMatch = true;
+                break;
+              }
+            }
+          }
+          if (!extraMatch && meta.activeTagIds.length > 0) {
+            for (let k = 0; k < meta.activeTagIds.length; k += 1) {
+              const tName = schemaTags[meta.activeTagIds[k]]?.name;
+              if (tName && tName.toLowerCase().includes(query)) {
+                extraMatch = true;
+                break;
+              }
+            }
+          }
+          if (!extraMatch) continue;
+        }
       }
 
-      matched.push({ file, meta });
+      if (sortByRating) {
+        matched.push({
+          file,
+          avgRating: meta.avgRating,
+          ratingCount: meta.ratingCount,
+          ts: getPhotoTimestamp(file),
+        });
+      } else {
+        matched.push(file);
+      }
     }
 
-    matched.sort((a, b) => {
-      switch (sortBy) {
-        case 'dateAsc':
-          return getPhotoTimestamp(a.file) - getPhotoTimestamp(b.file);
-        case 'ratingDesc': {
-          const diff = b.meta.avgRating - a.meta.avgRating;
+    if (sortByRating) {
+      matched.sort((a, b) => {
+        if (sortBy === 'ratingDesc') {
+          const diff = b.avgRating - a.avgRating;
           if (Math.abs(diff) > 0.001) return diff;
-          return b.meta.ratingCount - a.meta.ratingCount || getPhotoTimestamp(b.file) - getPhotoTimestamp(a.file);
+          return b.ratingCount - a.ratingCount || b.ts - a.ts;
         }
-        case 'ratingAsc': {
-          const diff = a.meta.avgRating - b.meta.avgRating;
-          if (Math.abs(diff) > 0.001) return diff;
-          return a.meta.ratingCount - b.meta.ratingCount || getPhotoTimestamp(a.file) - getPhotoTimestamp(b.file);
+        const diff = a.avgRating - b.avgRating;
+        if (Math.abs(diff) > 0.001) return diff;
+        return a.ratingCount - b.ratingCount || a.ts - b.ts;
+      });
+    } else {
+      matched.sort((a, b) => {
+        switch (sortBy) {
+          case 'dateAsc':
+            return getPhotoTimestamp(a) - getPhotoTimestamp(b);
+          case 'nameAsc':
+            return nameCollator.compare(a.name || '', b.name || '');
+          case 'nameDesc':
+            return nameCollator.compare(b.name || '', a.name || '');
+          case 'sizeDesc':
+            return (b.size || 0) - (a.size || 0);
+          case 'sizeAsc':
+            return (a.size || 0) - (b.size || 0);
+          case 'dateDesc':
+          default:
+            return getPhotoTimestamp(b) - getPhotoTimestamp(a);
         }
-        case 'nameAsc':
-          return a.file.name.localeCompare(b.file.name, locale);
-        case 'nameDesc':
-          return b.file.name.localeCompare(a.file.name, locale);
-        case 'sizeDesc':
-          return (b.file.size || 0) - (a.file.size || 0);
-        case 'sizeAsc':
-          return (a.file.size || 0) - (b.file.size || 0);
-        case 'dateDesc':
-        default:
-          return getPhotoTimestamp(b.file) - getPhotoTimestamp(a.file);
-      }
-    });
+      });
+    }
 
-    const result = matched.map((x) => x.file);
+    const result = sortByRating ? matched.map((x) => x.file) : matched;
+    this.visiblePhotosVersion += 1;
     this._visiblePhotosCache = {
       files,
       filesLen: files.length,
@@ -2088,7 +2792,7 @@ export class Store {
     };
   }
 
-  _persistChanges({ memberDirty = false, schemaDirty = false }) {
+  _persistChanges({ memberDirty = false, schemaDirty = false, deferEmit = false }) {
     if (this.state.mode === 'demo') {
       saveDemoState({
         tagSchema: this.state.tagSchema,
@@ -2098,7 +2802,15 @@ export class Store {
       return;
     }
 
-    this._scheduleAlbumCacheUpdate();
+    this._scheduleAlbumMetaOnlyCacheUpdate();
+
+    const applySyncPatch = (syncPatch) => {
+      if (deferEmit) {
+        this.state = { ...this.state, ...syncPatch };
+      } else {
+        this.setState(syncPatch, { type: 'ui-only' });
+      }
+    };
 
     if (this.state.mode === 'gdrive' && this.state.authType === 'apikey') {
       try {
@@ -2114,7 +2826,7 @@ export class Store {
       }
 
       if (!this.state.localMetaSupported) {
-        this.setState({
+        applySyncPatch({
           syncStatus: 'readonly',
           syncMessageKey: 'store.syncApiKeyLocal',
           syncMessage: t('store.syncApiKeyLocal'),
@@ -2125,7 +2837,7 @@ export class Store {
       if (memberDirty || schemaDirty) {
         clearTimeout(this.memberSyncTimer);
         clearTimeout(this.schemaSyncTimer);
-        this.setState({
+        applySyncPatch({
           syncStatus: 'syncing',
           syncMessageKey: 'store.syncSavingRatings',
           syncMessage: t('store.syncSavingRatings'),
@@ -2151,7 +2863,7 @@ export class Store {
       } catch {
         // Ignore
       }
-      this.setState({
+      applySyncPatch({
         syncStatus: 'readonly',
         syncMessageKey: 'store.syncReadonlySaved',
         syncMessage: t('store.syncReadonlySaved'),
@@ -2161,7 +2873,7 @@ export class Store {
 
     if (memberDirty) {
       clearTimeout(this.memberSyncTimer);
-      this.setState({
+      applySyncPatch({
         syncStatus: 'syncing',
         syncMessageKey: 'store.syncSavingRatings',
         syncMessage: t('store.syncSavingRatings'),
@@ -2171,7 +2883,7 @@ export class Store {
 
     if (schemaDirty) {
       clearTimeout(this.schemaSyncTimer);
-      this.setState({
+      applySyncPatch({
         syncStatus: 'syncing',
         syncMessageKey: 'store.syncSavingTags',
         syncMessage: t('store.syncSavingTags'),
@@ -2234,6 +2946,7 @@ export class Store {
         syncMessageKey: 'store.syncApiKeySynced',
         syncMessage: t('store.syncApiKeySynced'),
       });
+      this._scheduleAlbumMetaOnlyCacheUpdate();
     } catch (err) {
       this.setState({
         syncStatus: 'error',
@@ -2262,13 +2975,17 @@ export class Store {
         payload,
         accessToken: this.state.accessToken,
       });
-      this.setState({
-        metaFolderId: res.metaFolderId,
-        memberFilesById: { ...this.state.memberFilesById, [myId]: res.fileId },
-        syncStatus: 'synced',
-        syncMessageKey: 'store.syncOAuthUpdated',
-        syncMessage: t('store.syncOAuthUpdated'),
-      });
+      this.setState(
+        {
+          metaFolderId: res.metaFolderId,
+          memberFilesById: { ...this.state.memberFilesById, [myId]: res.fileId },
+          syncStatus: 'synced',
+          syncMessageKey: 'store.syncOAuthUpdated',
+          syncMessage: t('store.syncOAuthUpdated'),
+        },
+        { type: 'ui-only' }
+      );
+      this._scheduleAlbumMetaOnlyCacheUpdate();
     } catch (err) {
       this.setState({
         syncStatus: 'error',
@@ -2300,6 +3017,7 @@ export class Store {
         syncMessageKey: 'store.syncTagsUpdated',
         syncMessage: t('store.syncTagsUpdated'),
       });
+      this._scheduleAlbumMetaOnlyCacheUpdate();
     } catch (err) {
       this.setState({
         syncStatus: 'error',
@@ -2308,6 +3026,36 @@ export class Store {
       });
       this.toast(err?.message || t('store.syncTagsFailed'), 'error');
     }
+  }
+
+  _commitLocalItemEdits(ids, myId, record) {
+    if (this._itemsByPhotoIdRef !== this.state.membersData) {
+      this._rebuildItemsByPhotoId(this.state.membersData);
+    }
+    const mutatedSet = new Set(ids);
+    for (const fid of mutatedSet) {
+      let perPhoto = this._itemsByPhotoId.get(fid);
+      if (!perPhoto) {
+        perPhoto = new Map();
+        this._itemsByPhotoId.set(fid, perPhoto);
+      }
+      perPhoto.set(myId, record.items[fid]);
+      this._aggMetaCache.delete(fid);
+    }
+    const nextMembersData = { ...this.state.membersData, [myId]: record };
+    this._itemsByPhotoIdRef = nextMembersData;
+    if (this._aggMetaRefs) {
+      this._aggMetaRefs.membersData = nextMembersData;
+    }
+    this._libraryStatsCache = null;
+    this.state = { ...this.state, membersData: nextMembersData };
+    this._persistChanges({ memberDirty: true, deferEmit: true });
+    this.lastChange = {
+      type: 'meta-only',
+      photoIds: mutatedSet,
+      seq: ++this._changeSeq,
+    };
+    this.emit();
   }
 
   setRating(photoIds, rating) {
@@ -2327,10 +3075,7 @@ export class Store {
       };
     }
 
-    this.setState({
-      membersData: { ...this.state.membersData, [myId]: record },
-    });
-    this._persistChanges({ memberDirty: true });
+    this._commitLocalItemEdits(ids, myId, record);
   }
 
   toggleFavorite(photoIds, forceState = null) {
@@ -2351,10 +3096,7 @@ export class Store {
       };
     }
 
-    this.setState({
-      membersData: { ...this.state.membersData, [myId]: record },
-    });
-    this._persistChanges({ memberDirty: true });
+    this._commitLocalItemEdits(ids, myId, record);
   }
 
   toggleTagOnPhotos(photoIds, tagId, forceState = null) {
@@ -2382,10 +3124,7 @@ export class Store {
       };
     }
 
-    this.setState({
-      membersData: { ...this.state.membersData, [myId]: record },
-    });
-    this._persistChanges({ memberDirty: true });
+    this._commitLocalItemEdits(ids, myId, record);
   }
 
   setMyNote(photoId, note) {
@@ -2397,10 +3136,7 @@ export class Store {
       note: String(note || ''),
       updatedAt: Date.now(),
     };
-    this.setState({
-      membersData: { ...this.state.membersData, [myId]: record },
-    });
-    this._persistChanges({ memberDirty: true });
+    this._commitLocalItemEdits([photoId], myId, record);
   }
 
   upsertTagDefinition({ id = null, name, color = 'blue', group = '' }) {

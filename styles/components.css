@@ -717,7 +717,33 @@
   color: var(--text-secondary);
 }
 
-/* Gallery Photo Cards */
+/* Virtualized Gallery Stage & Photo Cards */
+.gallery-scroll,
+.gallery-grid {
+  overflow-anchor: none;
+}
+
+.gallery-grid.is-virtual-stage {
+  position: relative;
+  width: 100%;
+  overflow: hidden;
+  overflow-anchor: none;
+}
+
+.virtual-stage-layer {
+  position: absolute;
+  left: 0;
+  right: 0;
+  top: 0;
+  will-change: transform;
+}
+
+.virtual-stage-layer > .photo-card {
+  position: absolute;
+  left: 0;
+  top: 0;
+}
+
 .justified-gallery {
   display: flex;
   flex-direction: column;
@@ -817,6 +843,28 @@
 
 .photo-card.has-img .photo-skeleton {
   display: none;
+}
+
+.photo-card.is-thumb-error {
+  background: color-mix(in srgb, var(--bg-elevated) 84%, var(--border-subtle));
+}
+
+.photo-card.is-thumb-error img:not(.is-loaded) {
+  opacity: 0;
+  visibility: hidden;
+}
+
+.photo-card.is-thumb-error::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  margin: auto;
+  width: 24px;
+  height: 24px;
+  border-radius: 6px;
+  border: 1.5px solid var(--text-muted);
+  opacity: 0.28;
+  pointer-events: none;
 }
 
 @keyframes shimmer {

@@ -1,4 +1,4 @@
-import { downloadOriginalFile } from '../api/gdrive.js';
+import { buildDriveWebViewLink, downloadOriginalFile } from '../api/gdrive.js';
 import { getLocaleTag, t } from '../i18n.js';
 import { resolvePhotoTimestamp } from '../state/store.js';
 import { loadPhotoIntoElement } from '../storage/imageLoader.js';
@@ -73,7 +73,7 @@ export function renderInspector(container, store) {
     selectedCount > 1
       ? ''
       : state.lightboxPhotoId || state.focusedPhotoId || Array.from(state.selectedPhotoIds)[0] || '';
-  const file = selectedCount <= 1 && photoId ? state.files.find((f) => f.id === photoId) || null : null;
+  const file = selectedCount <= 1 && photoId ? store.getFileById(photoId) : null;
   const folder = file ? state.folders.find((f) => f.id === file.parentId) : null;
 
   const renderSig = [
@@ -223,6 +223,8 @@ export function renderInspector(container, store) {
     ? container.querySelector('.inspector-preview img')
     : null;
 
+  const viewUrl = file.webViewLink || (!file.isDemo && file.id ? buildDriveWebViewLink(file.id) : '');
+
   container.innerHTML = `
     ${buildMobileDrawerHeaderHtml()}
     <div class="inspector-scroll">
@@ -240,8 +242,8 @@ export function renderInspector(container, store) {
           <button type="button" class="btn btn-sm" style="flex:1" data-insp="open-lightbox" data-photo-id="${escapeAttr(file.id)}">${icon('zoomIn', 13)} ${escapeHtml(t('inspector.fullScreen'))}</button>
           <button type="button" class="btn btn-sm" style="flex:1" data-insp="download" data-photo-id="${escapeAttr(file.id)}">${icon('download', 13)} ${escapeHtml(t('inspector.original'))}</button>
           ${
-            file.webViewLink
-              ? `<a class="btn btn-sm btn-icon" href="${escapeAttr(file.webViewLink)}" target="_blank" rel="noopener" title="${escapeAttr(t('inspector.openInDrive'))}">${icon('externalLink', 13)}</a>`
+            viewUrl
+              ? `<a class="btn btn-sm btn-icon" href="${escapeAttr(viewUrl)}" target="_blank" rel="noopener" title="${escapeAttr(t('inspector.openInDrive'))}">${icon('externalLink', 13)}</a>`
               : ''
           }
         </div>
@@ -358,7 +360,7 @@ export function bindInspectorEvents(container, store) {
     } else if (action === 'open-lightbox') {
       store.openLightbox(pid);
     } else if (action === 'download') {
-      const file = store.state.files.find((f) => f.id === pid);
+      const file = store.getFileById(pid);
       if (file) {
         downloadOriginalFile(file, store.state.accessToken, store.state.apiKey).catch((err) =>
           store.toast(err?.message || t('inspector.downloadFailed'), 'error')

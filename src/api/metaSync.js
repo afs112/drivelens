@@ -92,7 +92,7 @@ async function createJsonFile(parentId, name, dataObj, accessToken) {
     mimeType: 'application/json',
     parents: [parentId],
   });
-  const content = JSON.stringify(dataObj, null, 2);
+  const content = JSON.stringify(dataObj);
 
   const body =
     `--${boundary}\r\n` +
@@ -130,7 +130,7 @@ async function updateJsonFile(fileId, dataObj, accessToken) {
         Authorization: `Bearer ${accessToken}`,
         'Content-Type': 'application/json; charset=UTF-8',
       },
-      body: JSON.stringify(dataObj, null, 2),
+      body: JSON.stringify(dataObj),
     }
   );
   if (!resp.ok) {

@@ -346,10 +346,65 @@ export async function fetchWithDriveBackoff(
   }
 }
 
+export const DRIVE_FILE_FIELDS =
+  'id,name,mimeType,parents,size,createdTime,modifiedTime,thumbnailLink,imageMediaMetadata(width,height,time,cameraMake,cameraModel,focalLength,aperture,exposureTime,isoSpeed),videoMediaMetadata(width,height,durationMillis)';
+
+const FOLDER_MIME = 'application/vnd.google-apps.folder';
+const MEDIA_OR_FOLDER_PREDICATE =
+  "trashed = false and (mimeType = 'application/vnd.google-apps.folder' or mimeType contains 'image/' or mimeType contains 'video/')";
+const MEDIA_ONLY_PREDICATE = "trashed = false and (mimeType contains 'image/' or mimeType contains 'video/')";
+const FOLDER_ONLY_PREDICATE = "trashed = false and mimeType = 'application/vnd.google-apps.folder'";
+const GROUP_BATCH_SIZE = 25;
+const MAX_CRAWL_DEPTH = 6;
+const MAX_CHANGES_PAGES = 15;
+
+export function buildDriveWebViewLink(fileId) {
+  return fileId ? `https://drive.google.com/file/d/${encodeURIComponent(fileId)}/view` : '';
+}
+
+function escapeDriveQueryValue(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
+function isMediaMimeType(mimeType) {
+  return typeof mimeType === 'string' && (mimeType.startsWith('image/') || mimeType.startsWith('video/'));
+}
+
+function normalizeDriveFile(entry, parentId = '', fetchedAt = Date.now()) {
+  const thumb = entry.thumbnailLink || '';
+  return {
+    id: entry.id,
+    name: entry.name,
+    parentId,
+    mimeType: entry.mimeType || 'image/jpeg',
+    size: Number(entry.size || 0),
+    createdTime: entry.createdTime || '',
+    modifiedTime: entry.modifiedTime || '',
+    thumbnailLink: thumb,
+    thumbFetchedAt: thumb ? fetchedAt : 0,
+    webViewLink: buildDriveWebViewLink(entry.id),
+    webContentLink: '',
+    imageMediaMetadata: entry.imageMediaMetadata || null,
+    videoMediaMetadata: entry.videoMediaMetadata || null,
+    isDemo: false,
+  };
+}
+
+function chunkItems(items, size) {
+  const out = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
+  }
+  return out;
+}
+
+function resolveAuth(auth = {}) {
+  return typeof auth === 'string' ? { accessToken: auth, apiKey: '' } : auth || {};
+}
+
 export async function fetchFreshThumbnailLink(fileId, auth = {}, signal = null) {
   if (!fileId) return '';
-  const { accessToken = '', apiKey = '' } =
-    typeof auth === 'string' ? { accessToken: auth } : auth;
+  const { accessToken = '', apiKey = '' } = resolveAuth(auth);
   if (!accessToken && !apiKey) return '';
 
   const baseUrl = `${DRIVE_API}/files/${encodeURIComponent(fileId)}?fields=thumbnailLink&supportsAllDrives=true`;
@@ -366,77 +421,272 @@ export async function fetchFreshThumbnailLink(fileId, auth = {}, signal = null) 
   }
 }
 
-async function driveJsonFetch(url, auth = {}) {
-  const { accessToken = '', apiKey = '' } = typeof auth === 'string' ? { accessToken: auth } : auth;
-  const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
-  const resp = await fetchWithDriveBackoff(url, { headers });
+export async function fetchBatchThumbnailLinks(items = [], auth = {}, signal = null) {
+  const resultMap = new Map();
+  const { accessToken = '', apiKey = '' } = resolveAuth(auth);
+  if ((!accessToken && !apiKey) || !Array.isArray(items) || items.length === 0) {
+    return resultMap;
+  }
 
-  if (resp.status === 400 && !accessToken && apiKey) {
-    const text = await resp.text().catch(() => '');
-    if (text.includes('API_KEY_INVALID') || text.includes('keyInvalid') || text.includes('key')) {
-      throw new Error(t('gdrive.err400InvalidKey'));
+  const seenIds = new Set();
+  const groupable = [];
+  const fallbackItems = [];
+
+  for (const item of items) {
+    const id = item?.id;
+    if (!id || seenIds.has(id)) continue;
+    seenIds.add(id);
+    if (item.parentId && item.name) {
+      groupable.push(item);
+    } else {
+      fallbackItems.push(item);
     }
-    throw new Error(t('gdrive.err400BadRequest'));
+  }
+
+  const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+  const chunks = chunkItems(groupable, GROUP_BATCH_SIZE);
+
+  for (const chunk of chunks) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const requestedIdSet = new Set(chunk.map((x) => x.id));
+    const uniqueParents = Array.from(new Set(chunk.map((x) => x.parentId)));
+    const uniqueNames = Array.from(new Set(chunk.map((x) => x.name)));
+    const parentQ = uniqueParents.map((p) => `'${escapeDriveQueryValue(p)}' in parents`).join(' or ');
+    const nameQ = uniqueNames.map((n) => `name = '${escapeDriveQueryValue(n)}'`).join(' or ');
+    const q = `(${parentQ}) and (${nameQ}) and trashed = false`;
+
+    const params = new URLSearchParams({
+      q,
+      fields: 'files(id,thumbnailLink)',
+      pageSize: '100',
+      supportsAllDrives: 'true',
+      includeItemsFromAllDrives: 'true',
+    });
+    if (!accessToken && apiKey) {
+      params.set('key', apiKey);
+    }
+
+    try {
+      const resp = await fetchWithDriveBackoff(
+        `${DRIVE_API}/files?${params.toString()}`,
+        { headers, signal },
+        { maxRetries: 2 }
+      );
+      if (!resp.ok) {
+        fallbackItems.push(...chunk);
+        continue;
+      }
+      const data = await resp.json();
+      const files = Array.isArray(data?.files) ? data.files : [];
+      const seenInResponse = new Set();
+      for (const f of files) {
+        if (f?.id) seenInResponse.add(f.id);
+        if (f?.id && requestedIdSet.has(f.id) && typeof f.thumbnailLink === 'string' && f.thumbnailLink) {
+          resultMap.set(f.id, f.thumbnailLink);
+        }
+      }
+      if (files.length >= 100) {
+        for (const item of chunk) {
+          if (!seenInResponse.has(item.id)) {
+            fallbackItems.push(item);
+          }
+        }
+      }
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err;
+      fallbackItems.push(...chunk);
+    }
+  }
+
+  if (fallbackItems.length > 0) {
+    const CONCURRENCY = 4;
+    let cursor = 0;
+    const worker = async () => {
+      while (cursor < fallbackItems.length) {
+        if (signal?.aborted) {
+          throw new DOMException('Aborted', 'AbortError');
+        }
+        const item = fallbackItems[cursor];
+        cursor += 1;
+        const link = await fetchFreshThumbnailLink(item.id, auth, signal);
+        if (link) {
+          resultMap.set(item.id, link);
+        }
+      }
+    };
+    await Promise.all(
+      Array.from({ length: Math.min(CONCURRENCY, fallbackItems.length) }, () => worker())
+    );
+  }
+
+  return resultMap;
+}
+
+async function driveJsonFetch(url, auth = {}, signal = null) {
+  const { accessToken = '', apiKey = '' } = resolveAuth(auth);
+  const headers = accessToken ? { Authorization: `Bearer ${accessToken}` } : {};
+  const resp = await fetchWithDriveBackoff(url, { headers, signal });
+
+  if (resp.status === 400) {
+    const text = await resp.text().catch(() => '');
+    let msg = t('gdrive.errHttp', { status: 400 });
+    if (!accessToken && apiKey) {
+      if (text.includes('API_KEY_INVALID') || text.includes('keyInvalid') || text.includes('key')) {
+        msg = t('gdrive.err400InvalidKey');
+      } else {
+        msg = t('gdrive.err400BadRequest');
+      }
+    }
+    const err = new Error(msg);
+    err.status = 400;
+    err.responseText = text;
+    throw err;
   }
   if (resp.status === 401) {
     clearSession();
-    throw new Error(t('gdrive.err401Expired'));
+    const err = new Error(t('gdrive.err401Expired'));
+    err.status = 401;
+    throw err;
   }
   if (resp.status === 403) {
     const text = await resp.text().catch(() => '');
+    let msg = t('gdrive.err403Forbidden');
     if (text.includes('rateLimitExceeded') || text.includes('userRateLimitExceeded')) {
-      throw new Error(t('gdrive.err403RateLimit'));
-    }
-    if (!accessToken && apiKey) {
+      msg = t('gdrive.err403RateLimit');
+    } else if (!accessToken && apiKey) {
       if (text.includes('accessNotConfigured') || text.includes('SERVICE_DISABLED')) {
-        throw new Error(t('gdrive.err403Disabled'));
+        msg = t('gdrive.err403Disabled');
+      } else if (text.includes('API_KEY_INVALID') || text.includes('keyInvalid')) {
+        msg = t('gdrive.err403KeyRestricted');
+      } else {
+        msg = t('gdrive.err403LinkAccess');
       }
-      if (text.includes('API_KEY_INVALID') || text.includes('keyInvalid')) {
-        throw new Error(t('gdrive.err403KeyRestricted'));
-      }
-      throw new Error(t('gdrive.err403LinkAccess'));
     }
-    throw new Error(t('gdrive.err403Forbidden'));
+    const err = new Error(msg);
+    err.status = 403;
+    err.responseText = text;
+    throw err;
   }
   if (resp.status === 404) {
-    if (!accessToken && apiKey) {
-      throw new Error(t('gdrive.err404ApiKey'));
-    }
-    throw new Error(t('gdrive.err404NotFound'));
+    const err = new Error(
+      !accessToken && apiKey ? t('gdrive.err404ApiKey') : t('gdrive.err404NotFound')
+    );
+    err.status = 404;
+    throw err;
   }
   if (!resp.ok) {
-    throw new Error(t('gdrive.errHttp', { status: resp.status }));
+    const err = new Error(t('gdrive.errHttp', { status: resp.status }));
+    err.status = resp.status;
+    throw err;
   }
   return resp.json();
 }
 
-async function listFolderChildren(folderId, auth) {
-  const { apiKey = '' } = auth;
-  const items = [];
+function isSplittableQueryError(err) {
+  if (!err || (err.status !== 400 && err.status !== 403)) return false;
+  const text = String(err.responseText || '');
+  if (
+    text.includes('API_KEY_INVALID') ||
+    text.includes('keyInvalid') ||
+    text.includes('SERVICE_DISABLED') ||
+    text.includes('accessNotConfigured')
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function listGroupedChildrenPages(
+  folderIds,
+  auth,
+  {
+    fields = `nextPageToken,files(${DRIVE_FILE_FIELDS})`,
+    predicate = MEDIA_OR_FOLDER_PREDICATE,
+    pageSize = APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000,
+    signal = null,
+    onPage = null,
+  } = {}
+) {
+  if (!Array.isArray(folderIds) || folderIds.length === 0) return [];
+  const { accessToken = '', apiKey = '' } = resolveAuth(auth);
+  const parentClauses = folderIds.map((id) => `'${escapeDriveQueryValue(id)}' in parents`).join(' or ');
+  const q = folderIds.length === 1 ? `${parentClauses} and ${predicate}` : `(${parentClauses}) and ${predicate}`;
+
+  const collected = onPage ? null : [];
   let pageToken = '';
-  const fields =
-    'nextPageToken,files(id,name,mimeType,size,createdTime,modifiedTime,thumbnailLink,webViewLink,webContentLink,imageMediaMetadata,videoMediaMetadata)';
-  const q = `'${folderId}' in parents and trashed = false and (mimeType = 'application/vnd.google-apps.folder' or mimeType contains 'image/' or mimeType contains 'video/')`;
+  let emittedAnyPage = false;
 
-  do {
-    const params = new URLSearchParams({
-      q,
-      fields,
-      pageSize: String(APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000),
-      supportsAllDrives: 'true',
-      includeItemsFromAllDrives: 'true',
-    });
-    if (pageToken) params.set('pageToken', pageToken);
-    if (!auth.accessToken && apiKey) params.set('key', apiKey);
+  try {
+    do {
+      if (signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      const params = new URLSearchParams({
+        q,
+        fields,
+        pageSize: String(pageSize),
+        supportsAllDrives: 'true',
+        includeItemsFromAllDrives: 'true',
+      });
+      if (pageToken) params.set('pageToken', pageToken);
+      if (!accessToken && apiKey) params.set('key', apiKey);
 
-    const data = await driveJsonFetch(`${DRIVE_API}/files?${params.toString()}`, auth);
-    if (Array.isArray(data.files)) {
-      items.push(...data.files);
+      const data = await driveJsonFetch(`${DRIVE_API}/files?${params.toString()}`, auth, signal);
+      const pageFiles = Array.isArray(data.files) ? data.files : [];
+      pageToken = data.nextPageToken || '';
+      emittedAnyPage = true;
+      if (onPage) {
+        onPage(pageFiles, Boolean(pageToken));
+      } else {
+        collected.push(...pageFiles);
+      }
+    } while (pageToken);
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (folderIds.length > 1 && !emittedAnyPage && isSplittableQueryError(err)) {
+      const mid = Math.ceil(folderIds.length / 2);
+      const left = await listGroupedChildrenPages(folderIds.slice(0, mid), auth, {
+        fields,
+        predicate,
+        pageSize,
+        signal,
+        onPage,
+      });
+      const right = await listGroupedChildrenPages(folderIds.slice(mid), auth, {
+        fields,
+        predicate,
+        pageSize,
+        signal,
+        onPage,
+      });
+      return onPage ? [] : [...left, ...right];
     }
-    pageToken = data.nextPageToken || '';
-  } while (pageToken);
+    throw err;
+  }
 
-  return items;
+  return collected || [];
+}
+
+async function fetchStartPageToken(auth, driveId = '', signal = null) {
+  const { accessToken = '' } = resolveAuth(auth);
+  if (!accessToken) return '';
+  const params = new URLSearchParams({ supportsAllDrives: 'true' });
+  if (driveId) params.set('driveId', driveId);
+  try {
+    const resp = await fetchWithDriveBackoff(
+      `${DRIVE_API}/changes/startPageToken?${params.toString()}`,
+      { headers: { Authorization: `Bearer ${accessToken}` }, signal },
+      { maxRetries: 2 }
+    );
+    if (!resp.ok) return '';
+    const data = await resp.json();
+    return typeof data?.startPageToken === 'string' ? data.startPageToken : '';
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    return '';
+  }
 }
 
 async function crawlAlbumTree({
@@ -445,87 +695,123 @@ async function crawlAlbumTree({
   onProgress = null,
   onBatch = null,
   captureMetaFolder = true,
+  signal = null,
 }) {
+  const crawlStartIso = new Date(Date.now() - 60_000).toISOString();
   const folders = [rootFolder];
   const files = [];
+  const seenFileIds = new Set();
   let metaFolderId = null;
 
-  let queue = [{ id: rootFolder.id, depth: 0 }];
+  let queue = [{ id: rootFolder.id, depth: rootFolder.depth || 0 }];
   const visited = new Set([rootFolder.id]);
-  const MAX_DEPTH = 6;
-  const BATCH_SIZE = 4;
+
   let lastBatchEmit = 0;
+  let lastEmittedFileCount = 0;
   let emittedInitialBatch = false;
+  let pendingNewFiles = [];
 
   while (queue.length > 0) {
-    const batch = queue.slice(0, BATCH_SIZE);
-    queue = queue.slice(BATCH_SIZE);
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const wave = queue;
+    queue = [];
+    const chunks = chunkItems(wave, GROUP_BATCH_SIZE);
+    let nextChunkIdx = 0;
+    let remainingChunks = chunks.length;
 
-    const results = await Promise.all(
-      batch.map(async (node) => {
-        const children = await listFolderChildren(node.id, auth);
-        return { node, children };
-      })
-    );
+    const runChunkWorker = async () => {
+      while (nextChunkIdx < chunks.length) {
+        const myIdx = nextChunkIdx;
+        nextChunkIdx += 1;
+        const batch = chunks[myIdx];
+        const batchIds = batch.map((n) => n.id);
+        const batchDepthById = new Map(batch.map((n) => [n.id, n.depth]));
+        const batchIdSet = new Set(batchIds);
 
-    for (const { node, children } of results) {
-      for (const entry of children) {
-        if (entry.mimeType === 'application/vnd.google-apps.folder') {
-          if (captureMetaFolder && entry.name === '.drivelens' && node.id === rootFolder.id) {
-            metaFolderId = entry.id;
-            continue;
-          }
-          if (entry.name.startsWith('.')) {
-            continue;
-          }
-          if (!visited.has(entry.id) && node.depth + 1 <= MAX_DEPTH) {
-            visited.add(entry.id);
-            folders.push({
-              id: entry.id,
-              name: entry.name,
-              parentId: node.id,
-              depth: node.depth + 1,
-            });
-            queue.push({ id: entry.id, depth: node.depth + 1 });
-          }
-        } else {
-          files.push({
-            id: entry.id,
-            name: entry.name,
-            parentId: node.id,
-            mimeType: entry.mimeType || 'image/jpeg',
-            size: Number(entry.size || 0),
-            createdTime: entry.createdTime || '',
-            modifiedTime: entry.modifiedTime || '',
-            thumbnailLink: entry.thumbnailLink || '',
-            webViewLink: entry.webViewLink || '',
-            webContentLink: entry.webContentLink || '',
-            imageMediaMetadata: entry.imageMediaMetadata || null,
-            videoMediaMetadata: entry.videoMediaMetadata || null,
-            isDemo: false,
+        try {
+          await listGroupedChildrenPages(batchIds, auth, {
+            fields: `nextPageToken,files(${DRIVE_FILE_FIELDS})`,
+            predicate: MEDIA_OR_FOLDER_PREDICATE,
+            pageSize: APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000,
+            signal,
+            onPage: (pageFiles, hasMoreInQuery) => {
+              const now = Date.now();
+              for (const entry of pageFiles) {
+                const parentId =
+                  (Array.isArray(entry.parents) &&
+                    (entry.parents.find((pid) => batchIdSet.has(pid)) || entry.parents[0])) ||
+                  (batchIds.length === 1 ? batchIds[0] : rootFolder.id);
+                const parentDepth = batchDepthById.get(parentId) ?? 0;
+
+                if (entry.mimeType === FOLDER_MIME) {
+                  if (captureMetaFolder && entry.name === '.drivelens' && parentId === rootFolder.id) {
+                    metaFolderId = entry.id;
+                    continue;
+                  }
+                  if (entry.name?.startsWith('.')) {
+                    continue;
+                  }
+                  if (!visited.has(entry.id) && parentDepth + 1 <= MAX_CRAWL_DEPTH) {
+                    visited.add(entry.id);
+                    const nextDepth = parentDepth + 1;
+                    folders.push({
+                      id: entry.id,
+                      name: entry.name,
+                      parentId,
+                      depth: nextDepth,
+                    });
+                    queue.push({ id: entry.id, depth: nextDepth });
+                  }
+                } else if (!seenFileIds.has(entry.id)) {
+                  seenFileIds.add(entry.id);
+                  const normalized = normalizeDriveFile(entry, parentId, now);
+                  files.push(normalized);
+                  pendingNewFiles.push(normalized);
+                }
+              }
+
+              if (onProgress) {
+                onProgress({ folderCount: folders.length, fileCount: files.length });
+              }
+
+              const hasMoreWork = hasMoreInQuery || queue.length > 0 || remainingChunks > 1;
+              if (onBatch && files.length > 0 && hasMoreWork) {
+                const shouldEmit = !emittedInitialBatch
+                  ? true
+                  : files.length < 5000
+                    ? now - lastBatchEmit >= 900
+                    : now - lastBatchEmit >= 2500 ||
+                      files.length >= Math.ceil(lastEmittedFileCount * 1.25);
+
+                if (shouldEmit) {
+                  emittedInitialBatch = true;
+                  lastBatchEmit = now;
+                  lastEmittedFileCount = files.length;
+                  const newFiles = pendingNewFiles;
+                  pendingNewFiles = [];
+                  onBatch({
+                    rootFolder,
+                    folders: [...folders],
+                    files,
+                    newFiles,
+                    isStreaming: true,
+                    metaFolderId,
+                    canWrite: rootFolder.canWrite,
+                  });
+                }
+              }
+            },
           });
+        } finally {
+          remainingChunks -= 1;
         }
       }
-    }
+    };
 
-    if (onProgress) {
-      onProgress({ folderCount: folders.length, fileCount: files.length });
-    }
-
-    if (onBatch && files.length > 0 && queue.length > 0) {
-      const now = Date.now();
-      if (!emittedInitialBatch || now - lastBatchEmit >= 850) {
-        emittedInitialBatch = true;
-        lastBatchEmit = now;
-        onBatch({
-          rootFolder,
-          folders: [...folders],
-          files: [...files],
-          metaFolderId,
-          canWrite: rootFolder.canWrite,
-        });
-      }
-    }
+    const workerCount = Math.min(3, chunks.length);
+    await Promise.all(Array.from({ length: workerCount }, () => runChunkWorker()));
   }
 
   return {
@@ -534,6 +820,7 @@ async function crawlAlbumTree({
     files,
     metaFolderId,
     canWrite: rootFolder.canWrite,
+    syncWatermark: crawlStartIso,
   };
 }
 
@@ -545,7 +832,7 @@ export async function loadSharedAlbum(folderId, accessToken, onProgress = null, 
 
   const auth = { accessToken };
   const rootParams = new URLSearchParams({
-    fields: 'id,name,mimeType,capabilities(canAddChildren,canEdit),owners(displayName,emailAddress)',
+    fields: 'id,name,mimeType,driveId,capabilities(canAddChildren,canEdit),owners(displayName,emailAddress)',
     supportsAllDrives: 'true',
   });
   const rootMeta = await driveJsonFetch(
@@ -553,7 +840,7 @@ export async function loadSharedAlbum(folderId, accessToken, onProgress = null, 
     auth
   );
 
-  if (rootMeta.mimeType !== 'application/vnd.google-apps.folder') {
+  if (rootMeta.mimeType !== FOLDER_MIME) {
     throw new Error(t('gdrive.notFolder'));
   }
 
@@ -564,9 +851,21 @@ export async function loadSharedAlbum(folderId, accessToken, onProgress = null, 
     parentId: null,
     depth: 0,
     canWrite,
+    driveId: rootMeta.driveId || '',
   };
 
-  return crawlAlbumTree({ rootFolder, auth, onProgress, onBatch, captureMetaFolder: true });
+  const result = await crawlAlbumTree({
+    rootFolder,
+    auth,
+    onProgress,
+    onBatch,
+    captureMetaFolder: true,
+  });
+  const startPageToken = await fetchStartPageToken(auth, rootFolder.driveId);
+  return {
+    ...result,
+    startPageToken,
+  };
 }
 
 export async function loadSharedAlbumWithApiKey(
@@ -585,10 +884,10 @@ export async function loadSharedAlbumWithApiKey(
   }
 
   const auth = { apiKey: cleanKey };
-  const rootUrl = `${DRIVE_API}/files/${encodeURIComponent(cleanId)}?fields=id,name,mimeType&supportsAllDrives=true&key=${encodeURIComponent(cleanKey)}`;
+  const rootUrl = `${DRIVE_API}/files/${encodeURIComponent(cleanId)}?fields=id,name,mimeType,driveId&supportsAllDrives=true&key=${encodeURIComponent(cleanKey)}`;
   const rootMeta = await driveJsonFetch(rootUrl, auth);
 
-  if (rootMeta.mimeType !== 'application/vnd.google-apps.folder') {
+  if (rootMeta.mimeType !== FOLDER_MIME) {
     throw new Error(t('gdrive.notFolder'));
   }
 
@@ -598,9 +897,629 @@ export async function loadSharedAlbumWithApiKey(
     parentId: null,
     depth: 0,
     canWrite: true,
+    driveId: rootMeta.driveId || '',
   };
 
-  return crawlAlbumTree({ rootFolder, auth, onProgress, onBatch, captureMetaFolder: false });
+  const result = await crawlAlbumTree({
+    rootFolder,
+    auth,
+    onProgress,
+    onBatch,
+    captureMetaFolder: false,
+  });
+  return {
+    ...result,
+    startPageToken: '',
+  };
+}
+
+function pruneFolderSubtree(folderMap, targetId) {
+  const stack = [targetId];
+  while (stack.length > 0) {
+    const id = stack.pop();
+    if (!folderMap.has(id)) continue;
+    folderMap.delete(id);
+    for (const [childId, folder] of folderMap.entries()) {
+      if (folder.parentId === id) {
+        stack.push(childId);
+      }
+    }
+  }
+}
+
+async function crawlSubtreeIntoMaps({
+  seedFolders,
+  folderMap,
+  upsertedMap,
+  auth,
+  signal = null,
+}) {
+  if (!seedFolders.length) return;
+  const visited = new Set(seedFolders.map((s) => s.id));
+  let queue = seedFolders.map((s) => ({ id: s.id, depth: s.depth }));
+
+  while (queue.length > 0) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const wave = queue;
+    queue = [];
+    for (const chunk of chunkItems(wave, GROUP_BATCH_SIZE)) {
+      const batchIds = chunk.map((n) => n.id);
+      const batchDepthById = new Map(chunk.map((n) => [n.id, n.depth]));
+      const batchIdSet = new Set(batchIds);
+
+      await listGroupedChildrenPages(batchIds, auth, {
+        fields: `nextPageToken,files(${DRIVE_FILE_FIELDS})`,
+        predicate: MEDIA_OR_FOLDER_PREDICATE,
+        pageSize: APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000,
+        signal,
+        onPage: (pageFiles) => {
+          const now = Date.now();
+          for (const entry of pageFiles) {
+            const parentId =
+              (Array.isArray(entry.parents) &&
+                (entry.parents.find((pid) => batchIdSet.has(pid)) || entry.parents[0])) ||
+              (batchIds.length === 1 ? batchIds[0] : '');
+            if (!parentId) continue;
+            const parentDepth = batchDepthById.get(parentId) ?? 0;
+
+            if (entry.mimeType === FOLDER_MIME) {
+              if (entry.name?.startsWith('.')) continue;
+              const nextDepth = parentDepth + 1;
+              if (nextDepth <= MAX_CRAWL_DEPTH) {
+                folderMap.set(entry.id, {
+                  id: entry.id,
+                  name: entry.name,
+                  parentId,
+                  depth: nextDepth,
+                });
+                if (!visited.has(entry.id)) {
+                  visited.add(entry.id);
+                  queue.push({ id: entry.id, depth: nextDepth });
+                }
+              }
+            } else {
+              upsertedMap.set(entry.id, normalizeDriveFile(entry, parentId, now));
+            }
+          }
+        },
+      });
+    }
+  }
+}
+
+async function runIdReconcileSweep({
+  folderMap,
+  knownFileIds,
+  upsertedMap,
+  removedSet,
+  auth,
+  fetchMissingDetails = true,
+  signal = null,
+}) {
+  const folderIds = Array.from(folderMap.keys());
+  const liveFileIds = new Set();
+  const liveParentById = new Map();
+
+  for (const chunk of chunkItems(folderIds, GROUP_BATCH_SIZE)) {
+    const chunkSet = new Set(chunk);
+    await listGroupedChildrenPages(chunk, auth, {
+      fields: 'nextPageToken,files(id,parents)',
+      predicate: MEDIA_ONLY_PREDICATE,
+      pageSize: APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000,
+      signal,
+      onPage: (pageFiles) => {
+        for (const entry of pageFiles) {
+          if (!entry?.id) continue;
+          liveFileIds.add(entry.id);
+          const pid =
+            (Array.isArray(entry.parents) &&
+              (entry.parents.find((p) => chunkSet.has(p)) || entry.parents[0])) ||
+            (chunk.length === 1 ? chunk[0] : '');
+          if (pid) liveParentById.set(entry.id, pid);
+        }
+      },
+    });
+  }
+
+  for (const id of knownFileIds) {
+    if (!liveFileIds.has(id)) {
+      upsertedMap.delete(id);
+      removedSet.add(id);
+    }
+  }
+
+  if (fetchMissingDetails) {
+    const missingIds = [];
+    for (const id of liveFileIds) {
+      if (!knownFileIds.has(id) && !upsertedMap.has(id)) {
+        missingIds.push(id);
+      }
+    }
+    if (missingIds.length > 0) {
+      const { accessToken = '', apiKey = '' } = resolveAuth(auth);
+      const CONCURRENCY = 4;
+      let cursor = 0;
+      const worker = async () => {
+        while (cursor < missingIds.length) {
+          if (signal?.aborted) {
+            throw new DOMException('Aborted', 'AbortError');
+          }
+          const id = missingIds[cursor];
+          cursor += 1;
+          const params = new URLSearchParams({
+            fields: DRIVE_FILE_FIELDS,
+            supportsAllDrives: 'true',
+          });
+          if (!accessToken && apiKey) params.set('key', apiKey);
+          try {
+            const entry = await driveJsonFetch(
+              `${DRIVE_API}/files/${encodeURIComponent(id)}?${params.toString()}`,
+              auth,
+              signal
+            );
+            if (entry?.id && isMediaMimeType(entry.mimeType)) {
+              const parentId =
+                (Array.isArray(entry.parents) &&
+                  (entry.parents.find((p) => folderMap.has(p)) || entry.parents[0])) ||
+                liveParentById.get(id) ||
+                '';
+              if (parentId && folderMap.has(parentId)) {
+                removedSet.delete(entry.id);
+                upsertedMap.set(entry.id, normalizeDriveFile(entry, parentId, Date.now()));
+              }
+            }
+          } catch (err) {
+            if (err?.name === 'AbortError') throw err;
+            // Ignore single inaccessible file during reconcile
+          }
+        }
+      };
+      await Promise.all(
+        Array.from({ length: Math.min(CONCURRENCY, missingIds.length) }, () => worker())
+      );
+    }
+  }
+}
+
+export async function syncAlbumIncremental({
+  rootFolder,
+  existingFolders = [],
+  existingFileIds = new Set(),
+  auth = {},
+  startPageToken = '',
+  syncWatermark = '',
+  lastFullReconcileAt = 0,
+  forceFullReconcile = false,
+  captureMetaFolder = true,
+  signal = null,
+}) {
+  if (!rootFolder?.id) {
+    throw new Error(t('gdrive.invalidFolder'));
+  }
+
+  const resolvedAuth = resolveAuth(auth);
+  const knownFileIds =
+    existingFileIds instanceof Set ? existingFileIds : new Set(existingFileIds || []);
+  const syncStartIso = new Date(Date.now() - 60_000).toISOString();
+
+  const initialFolderMap = new Map();
+  for (const folder of existingFolders || []) {
+    if (folder?.id) {
+      initialFolderMap.set(folder.id, { ...folder });
+    }
+  }
+  if (!initialFolderMap.has(rootFolder.id)) {
+    initialFolderMap.set(rootFolder.id, { ...rootFolder, parentId: null, depth: 0 });
+  }
+
+  // Path 1: OAuth changes.list incremental sync
+  if (resolvedAuth.accessToken && startPageToken && !forceFullReconcile) {
+    let pageToken = startPageToken;
+    let newStartPageToken = '';
+    let pageCount = 0;
+    let canUseChanges = true;
+    const allChanges = [];
+
+    while (pageToken) {
+      if (signal?.aborted) {
+        throw new DOMException('Aborted', 'AbortError');
+      }
+      pageCount += 1;
+      if (pageCount > MAX_CHANGES_PAGES) {
+        canUseChanges = false;
+        break;
+      }
+
+      const params = new URLSearchParams({
+        pageToken,
+        pageSize: '1000',
+        includeRemoved: 'true',
+        includeItemsFromAllDrives: 'true',
+        supportsAllDrives: 'true',
+        fields: `newStartPageToken,nextPageToken,changes(fileId,removed,file(trashed,${DRIVE_FILE_FIELDS}))`,
+      });
+      if (rootFolder.driveId) {
+        params.set('driveId', rootFolder.driveId);
+        params.set('includeCorpusRemovals', 'true');
+      }
+
+      const resp = await fetchWithDriveBackoff(
+        `${DRIVE_API}/changes?${params.toString()}`,
+        { headers: { Authorization: `Bearer ${resolvedAuth.accessToken}` }, signal }
+      );
+
+      if (resp.status === 401) {
+        clearSession();
+        const err = new Error(t('gdrive.err401Expired'));
+        err.status = 401;
+        throw err;
+      }
+      if (resp.status === 400 || resp.status === 410 || !resp.ok) {
+        canUseChanges = false;
+        break;
+      }
+
+      const data = await resp.json();
+      if (Array.isArray(data.changes)) {
+        allChanges.push(...data.changes);
+      }
+      if (data.newStartPageToken) {
+        newStartPageToken = data.newStartPageToken;
+      }
+      pageToken = data.nextPageToken || '';
+    }
+
+    if (canUseChanges) {
+      const folderMap = new Map(
+        Array.from(initialFolderMap.entries()).map(([k, v]) => [k, { ...v }])
+      );
+      const upsertedMap = new Map();
+      const removedSet = new Set();
+      let metaFolderId = null;
+      let removedAnyFolder = false;
+
+      // Track latest state per fileId across chronological change records
+      const latestByFileId = new Map();
+      for (const ch of allChanges) {
+        if (ch?.fileId) {
+          latestByFileId.set(ch.fileId, ch);
+        }
+      }
+
+      // Step 1: Handle removed/trashed items
+      for (const [fileId, ch] of latestByFileId.entries()) {
+        if (ch.removed || ch.file?.trashed) {
+          if (folderMap.has(fileId) && fileId !== rootFolder.id) {
+            pruneFolderSubtree(folderMap, fileId);
+            removedAnyFolder = true;
+          } else if (knownFileIds.has(fileId)) {
+            removedSet.add(fileId);
+          }
+        }
+      }
+
+      // Step 2: Handle folder creations, moves, and renames (fixed-point for nested moved folders)
+      const activeFolderChanges = [];
+      for (const ch of latestByFileId.values()) {
+        if (!ch.removed && ch.file && !ch.file.trashed && ch.file.mimeType === FOLDER_MIME) {
+          activeFolderChanges.push(ch.file);
+        }
+      }
+
+      const newSubfolderSeeds = [];
+      const seenSeedIds = new Set();
+      let changed = true;
+      let guard = 0;
+      while (changed && guard < MAX_CRAWL_DEPTH + 2) {
+        changed = false;
+        guard += 1;
+        for (const f of activeFolderChanges) {
+          if (f.id === rootFolder.id) {
+            const existingRoot = folderMap.get(rootFolder.id);
+            if (existingRoot && f.name && existingRoot.name !== f.name) {
+              existingRoot.name = f.name;
+            }
+            continue;
+          }
+          const parents = Array.isArray(f.parents) ? f.parents : [];
+          const matchedParentId = parents.find((pid) => folderMap.has(pid)) || '';
+          if (matchedParentId) {
+            if (captureMetaFolder && f.name === '.drivelens' && matchedParentId === rootFolder.id) {
+              metaFolderId = f.id;
+              continue;
+            }
+            if (f.name?.startsWith('.')) {
+              if (folderMap.has(f.id)) {
+                pruneFolderSubtree(folderMap, f.id);
+                removedAnyFolder = true;
+                changed = true;
+              }
+              continue;
+            }
+            const nextDepth = (folderMap.get(matchedParentId)?.depth ?? 0) + 1;
+            if (nextDepth <= MAX_CRAWL_DEPTH) {
+              const prev = folderMap.get(f.id);
+              if (!prev) {
+                folderMap.set(f.id, {
+                  id: f.id,
+                  name: f.name,
+                  parentId: matchedParentId,
+                  depth: nextDepth,
+                });
+                if (!initialFolderMap.has(f.id) && !seenSeedIds.has(f.id)) {
+                  seenSeedIds.add(f.id);
+                  newSubfolderSeeds.push({ id: f.id, depth: nextDepth });
+                }
+                changed = true;
+              } else if (
+                prev.name !== f.name ||
+                prev.parentId !== matchedParentId ||
+                prev.depth !== nextDepth
+              ) {
+                prev.name = f.name;
+                prev.parentId = matchedParentId;
+                prev.depth = nextDepth;
+                changed = true;
+              }
+            }
+          } else if (folderMap.has(f.id)) {
+            pruneFolderSubtree(folderMap, f.id);
+            removedAnyFolder = true;
+            changed = true;
+          }
+        }
+      }
+
+      // Crawl newly created/moved-in subfolders so existing photos inside them are discovered
+      if (newSubfolderSeeds.length > 0) {
+        await crawlSubtreeIntoMaps({
+          seedFolders: newSubfolderSeeds,
+          folderMap,
+          upsertedMap,
+          auth: resolvedAuth,
+          signal,
+        });
+      }
+
+      // Step 3: Handle media file upserts & moves outside album
+      const now = Date.now();
+      for (const [fileId, ch] of latestByFileId.entries()) {
+        if (ch.removed || !ch.file || ch.file.trashed) continue;
+        if (!isMediaMimeType(ch.file.mimeType)) continue;
+        const parents = Array.isArray(ch.file.parents) ? ch.file.parents : [];
+        const matchedParentId = parents.find((pid) => folderMap.has(pid)) || '';
+        if (matchedParentId) {
+          removedSet.delete(fileId);
+          upsertedMap.set(fileId, normalizeDriveFile(ch.file, matchedParentId, now));
+        } else if (knownFileIds.has(fileId) || upsertedMap.has(fileId)) {
+          upsertedMap.delete(fileId);
+          removedSet.add(fileId);
+        }
+      }
+
+      // If a subfolder was removed or moved out, reconcile live file IDs so orphaned files inside it are removed
+      let nextLastFullReconcileAt = Number(lastFullReconcileAt || 0);
+      if (removedAnyFolder && knownFileIds.size > 0) {
+        await runIdReconcileSweep({
+          folderMap,
+          knownFileIds,
+          upsertedMap,
+          removedSet,
+          auth: resolvedAuth,
+          fetchMissingDetails: false,
+          signal,
+        });
+        nextLastFullReconcileAt = Date.now();
+      }
+
+      return {
+        mode: 'changes',
+        upsertedFiles: Array.from(upsertedMap.values()),
+        removedFileIds: Array.from(removedSet),
+        folders: Array.from(folderMap.values()),
+        metaFolderId,
+        nextStartPageToken: newStartPageToken || startPageToken,
+        nextWatermark: syncStartIso,
+        lastFullReconcileAt: nextLastFullReconcileAt,
+        fullResult: null,
+      };
+    }
+  }
+
+  // Path 2: Watermark + Periodic ID Reconcile (API Key mode or OAuth fallback)
+  if (!syncWatermark && (!existingFolders || existingFolders.length === 0)) {
+    const fullResult = await crawlAlbumTree({
+      rootFolder,
+      auth: resolvedAuth,
+      captureMetaFolder,
+      signal,
+    });
+    const freshToken = resolvedAuth.accessToken
+      ? await fetchStartPageToken(resolvedAuth, rootFolder.driveId, signal)
+      : '';
+    return {
+      mode: 'fallback-full',
+      upsertedFiles: [],
+      removedFileIds: [],
+      folders: fullResult.folders,
+      metaFolderId: fullResult.metaFolderId,
+      nextStartPageToken: freshToken,
+      nextWatermark: fullResult.syncWatermark,
+      lastFullReconcileAt: Date.now(),
+      fullResult: {
+        ...fullResult,
+        startPageToken: freshToken,
+      },
+    };
+  }
+
+  // Step A: Discover current folder tree via grouped folder-only queries
+  const discoveredFolderMap = new Map();
+  discoveredFolderMap.set(rootFolder.id, { ...rootFolder, parentId: null, depth: 0 });
+  let metaFolderId = null;
+  let folderQueue = [{ id: rootFolder.id, depth: 0 }];
+  const visitedFolders = new Set([rootFolder.id]);
+
+  while (folderQueue.length > 0) {
+    if (signal?.aborted) {
+      throw new DOMException('Aborted', 'AbortError');
+    }
+    const wave = folderQueue;
+    folderQueue = [];
+    for (const chunk of chunkItems(wave, GROUP_BATCH_SIZE)) {
+      const batchIds = chunk.map((n) => n.id);
+      const batchDepthById = new Map(chunk.map((n) => [n.id, n.depth]));
+      const batchIdSet = new Set(batchIds);
+
+      await listGroupedChildrenPages(batchIds, resolvedAuth, {
+        fields: 'nextPageToken,files(id,name,parents)',
+        predicate: FOLDER_ONLY_PREDICATE,
+        pageSize: APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000,
+        signal,
+        onPage: (pageFolders) => {
+          for (const entry of pageFolders) {
+            const parentId =
+              (Array.isArray(entry.parents) &&
+                (entry.parents.find((pid) => batchIdSet.has(pid)) || entry.parents[0])) ||
+              (batchIds.length === 1 ? batchIds[0] : '');
+            if (!parentId) continue;
+
+            if (captureMetaFolder && entry.name === '.drivelens' && parentId === rootFolder.id) {
+              metaFolderId = entry.id;
+              continue;
+            }
+            if (entry.name?.startsWith('.')) continue;
+
+            const parentDepth = batchDepthById.get(parentId) ?? 0;
+            const nextDepth = parentDepth + 1;
+            if (!visitedFolders.has(entry.id) && nextDepth <= MAX_CRAWL_DEPTH) {
+              visitedFolders.add(entry.id);
+              discoveredFolderMap.set(entry.id, {
+                id: entry.id,
+                name: entry.name,
+                parentId,
+                depth: nextDepth,
+              });
+              folderQueue.push({ id: entry.id, depth: nextDepth });
+            }
+          }
+        },
+      });
+    }
+  }
+
+  const newlyAddedFolderIds = [];
+  for (const id of discoveredFolderMap.keys()) {
+    if (!initialFolderMap.has(id)) {
+      newlyAddedFolderIds.push(id);
+    }
+  }
+  let hasVanishedFolder = false;
+  for (const id of initialFolderMap.keys()) {
+    if (!discoveredFolderMap.has(id)) {
+      hasVanishedFolder = true;
+      break;
+    }
+  }
+
+  const upsertedMap = new Map();
+  const removedSet = new Set();
+
+  // Crawl newly discovered subfolders completely for all their media files
+  if (newlyAddedFolderIds.length > 0) {
+    for (const chunk of chunkItems(newlyAddedFolderIds, GROUP_BATCH_SIZE)) {
+      const chunkSet = new Set(chunk);
+      await listGroupedChildrenPages(chunk, resolvedAuth, {
+        fields: `nextPageToken,files(${DRIVE_FILE_FIELDS})`,
+        predicate: MEDIA_ONLY_PREDICATE,
+        pageSize: APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000,
+        signal,
+        onPage: (pageFiles) => {
+          const now = Date.now();
+          for (const entry of pageFiles) {
+            const parentId =
+              (Array.isArray(entry.parents) &&
+                (entry.parents.find((pid) => chunkSet.has(pid)) || entry.parents[0])) ||
+              (chunk.length === 1 ? chunk[0] : '');
+            if (parentId) {
+              upsertedMap.set(entry.id, normalizeDriveFile(entry, parentId, now));
+            }
+          }
+        },
+      });
+    }
+  }
+
+  // Step B: Watermark query (modifiedTime > W or createdTime > W) across all folders
+  const parsedWatermark = syncWatermark ? Date.parse(syncWatermark) : NaN;
+  const hasValidWatermark = Number.isFinite(parsedWatermark);
+  if (hasValidWatermark) {
+    const safeWatermarkIso = new Date(Math.max(0, parsedWatermark - 5 * 60 * 1000)).toISOString();
+    const watermarkPredicate = `${MEDIA_ONLY_PREDICATE} and (modifiedTime > '${safeWatermarkIso}' or createdTime > '${safeWatermarkIso}')`;
+    const allFolderIds = Array.from(discoveredFolderMap.keys());
+
+    for (const chunk of chunkItems(allFolderIds, GROUP_BATCH_SIZE)) {
+      const chunkSet = new Set(chunk);
+      await listGroupedChildrenPages(chunk, resolvedAuth, {
+        fields: `nextPageToken,files(${DRIVE_FILE_FIELDS})`,
+        predicate: watermarkPredicate,
+        pageSize: APP_CONFIG.DRIVE_LIST_PAGE_SIZE || 1000,
+        signal,
+        onPage: (pageFiles) => {
+          const now = Date.now();
+          for (const entry of pageFiles) {
+            const parentId =
+              (Array.isArray(entry.parents) &&
+                (entry.parents.find((pid) => chunkSet.has(pid)) || entry.parents[0])) ||
+              (chunk.length === 1 ? chunk[0] : '');
+            if (parentId) {
+              upsertedMap.set(entry.id, normalizeDriveFile(entry, parentId, now));
+            }
+          }
+        },
+      });
+    }
+  }
+
+  // Step C: Periodic or triggered ID-only sweep to reconcile removals & missed additions
+  let nextLastFullReconcileAt = Number(lastFullReconcileAt || 0);
+  const needsIdSweep =
+    forceFullReconcile ||
+    hasVanishedFolder ||
+    !hasValidWatermark ||
+    !nextLastFullReconcileAt ||
+    Date.now() - nextLastFullReconcileAt > 24 * 60 * 60 * 1000;
+
+  if (needsIdSweep) {
+    await runIdReconcileSweep({
+      folderMap: discoveredFolderMap,
+      knownFileIds,
+      upsertedMap,
+      removedSet,
+      auth: resolvedAuth,
+      fetchMissingDetails: true,
+      signal,
+    });
+    nextLastFullReconcileAt = Date.now();
+  }
+
+  const nextStartPageToken = resolvedAuth.accessToken
+    ? await fetchStartPageToken(resolvedAuth, rootFolder.driveId, signal)
+    : '';
+
+  return {
+    mode: 'watermark',
+    upsertedFiles: Array.from(upsertedMap.values()),
+    removedFileIds: Array.from(removedSet),
+    folders: Array.from(discoveredFolderMap.values()),
+    metaFolderId,
+    nextStartPageToken,
+    nextWatermark: syncStartIso,
+    lastFullReconcileAt: nextLastFullReconcileAt,
+    fullResult: null,
+  };
 }
 
 function triggerDownloadUrl(url, filename) {
@@ -622,11 +1541,11 @@ export async function downloadOriginalFile(item, accessToken, apiKey = '') {
 
   const fallbackDownloadUrl =
     item.webContentLink ||
-    `https://drive.google.com/uc?export=download&id=${encodeURIComponent(item.id)}`;
+    (item.id ? `https://drive.google.com/uc?export=download&id=${encodeURIComponent(item.id)}` : '');
 
   if (!accessToken && !apiKey) {
-    if (item.webContentLink) {
-      window.open(item.webContentLink, '_blank', 'noopener');
+    if (fallbackDownloadUrl) {
+      window.open(fallbackDownloadUrl, '_blank', 'noopener');
       return;
     }
     throw new Error(t('gdrive.missingDownloadAuth'));
@@ -639,12 +1558,8 @@ export async function downloadOriginalFile(item, accessToken, apiKey = '') {
   try {
     const resp = await fetchWithDriveBackoff(url, fetchOptions);
     if (!resp.ok) {
-      if (!accessToken && apiKey) {
+      if (fallbackDownloadUrl) {
         window.open(fallbackDownloadUrl, '_blank', 'noopener');
-        return;
-      }
-      if (item.webContentLink) {
-        window.open(item.webContentLink, '_blank', 'noopener');
         return;
       }
       throw new Error(t('gdrive.downloadFailedStatus', { status: resp.status }));
@@ -655,7 +1570,7 @@ export async function downloadOriginalFile(item, accessToken, apiKey = '') {
     triggerDownloadUrl(objUrl, item.name || 'photo');
     setTimeout(() => URL.revokeObjectURL(objUrl), 5000);
   } catch (err) {
-    if (!accessToken && apiKey) {
+    if (!accessToken && apiKey && fallbackDownloadUrl) {
       window.open(fallbackDownloadUrl, '_blank', 'noopener');
       return;
     }

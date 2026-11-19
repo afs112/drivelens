@@ -215,14 +215,7 @@ export function renderSidebar(container, store) {
   lastSidebarSignature = sig;
 
   const members = store.getMembersSummary();
-  const totalCount = state.files.length;
-  let favTotal = 0;
-  let unratedTotal = 0;
-  for (const f of state.files) {
-    const m = store.getAggregatedItemMeta(f.id);
-    if (m.favoriteCount > 0) favTotal += 1;
-    if (m.ratingCount === 0) unratedTotal += 1;
-  }
+  const { totalCount, favTotal, unratedTotal } = store.getLibraryStats();
 
   const hasActiveFilters =
     state.quickView !== 'all' ||

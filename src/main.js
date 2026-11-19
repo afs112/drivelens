@@ -67,7 +67,7 @@ function syncSmartHdPipeline(visiblePhotos = store.getVisiblePhotos()) {
     if (idx >= 0) {
       lightboxItems = visiblePhotos.slice(idx, idx + 4);
     } else {
-      const single = state.files.find((f) => f.id === state.lightboxPhotoId);
+      const single = store.getFileById(state.lightboxPhotoId);
       if (single) lightboxItems = [single];
     }
   }
