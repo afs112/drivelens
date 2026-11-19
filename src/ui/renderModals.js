@@ -7,7 +7,7 @@ import {
 } from '../api/gdrive.js';
 import { APP_CONFIG } from '../constants.js';
 import { t } from '../i18n.js';
-import { getTagColors } from '../state/store.js';
+import { getTagColors, saveConnectPrefs } from '../state/store.js';
 import { escapeAttr, escapeHtml, icon } from './icons.js';
 
 let selectedTagColor = 'blue';
@@ -80,6 +80,83 @@ function downloadTextFile(filename, content, mimeType) {
   setTimeout(() => URL.revokeObjectURL(url), 4000);
 }
 
+function parseSetupLinkInput(rawInput) {
+  const trimmed = String(rawInput || '').trim();
+  if (!trimmed) return null;
+
+  let searchStr = '';
+  let hashStr = '';
+  if (/^https?:\/\//i.test(trimmed)) {
+    try {
+      const parsed = new URL(trimmed);
+      searchStr = parsed.search || '';
+      hashStr = parsed.hash || '';
+    } catch {
+      return null;
+    }
+  } else if (trimmed.includes('=')) {
+    const normalized =
+      trimmed.startsWith('?') || trimmed.startsWith('#')
+        ? `https://drivelens.local/${trimmed}`
+        : `https://drivelens.local/?${trimmed}`;
+    try {
+      const parsed = new URL(normalized);
+      searchStr = parsed.search || '';
+      hashStr = parsed.hash || '';
+    } catch {
+      return null;
+    }
+  }
+
+  const sp = new URLSearchParams(searchStr);
+  const hp = new URLSearchParams(hashStr.startsWith('#') ? hashStr.slice(1) : hashStr);
+  const getParam = (name) => (hp.get(name) ?? sp.get(name) ?? '').trim();
+
+  const rawFolder = getParam('folder');
+  const folderId = rawFolder ? parseDriveFolderId(rawFolder) : '';
+  const clientId = getParam('client_id');
+  const apiKey = getParam('key');
+  const rawRenewal = getParam('renewal_url') || getParam('worker');
+  const tokenRenewalUrl = rawRenewal ? normalizeRenewalEndpoint(rawRenewal) : '';
+  if (rawRenewal && !tokenRenewalUrl) {
+    return { invalidRenewalUrl: true };
+  }
+  const nickname = getParam('nick') || getParam('nickname');
+  const rawLang = getParam('lang').toLowerCase();
+  const lang = rawLang === 'en' || rawLang === 'zh' ? rawLang : '';
+  const rawLayout = getParam('layout').toLowerCase();
+  const layout =
+    rawLayout === 'justified' || rawLayout === 'waterfall' || rawLayout === 'grid'
+      ? rawLayout
+      : '';
+
+  const fallbackDriveFolder =
+    !folderId &&
+    !clientId &&
+    !apiKey &&
+    !tokenRenewalUrl &&
+    !nickname &&
+    !lang &&
+    !layout &&
+    /^(https?:\/\/)?(drive|docs)\.google\.com\//i.test(trimmed)
+      ? parseDriveFolderId(trimmed)
+      : '';
+  const finalFolderId = folderId || fallbackDriveFolder;
+
+  const fields = {
+    folderId: finalFolderId,
+    clientId,
+    apiKey,
+    tokenRenewalUrl,
+    nickname,
+    lang,
+    layout,
+  };
+  const fieldCount = Object.values(fields).filter(Boolean).length;
+  if (fieldCount === 0) return null;
+  return { ...fields, fieldCount };
+}
+
 export function renderModals(container, store) {
   if (!container) return;
   const modal = store.state.modal;
@@ -148,11 +225,38 @@ export function renderModals(container, store) {
       ? `<div class="form-help" style="color:var(--accent)">${escapeHtml(t('modal.savedAccountBadge', { email: store.state.savedOAuthUser.email }))}</div>`
       : '';
 
+    const importLinkHtml = `
+      <div class="form-field">
+        <label class="form-label" for="importSetupLinkInput">${escapeHtml(t('modal.importSetupLinkLabel'))}</label>
+        <div style="display:flex;align-items:center;gap:8px">
+          <input
+            id="importSetupLinkInput"
+            class="form-input"
+            type="text"
+            inputmode="url"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="${escapeAttr(t('modal.importSetupLinkPlaceholder'))}"
+            style="flex:1;min-width:0"
+          />
+          <button
+            type="button"
+            class="btn btn-sm"
+            data-action="import-setup-link"
+            style="flex-shrink:0"
+          >${icon('download', 13)} ${escapeHtml(t('modal.importSetupLinkBtn'))}</button>
+        </div>
+        <span class="form-help">${escapeHtml(t('modal.importSetupLinkHint'))}</span>
+      </div>
+    `;
+
     const formHtml =
       activeTab === 'apikey'
         ? `
           <form id="connectApiKeyForm">
             <div class="modal-body">
+              ${importLinkHtml}
+
               <div class="form-field">
                 <label class="form-label" for="apiKeyInput">${escapeHtml(t('modal.apiKeyLabel'))}</label>
                 <input id="apiKeyInput" class="form-input" type="text" placeholder="${escapeAttr(t('modal.apiKeyPlaceholder'))}" value="${escapeAttr(apiKeyVal)}" required />
@@ -208,6 +312,8 @@ export function renderModals(container, store) {
         : `
           <form id="connectDriveForm">
             <div class="modal-body">
+              ${importLinkHtml}
+
               <div class="form-field">
                 <label class="form-label" for="clientIdInput">${escapeHtml(t('modal.clientIdLabel'))}</label>
                 <input id="clientIdInput" class="form-input" type="text" placeholder="${escapeAttr(t('modal.clientIdPlaceholder'))}" value="${escapeAttr(clientIdVal)}" required />
@@ -503,6 +609,13 @@ export function renderModals(container, store) {
 export function bindModalEvents(container, store) {
   if (!container) return;
 
+  container.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && e.target?.id === 'importSetupLinkInput') {
+      e.preventDefault();
+      container.querySelector('[data-action="import-setup-link"]')?.click();
+    }
+  });
+
   container.addEventListener('input', (e) => {
     if (e.target.id === 'quickTagSearchInput') {
       quickTagSearch = e.target.value;
@@ -625,6 +738,103 @@ export function bindModalEvents(container, store) {
         tokenRenewalUrl,
         rememberCredentials,
       });
+      return;
+    }
+
+    if (e.target.closest('[data-action="import-setup-link"]')) {
+      const linkInput = container.querySelector('#importSetupLinkInput');
+      let rawText = String(linkInput?.value || '').trim();
+      if (!rawText && typeof navigator !== 'undefined' && navigator.clipboard?.readText) {
+        try {
+          rawText = String((await navigator.clipboard.readText()) || '').trim();
+        } catch {
+          // Ignore clipboard permission denial
+        }
+      }
+      if (!rawText) {
+        linkInput?.focus();
+        store.toast(t('modal.importSetupLinkEmpty'), 'info');
+        return;
+      }
+
+      const parsed = parseSetupLinkInput(rawText);
+      if (parsed?.invalidRenewalUrl) {
+        linkInput?.focus();
+        store.toast(t('modal.invalidRenewalUrl'), 'error');
+        return;
+      }
+      if (!parsed) {
+        linkInput?.focus();
+        store.toast(t('modal.importSetupLinkInvalid'), 'error');
+        return;
+      }
+
+      const targetAuth =
+        parsed.apiKey && !parsed.clientId
+          ? 'apikey'
+          : parsed.clientId || parsed.tokenRenewalUrl
+            ? 'oauth'
+            : connectTab || store.state.authType || 'oauth';
+      connectTab = targetAuth;
+
+      if (parsed.lang) {
+        store.setLanguage(parsed.lang);
+      }
+      if (parsed.layout) {
+        store.setLayoutMode(parsed.layout);
+      }
+
+      const remEl =
+        container.querySelector('#rememberOAuthCheck') ||
+        container.querySelector('#rememberApiKeyCheck');
+      const rememberCredentials = remEl
+        ? Boolean(remEl.checked)
+        : store.state.rememberCredentials !== false;
+      const patch = {
+        authType: targetAuth,
+        rememberCredentials,
+      };
+      if (parsed.folderId) patch.folderId = parsed.folderId;
+      if (parsed.clientId) patch.clientId = parsed.clientId;
+      if (parsed.apiKey) patch.apiKey = parsed.apiKey;
+      if (parsed.tokenRenewalUrl) patch.tokenRenewalUrl = parsed.tokenRenewalUrl;
+      if (parsed.nickname) patch.nickname = parsed.nickname;
+
+      if (rememberCredentials) {
+        saveConnectPrefs({
+          authType: targetAuth,
+          folderId: patch.folderId ?? store.state.folderId ?? '',
+          clientId: patch.clientId ?? store.state.clientId ?? '',
+          apiKey: patch.apiKey ?? store.state.apiKey ?? '',
+          tokenRenewalUrl: patch.tokenRenewalUrl ?? store.state.tokenRenewalUrl ?? '',
+          nickname: patch.nickname ?? store.state.nickname ?? '',
+          rememberCredentials: true,
+          autoConnect: true,
+        });
+      }
+
+      store.setState(patch, { type: 'ui-only' });
+      renderModals(container, store);
+
+      if (parsed.clientId || parsed.tokenRenewalUrl || (parsed.folderId && targetAuth === 'oauth')) {
+        store.toast(
+          t('modal.importSetupLinkSuccessOAuth', { count: parsed.fieldCount }),
+          'success',
+          4800
+        );
+      } else if (parsed.apiKey || (parsed.folderId && targetAuth === 'apikey')) {
+        store.toast(
+          t('modal.importSetupLinkSuccessApiKey', { count: parsed.fieldCount }),
+          'success',
+          4800
+        );
+      } else {
+        store.toast(
+          t('modal.importSetupLinkSuccessGeneric', { count: parsed.fieldCount }),
+          'success',
+          3800
+        );
+      }
       return;
     }
 

@@ -63,7 +63,7 @@
    - 复制生成的 **客户端 ID**（`xxx.apps.googleusercontent.com`）。
    - 打开 **[https://afs112.github.io/drivelens/#lang=zh](https://afs112.github.io/drivelens/#lang=zh)**，切换到 **OAuth 账号登录** 标签页，填入相册链接与您的 Client ID，点击 **授权并打开相册**。
    - 拥有文件夹 **编辑者（Editor）** 权限的协作者会自动将评分、标签和批注同步至相册内的 `.drivelens/` 目录；**查看者（Viewer）** 权限则可正常看图并在本地暂存评分。
-   - 在 **OAuth 账号登录** 标签页点击 **复制一键配置链接**（会自动导出相册 ID、Client ID 与可选的 Worker 地址；同时兼容 `#` 与 `?` 参数及 `&worker=` 别名），或按下面格式发给已加入测试用户的朋友。打开链接并保存配置后，系统会**立即自动清空地址栏敏感参数**（`folder`、`client_id`、`key`、`renewal_url`、`worker`、`nick`），避免分享当前页面链接时意外泄露参数：
+   - 在 **OAuth 账号登录** 标签页点击 **复制一键配置链接**（会自动导出相册 ID、Client ID 与可选的 Worker 地址；同时兼容 `#` 与 `?` 参数及 `&worker=` 别名），或按下面格式发给已加入测试用户的朋友。打开链接并保存配置后，系统会**立即自动清空地址栏敏感参数**（`folder`、`client_id`、`key`、`renewal_url`、`worker`、`nick`），避免分享当前页面链接时意外泄露参数。若使用桌面/手机上**没有地址栏的独立 App（PWA）**，也可以直接在连接弹窗顶部的 **从配置链接导入** 中粘贴链接（或留空直接点击 **导入** 读取剪贴板）完成配置：
      ```text
      https://afs112.github.io/drivelens/#folder=<FOLDER_ID>&client_id=<YOUR_CLIENT_ID>&lang=zh
      ```

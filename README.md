@@ -63,7 +63,7 @@ Best when photos must stay private to invited Google accounts, or when multiple 
    - Copy the generated **Client ID** (`<YOUR_CLIENT_ID>.apps.googleusercontent.com`).
    - Open **[https://afs112.github.io/drivelens/](https://afs112.github.io/drivelens/)**, switch to the **OAuth Account Sign-In** tab, paste your **Folder Link/ID** and **Client ID**, and click **Authorize & Open Album**.
    - Collaborators with **Editor** access automatically sync ratings, tags, and notes to `.drivelens/` inside the Drive folder; **Viewer** accounts save picks locally.
-   - Click **Copy 1-Click Setup Link** in the OAuth tab (includes Folder + Client ID + optional Worker URL; accepts both `#` hash and `?` query parameters as well as `&worker=` alias) or share this format with your test-user friends. Opening the link saves settings locally and **immediately clears sensitive URL parameters** (`folder`, `client_id`, `key`, `renewal_url`, `worker`, `nick`):
+   - Click **Copy 1-Click Setup Link** in the OAuth tab (includes Folder + Client ID + optional Worker URL; accepts both `#` hash and `?` query parameters as well as `&worker=` alias) or share this format with your test-user friends. Opening the link saves settings locally and **immediately clears sensitive URL parameters** (`folder`, `client_id`, `key`, `renewal_url`, `worker`, `nick`). Using an installed **Home Screen / standalone Web App (PWA)** with no address bar? Paste the 1-click setup link directly into **Import from Setup Link** inside the Connect modal instead:
      ```text
      https://afs112.github.io/drivelens/#folder=<FOLDER_ID>&client_id=<YOUR_CLIENT_ID>
      ```
