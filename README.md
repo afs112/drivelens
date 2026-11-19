@@ -70,7 +70,51 @@ Best when photos must stay private to invited Google accounts, or when multiple 
 
 ---
 
-## 3. Quick Self-Deployment (Own Domain or Local LAN in 1 Minute)
+## 3. Solving Google 1-Hour Sign-In Expiry (Solution A Pure Static vs. Solution B Auto-Renewal Worker)
+
+### Why Google OAuth Expires After 1 Hour
+
+Pure-frontend web apps receive a **60-minute** `access_token` from Google Identity Services (GIS) without a `refresh_token`, because Google requires a confidential server-side `client_secret` to issue and exchange refresh tokens. DriveLens solves this cleanly with two built-in options:
+
+### Solution A — Pure Static Page (Default · Zero Extra Deployment)
+
+Built into DriveLens out of the box whenever **Token Renewal Endpoint (Optional)** is left blank:
+
+- **Never Kicked Out**: When the 60-minute `access_token` expires, your cached album and photos stay open on screen, and any new star ratings, favorites, tags, or notes buffer safely in your browser.
+- **1-Click `0.5s` Flash Reconnect**: The top-right sync indicator switches to **Reconnect (`!`)** (or red **`!`** if you have unsynced edits). Click it **once** and DriveLens directly invokes GIS with `prompt: ''` and your saved account hint—no Connect modal and no re-selecting your account; the popup auto-closes in `~0.5s` and immediately flushes all pending ratings to `.drivelens/`.
+- **Hybrid API Key Tip**: If your folder is link-shared and you have also saved an **API Key**, photo browsing, thumbnail self-healing, and incremental new-photo refresh continue running on the non-expiring API Key—you only ever reconnect OAuth when writing ratings!
+
+### Solution B — Permanent Background Silent Auto-Renewal (Free Cloudflare Worker · ~3 Mins Setup · Zero Credentials in GitHub!)
+
+For users who want native-app-style **sign in once for months** with zero popups across refreshes, tab wakes, and PWA restarts:
+
+#### Step 1: Google Cloud Console Setup
+
+1. Open your Web OAuth Client in [Google Cloud Console](https://console.cloud.google.com/) (**APIs & Services → Credentials**) and copy its **Client Secret** (`<YOUR_OAUTH_CLIENT_SECRET>` — **keep it strictly private and NEVER commit it to GitHub!**).
+2. Ensure your site origin (`https://afs112.github.io` or `https://<your-username>.github.io`) is listed under **Authorized JavaScript origins**. Google's popup code flow automatically uses `postmessage`, so no extra redirect URI is needed (you can leave **Authorized redirect URIs** empty).
+3. *(Important Google Tip)*: Under **OAuth consent screen / Audience**, if **Publishing status** is **Testing**, Google forces refresh tokens to expire every **7 days**. Click **Publish App** (free; for personal or small-group unverified apps, users simply click *"Advanced → Go to ... (unsafe)"* once on first sign-in, and the refresh token lasts for months instead of 7 days!).
+
+#### Step 2: Deploy [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js) to Cloudflare Workers (Free Tier: 100k req/day)
+
+*Browser Dashboard Method (No CLI needed)*:
+
+1. Sign in to [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Compute (Workers & Pages) → Create → Create Worker**.
+2. Click **Deploy**, then click **Edit Code**, paste the entire contents of [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js), and click **Deploy**.
+3. Open your Worker → **Settings → Variables and Secrets → + Add**:
+   - Add **Secret**: Name = `GOOGLE_CLIENT_SECRET`, Value = `<YOUR_OAUTH_CLIENT_SECRET>` *(MUST select type **Secret** so it is encrypted!)*.
+   - Add **Text Variable**: Name = `ALLOWED_ORIGINS`, Value = `https://afs112.github.io` *(comma-separated if adding `http://localhost:5173` or your own fork origin)*.
+   - *(Optional Extra Security)* Add **Secret**: Name = `TICKET_ENC_KEY`, Value = `<ANY_RANDOM_32_CHAR_PASSPHRASE>` *(encrypts the Google refresh token with `AES-256-GCM` so the browser only ever holds an opaque encrypted ticket!)*.
+   - *(Optional)* Add **Text Variable**: Name = `ALLOWED_CLIENT_IDS`, Value = `<YOUR_CLIENT_ID>.apps.googleusercontent.com`.
+4. Test your Worker by opening `https://<your-worker>.<your-subdomain>.workers.dev/health` in your browser—it should return `{"ok":true,"service":"drivelens-oauth-renewal",...}`.
+
+#### Step 3: Connect in DriveLens
+
+1. Open DriveLens → **Connect Drive → OAuth Account Sign-In**, paste `https://<your-worker>.<your-subdomain>.workers.dev` into **Token Renewal Endpoint (Optional)**, and sign in once.
+2. Your Worker URL is saved **only in your own browser's `localStorage`** (never in GitHub). DriveLens will now silently renew your `access_token` in the background every ~55 minutes (5 minutes before expiry), on tab wake, and automatically upon reopening the browser or PWA! *(You can also pass `#folder=<FOLDER_ID>&client_id=<YOUR_CLIENT_ID>&renewal_url=https://<your-worker>.<your-subdomain>.workers.dev` in a direct share link.)*
+
+---
+
+## 4. Quick Self-Deployment (Own Domain or Local LAN in 1 Minute)
 
 DriveLens uses native browser ES Modules with **zero build steps** and **no Node.js / npm required**.
 
@@ -103,7 +147,7 @@ Requires only **Python 3**:
 
 ---
 
-## 4. Practical User Guide & Controls Cheat-Sheet
+## 5. Practical User Guide & Controls Cheat-Sheet
 
 ### Browsing, Layouts & Multimodal Search
 
@@ -137,8 +181,8 @@ Requires only **Python 3**:
 
 ### Top-Right Sync & Refresh Indicator
 
-- **Red `!` badge**: Cloud sync failed or edits have not synced yet—click the sync button to retry immediately.
-- **Amber `!` badge**: Read-only Drive access or static API Key mode—your ratings and notes are safely saved **locally in this browser**.
+- **Red `!` badge**: Cloud sync failed or edits have not synced yet—click the sync button to retry immediately (or perform a 1-click `0.5s` OAuth reconnect and flush pending ratings).
+- **Amber `!` / `Reconnect` badge**: Read-only Drive access, static API Key mode (ratings saved locally in this browser), or expired OAuth session—click **Reconnect** once for instant `0.5s` OAuth renewal without opening the settings modal.
 - **Refresh vs. Full Rescan**: Click **Refresh** for fast incremental Drive sync (`changes.list` / watermark), or **`Shift + Click`** Refresh to force a full folder rescan.
 
 ### 2–4 Photo Side-by-Side Compare (`C`) & Export Picks
@@ -167,7 +211,7 @@ Requires only **Python 3**:
 
 ---
 
-## 5. Installing as Desktop / Mobile App (PWA) & Security Guarantee
+## 6. Installing as Desktop / Mobile App (PWA) & Security Guarantee
 
 ### Install as a Standalone App (PWA)
 
@@ -179,7 +223,7 @@ Service Worker caching ([`sw.js`](sw.js)) and PWA installation activate automati
 
 ### Persistent Credentials & Zero-Secret Guarantee
 
-- **Auto-Reconnect**: **Remember login credentials & auto-reconnect** is enabled by default so refreshing or relaunching the PWA restores your album automatically. In OAuth mode, after Google's 1-hour access token expires, DriveLens keeps your email hint for 1-click re-consent.
+- **Auto-Reconnect**: **Remember login credentials & auto-reconnect** is enabled by default so refreshing or relaunching the PWA restores your album automatically. In OAuth mode, Solution A preserves your email hint for 1-click `0.5s` re-consent (`prompt: ''`), while Solution B (optional Cloudflare Worker) stores an encrypted refresh ticket in your browser to renew silently in the background.
 - **One-Click Wipe**: Click **Forget Saved Credentials** in the Connect modal to immediately clear saved API keys, Client IDs, tokens, and recent albums, or click **Clear Cache** to wipe local IndexedDB album/thumbnail caches.
 - **Zero Secrets in Repository**: This repository contains **zero** API keys, OAuth Client IDs, folder IDs, emails, or tokens ([`src/constants.js`](src/constants.js) holds empty defaults only; [`.gitignore`](.gitignore) blocks `config*.js`, `.env*`, `*credentials*`, `*secret*`, and `.local-meta/`).
 

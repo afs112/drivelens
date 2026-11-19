@@ -1909,24 +1909,44 @@ def verify_mobile_ux(parsed_js):
         if missing:
             errors.append(f"{rel_js} missing touch handler(s): {missing}")
 
-    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v11'
+    # 4. sw.js defines CACHE_NAME = 'drivelens-shell-v12'
     checks += 1
     sw_path = ROOT_DIR / "sw.js"
     if not sw_path.is_file():
         errors.append("Missing sw.js")
     else:
         sw_toks = tokenize_js(sw_path.read_text(encoding="utf-8"), filename="sw.js")
-        has_v11 = any(
+        has_v12 = any(
             sw_toks[i].kind == "IDENT"
             and sw_toks[i].value == "CACHE_NAME"
             and sw_toks[i + 1].kind == "PUNCT"
             and sw_toks[i + 1].value == "="
             and sw_toks[i + 2].kind == "STRING"
-            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v11"
+            and unquote_string(sw_toks[i + 2].value) == "drivelens-shell-v12"
             for i in range(len(sw_toks) - 2)
         )
-        if not has_v11:
-            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v11'")
+        if not has_v12:
+            errors.append("sw.js does not define CACHE_NAME = 'drivelens-shell-v12'")
+
+    # 5. workers/oauth-renewal-worker.js exists, tokenizes cleanly, and exports default fetch handler
+    checks += 1
+    worker_path = ROOT_DIR / "workers" / "oauth-renewal-worker.js"
+    if not worker_path.is_file():
+        errors.append("Missing workers/oauth-renewal-worker.js")
+    else:
+        worker_text = worker_path.read_text(encoding="utf-8")
+        try:
+            worker_toks = tokenize_js(worker_text, filename="workers/oauth-renewal-worker.js")
+        except SyntaxError as exc:
+            errors.append(f"workers/oauth-renewal-worker.js syntax/balance error: {exc}")
+            worker_toks = []
+        if worker_toks:
+            _, worker_exports, _ = extract_imports_and_exports(worker_toks)
+            if "default" not in worker_exports:
+                errors.append("workers/oauth-renewal-worker.js missing default export")
+            has_fetch = any(tok.kind == "IDENT" and tok.value == "fetch" for tok in worker_toks)
+            if not has_fetch:
+                errors.append("workers/oauth-renewal-worker.js missing fetch handler")
 
     # 5. albumCache.js and renderGallery.js exports
     checks += 1
@@ -2084,7 +2104,7 @@ def main():
             print(f"      - {e}")
         all_errors.extend(mob_errors)
     else:
-        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v2, and README section preserved.")
+        print("    PASS: viewport-fit=cover, #mobileNavBar, safe-area & 16px CSS, touch gestures, sw v12, worker export, and README section preserved.")
 
     print("=" * 56)
     if all_errors:

@@ -67,6 +67,7 @@ export function renderModals(container, store) {
     const nicknameVal = store.state.nickname || store.state.currentUser?.name || '';
     const clientIdVal = store.state.clientId || APP_CONFIG.DEFAULT_CLIENT_ID || '';
     const folderVal = store.state.folderId || APP_CONFIG.DEFAULT_FOLDER_ID || '';
+    const renewalUrlVal = store.state.tokenRenewalUrl || '';
     const recent = store.state.recentAlbums || [];
 
     const recentHtml =
@@ -102,7 +103,7 @@ export function renderModals(container, store) {
 
     const rememberChecked = store.state.rememberCredentials !== false ? 'checked' : '';
     const hasSavedCreds = Boolean(
-      apiKeyVal || clientIdVal || folderVal || store.state.savedOAuthUser
+      apiKeyVal || clientIdVal || folderVal || renewalUrlVal || store.state.savedOAuthUser
     );
     const forgetCredsBtn = hasSavedCreds
       ? `<button type="button" class="btn btn-ghost btn-sm" data-action="forget-creds">${icon('trash', 13)} ${escapeHtml(t('modal.forgetCredsBtn'))}</button>`
@@ -177,6 +178,19 @@ export function renderModals(container, store) {
                 <label class="form-label" for="folderUrlInput">${escapeHtml(t('modal.folderUrlLabel'))}</label>
                 <input id="folderUrlInput" class="form-input" type="text" placeholder="${escapeAttr(t('modal.folderUrlPlaceholder'))}" value="${escapeAttr(folderVal)}" required />
                 <span class="form-help">${escapeHtml(t('modal.oauthFolderHelp'))}</span>
+              </div>
+
+              <div class="form-field">
+                <label class="form-label" for="tokenRenewalUrlInput">${escapeHtml(t('modal.renewalUrlLabel'))}</label>
+                <input
+                  id="tokenRenewalUrlInput"
+                  class="form-input"
+                  type="url"
+                  placeholder="${escapeAttr(t('modal.renewalUrlPlaceholder'))}"
+                  value="${escapeAttr(renewalUrlVal)}"
+                  autocomplete="off"
+                />
+                <span class="form-help">${escapeHtml(t('modal.renewalUrlHelp'))}</span>
               </div>
 
               <label class="switch-label">
@@ -483,6 +497,7 @@ export function bindModalEvents(container, store) {
       e.preventDefault();
       const clientId = container.querySelector('#clientIdInput')?.value || '';
       const folderInput = container.querySelector('#folderUrlInput')?.value || '';
+      const tokenRenewalUrl = container.querySelector('#tokenRenewalUrlInput')?.value || '';
       const rememberCredentials = Boolean(
         container.querySelector('#rememberOAuthCheck')?.checked
       );
@@ -491,6 +506,7 @@ export function bindModalEvents(container, store) {
       await store.connectGoogleDrive({
         clientId,
         folderInput,
+        tokenRenewalUrl,
         rememberCredentials,
         prompt: useSaved ? '' : 'select_account',
         ...(useSaved ? { loginHint: savedUser.email || '' } : {}),

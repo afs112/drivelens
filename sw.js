@@ -1,4 +1,4 @@
-const CACHE_NAME = 'drivelens-shell-v11';
+const CACHE_NAME = 'drivelens-shell-v12';
 const PRECACHE_ASSETS = [
   './',
   './index.html',

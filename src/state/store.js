@@ -13,9 +13,12 @@ import {
   clearSession,
   getCachedSession,
   getSavedOAuthUser,
+  hasStoredRenewalTicket,
   loadSharedAlbum,
   loadSharedAlbumWithApiKey,
+  normalizeRenewalEndpoint,
   parseDriveFolderId,
+  renewOAuthSessionSilently,
   syncAlbumIncremental,
 } from '../api/gdrive.js';
 import {
@@ -131,6 +134,7 @@ export function loadConnectPrefs() {
       apiKey: parsed.apiKey || APP_CONFIG.DEFAULT_API_KEY || '',
       clientId: parsed.clientId || APP_CONFIG.DEFAULT_CLIENT_ID || '',
       folderId: parsed.folderId || APP_CONFIG.DEFAULT_FOLDER_ID || '',
+      tokenRenewalUrl: normalizeRenewalEndpoint(parsed.tokenRenewalUrl || ''),
       nickname: parsed.nickname || defaultNick,
       rememberCredentials: parsed.rememberCredentials !== false,
       autoConnect: Boolean(parsed.autoConnect),
@@ -141,6 +145,7 @@ export function loadConnectPrefs() {
       apiKey: APP_CONFIG.DEFAULT_API_KEY || '',
       clientId: APP_CONFIG.DEFAULT_CLIENT_ID || '',
       folderId: APP_CONFIG.DEFAULT_FOLDER_ID || '',
+      tokenRenewalUrl: '',
       nickname: defaultNick,
       rememberCredentials: true,
       autoConnect: false,
@@ -151,7 +156,11 @@ export function loadConnectPrefs() {
 function saveConnectPrefs(patch) {
   try {
     const prev = loadConnectPrefs();
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify({ ...prev, ...patch }));
+    const next = { ...prev, ...patch };
+    if ('tokenRenewalUrl' in next) {
+      next.tokenRenewalUrl = normalizeRenewalEndpoint(next.tokenRenewalUrl || '');
+    }
+    localStorage.setItem(SETTINGS_KEY, JSON.stringify(next));
   } catch {
     // Ignore
   }
@@ -331,6 +340,8 @@ export class Store {
     this._lastFullReconcileAt = 0;
     this._unsyncedPhotoIds = new Set();
     this._unsyncedSchemaDirty = false;
+    this._sessionExpiresAt = 0;
+    this._sessionTimer = 0;
 
     const initialLang = setLangCode(getLang());
     const prefs = loadConnectPrefs();
@@ -352,6 +363,7 @@ export class Store {
       nickname: prefs.nickname,
       clientId: prefs.clientId,
       folderId: prefs.folderId,
+      tokenRenewalUrl: prefs.tokenRenewalUrl || '',
       rememberCredentials: prefs.rememberCredentials,
       savedOAuthUser: getSavedOAuthUser(prefs.clientId),
       canInstallPwa: false,
@@ -400,6 +412,14 @@ export class Store {
 
     if (typeof document !== 'undefined') {
       document.documentElement.setAttribute('data-theme', this.state.theme);
+      if (typeof document.addEventListener === 'function') {
+        this._onVisibilityChange = () => {
+          if (document.visibilityState === 'visible') {
+            this._checkOrRenewSession().catch(() => {});
+          }
+        };
+        document.addEventListener('visibilitychange', this._onVisibilityChange, { passive: true });
+      }
     }
     setThumbnailLinkHealedCallback(({ patches }) => {
       if (!patches || !(patches instanceof Map) || patches.size === 0) return;
@@ -650,10 +670,108 @@ export class Store {
     this._unsyncedSchemaDirty = false;
   }
 
+  _clearSessionLifecycle() {
+    if (this._sessionTimer) {
+      clearTimeout(this._sessionTimer);
+      this._sessionTimer = 0;
+    }
+    this._sessionExpiresAt = 0;
+  }
+
+  _scheduleSessionLifecycle(expiresAt) {
+    if (this._sessionTimer) {
+      clearTimeout(this._sessionTimer);
+      this._sessionTimer = 0;
+    }
+    const exp = Number(expiresAt || 0);
+    this._sessionExpiresAt = exp;
+    if (!exp || this.state.authType !== 'oauth') {
+      return;
+    }
+    const delayMs = Math.min(2147483647, Math.max(1000, exp - Date.now() - 5 * 60 * 1000));
+    this._sessionTimer = setTimeout(() => {
+      this._sessionTimer = 0;
+      this._checkOrRenewSession().catch(() => {});
+    }, delayMs);
+  }
+
+  async _checkOrRenewSession() {
+    if (this.state.mode !== 'gdrive' || this.state.authType !== 'oauth') {
+      return false;
+    }
+    if (!this._sessionExpiresAt) {
+      return false;
+    }
+    if (Date.now() < this._sessionExpiresAt - 5 * 60 * 1000) {
+      if (!this._sessionTimer) {
+        this._scheduleSessionLifecycle(this._sessionExpiresAt);
+      }
+      return false;
+    }
+
+    if (this.state.tokenRenewalUrl && this.state.clientId) {
+      const renewed = await renewOAuthSessionSilently(
+        this.state.clientId,
+        this.state.tokenRenewalUrl,
+        { remember: this.state.rememberCredentials }
+      );
+      if (this.state.mode !== 'gdrive' || this.state.authType !== 'oauth') {
+        return false;
+      }
+      if (renewed?.accessToken) {
+        this.setState(
+          {
+            accessToken: renewed.accessToken,
+            ...(renewed.user ? { currentUser: renewed.user } : {}),
+          },
+          { type: 'ui-only' }
+        );
+        this._scheduleSessionLifecycle(renewed.expiresAt);
+        if (this._unsyncedPhotoIds.size > 0) {
+          await this._flushMemberSync();
+        }
+        if (this._unsyncedSchemaDirty) {
+          await this._flushSchemaSync();
+        }
+        return true;
+      }
+    }
+
+    if (Date.now() >= this._sessionExpiresAt - 30_000) {
+      const hasPending = this._unsyncedPhotoIds.size > 0 || this._unsyncedSchemaDirty;
+      if (this.state.accessToken) {
+        this.setState(
+          {
+            accessToken: '',
+            syncStatus: hasPending ? 'error' : 'readonly',
+            syncMessageKey: 'store.syncCachedSessionExpired',
+            syncMessage: t('store.syncCachedSessionExpired'),
+          },
+          { type: 'ui-only' }
+        );
+      }
+      this._clearSessionLifecycle();
+      return false;
+    }
+
+    if (!this._sessionTimer && this._sessionExpiresAt > 0) {
+      const untilBoundary = Math.max(1000, this._sessionExpiresAt - 30_000 - Date.now());
+      const retryDelay = this.state.tokenRenewalUrl
+        ? Math.min(60_000, untilBoundary)
+        : untilBoundary;
+      this._sessionTimer = setTimeout(() => {
+        this._sessionTimer = 0;
+        this._checkOrRenewSession().catch(() => {});
+      }, retryDelay);
+    }
+    return false;
+  }
+
   loadDemoMode(showNotice = true, disableAutoConnect = false) {
     const wasGdrive = this.state?.mode === 'gdrive';
     this.connectSeq += 1;
     clearTimeout(this.cacheSnapshotTimer);
+    this._clearSessionLifecycle();
     this._resetUnsyncedTracking();
     if (disableAutoConnect) {
       saveConnectPrefs({ autoConnect: false });
@@ -1059,6 +1177,7 @@ export class Store {
   async connectGoogleDrive({
     clientId,
     folderInput,
+    tokenRenewalUrl = this.state.tokenRenewalUrl,
     reuseSession = false,
     rememberCredentials = this.state.rememberCredentials,
     prompt,
@@ -1067,6 +1186,7 @@ export class Store {
   }) {
     const cleanClientId = String(clientId || '').trim();
     const cleanFolderId = parseDriveFolderId(folderInput);
+    const cleanRenewalUrl = normalizeRenewalEndpoint(tokenRenewalUrl);
     const remember = rememberCredentials !== false;
 
     if (!cleanClientId) {
@@ -1093,6 +1213,7 @@ export class Store {
         authType: 'oauth',
         clientId: cleanClientId,
         folderId: cleanFolderId,
+        tokenRenewalUrl: cleanRenewalUrl,
         rememberCredentials: true,
         autoConnect: true,
       });
@@ -1104,8 +1225,9 @@ export class Store {
         apiKey: '',
         clientId: '',
         folderId: '',
+        tokenRenewalUrl: '',
       });
-      clearSession({ forgetUser: true });
+      clearSession({ forgetUser: true, clearRenewal: true });
     }
 
     const cachedBeforeAuth = !forceRescan ? await getCachedAlbum('oauth', cleanFolderId) : null;
@@ -1129,6 +1251,14 @@ export class Store {
         syncMessageKey: 'store.syncCachedRevalidating',
         backgroundRefreshing: true,
       });
+      this.setState(
+        {
+          tokenRenewalUrl: cleanRenewalUrl,
+          rememberCredentials: remember,
+          savedOAuthUser: remember ? existingSavedUser : null,
+        },
+        { type: 'ui-only' }
+      );
       this._updateUrlHash(cleanFolderId, cleanClientId);
       this.toast(
         t('store.loadedFromCacheToast', {
@@ -1147,6 +1277,7 @@ export class Store {
         localMetaSupported: false,
         clientId: cleanClientId,
         folderId: cleanFolderId,
+        tokenRenewalUrl: cleanRenewalUrl,
         rememberCredentials: remember,
         savedOAuthUser: remember ? existingSavedUser : null,
         ...(keepVisible
@@ -1166,6 +1297,7 @@ export class Store {
           prompt: effectivePrompt,
           loginHint: effectiveHint,
           remember,
+          tokenRenewalUrl: cleanRenewalUrl,
         });
       }
       if (reqSeq !== this.connectSeq) return false;
@@ -1186,7 +1318,9 @@ export class Store {
         accessToken: session.accessToken,
         currentUser: session.user,
         savedOAuthUser: nextSavedUser,
+        tokenRenewalUrl: cleanRenewalUrl,
       });
+      this._scheduleSessionLifecycle(session.expiresAt);
 
       // Cache-first fast path: hydrate immediately and run background incremental sync
       if (hasUsableCache) {
@@ -1388,6 +1522,7 @@ export class Store {
     }
 
     const reqSeq = ++this.connectSeq;
+    this._clearSessionLifecycle();
     if (this.state.mode !== 'gdrive' || this.state.folderId !== cleanFolderId) {
       this._resetUnsyncedTracking();
     }
@@ -1409,8 +1544,9 @@ export class Store {
         apiKey: '',
         clientId: '',
         folderId: '',
+        tokenRenewalUrl: '',
       });
-      clearSession({ forgetUser: true });
+      clearSession({ forgetUser: true, clearRenewal: true });
     }
 
     const userId = `nick_${sanitizeMemberKey(cleanNick)}`;
@@ -1652,12 +1788,14 @@ export class Store {
     }
   }
 
-  async restoreExpiredOAuthCacheOrPrompt({ clientId, folderInput }) {
-    const cleanClientId = String(clientId || '').trim();
-    const cleanFolderId = parseDriveFolderId(folderInput);
-    const savedUser = getSavedOAuthUser(cleanClientId);
-    const cached = cleanFolderId ? await getCachedAlbum('oauth', cleanFolderId) : null;
-
+  _applyExpiredOAuthFallback({
+    cleanClientId,
+    cleanFolderId,
+    folderInput,
+    cleanRenewalUrl,
+    savedUser,
+    cached,
+  }) {
     if (cached) {
       this._hydrateFromAlbumCache(cached, {
         authType: 'oauth',
@@ -1674,7 +1812,13 @@ export class Store {
         syncMessageKey: 'store.syncCachedSessionExpired',
         backgroundRefreshing: false,
       });
-      this.setState({ savedOAuthUser: savedUser });
+      this.setState(
+        {
+          savedOAuthUser: savedUser,
+          tokenRenewalUrl: cleanRenewalUrl,
+        },
+        { type: 'ui-only' }
+      );
       this._updateUrlHash(cleanFolderId, cleanClientId);
       this.toast(
         t('store.cachedSessionReconnectHint', {
@@ -1689,6 +1833,7 @@ export class Store {
       authType: 'oauth',
       clientId: cleanClientId,
       folderId: folderInput,
+      tokenRenewalUrl: cleanRenewalUrl,
       savedOAuthUser: savedUser,
     });
     this.openModal('connect');
@@ -1701,6 +1846,83 @@ export class Store {
       );
     }
     return false;
+  }
+
+  async restoreExpiredOAuthCacheOrPrompt({
+    clientId,
+    folderInput,
+    tokenRenewalUrl = this.state.tokenRenewalUrl,
+  }) {
+    const cleanClientId = String(clientId || '').trim();
+    const cleanFolderId = parseDriveFolderId(folderInput);
+    const cleanRenewalUrl = normalizeRenewalEndpoint(tokenRenewalUrl);
+    const savedUser = getSavedOAuthUser(cleanClientId);
+    const cached = cleanFolderId ? await getCachedAlbum('oauth', cleanFolderId) : null;
+
+    if (
+      cleanClientId &&
+      cleanRenewalUrl &&
+      hasStoredRenewalTicket(cleanClientId, cleanRenewalUrl)
+    ) {
+      const reqSeq = ++this.connectSeq;
+      const hasUsableCache = Boolean(cached && cached.files?.length > 0);
+      if (hasUsableCache) {
+        this._hydrateFromAlbumCache(cached, {
+          authType: 'oauth',
+          folderId: cleanFolderId,
+          clientId: cleanClientId,
+          user: savedUser || this.state.currentUser,
+          syncStatus: 'syncing',
+          syncMessageKey: 'store.syncCachedRevalidating',
+          backgroundRefreshing: true,
+        });
+        this.setState(
+          {
+            savedOAuthUser: savedUser,
+            tokenRenewalUrl: cleanRenewalUrl,
+          },
+          { type: 'ui-only' }
+        );
+        this._updateUrlHash(cleanFolderId, cleanClientId);
+      }
+
+      const renewed = await renewOAuthSessionSilently(cleanClientId, cleanRenewalUrl, {
+        remember: this.state.rememberCredentials,
+      });
+      if (reqSeq !== this.connectSeq) return false;
+      if (renewed?.accessToken) {
+        if (hasUsableCache) {
+          this.setState(
+            {
+              accessToken: renewed.accessToken,
+              currentUser: renewed.user,
+              savedOAuthUser: getSavedOAuthUser(cleanClientId) || savedUser,
+              tokenRenewalUrl: cleanRenewalUrl,
+            },
+            { type: 'ui-only' }
+          );
+          this._scheduleSessionLifecycle(renewed.expiresAt);
+          await this._performIncrementalSync({ reqSeq, showToast: false });
+          return true;
+        }
+        return this.connectGoogleDrive({
+          clientId: cleanClientId,
+          folderInput,
+          tokenRenewalUrl: cleanRenewalUrl,
+          reuseSession: true,
+          rememberCredentials: this.state.rememberCredentials,
+        });
+      }
+    }
+
+    return this._applyExpiredOAuthFallback({
+      cleanClientId,
+      cleanFolderId,
+      folderInput,
+      cleanRenewalUrl,
+      savedUser,
+      cached,
+    });
   }
 
   async restoreSavedSession() {
@@ -1723,14 +1945,85 @@ export class Store {
         return this.connectGoogleDrive({
           clientId: prefs.clientId,
           folderInput: prefs.folderId,
+          tokenRenewalUrl: prefs.tokenRenewalUrl,
           reuseSession: true,
           rememberCredentials: true,
+        });
+      }
+
+      if (prefs.tokenRenewalUrl) {
+        const cleanFolderId = parseDriveFolderId(prefs.folderId);
+        const reqSeq = ++this.connectSeq;
+        const savedUser = getSavedOAuthUser(prefs.clientId);
+        const cached = cleanFolderId ? await getCachedAlbum('oauth', cleanFolderId) : null;
+        if (reqSeq !== this.connectSeq) return false;
+
+        const hasUsableCache = Boolean(cached && cached.files?.length > 0);
+        if (hasUsableCache) {
+          this._hydrateFromAlbumCache(cached, {
+            authType: 'oauth',
+            folderId: cleanFolderId,
+            clientId: prefs.clientId,
+            user: savedUser || this.state.currentUser,
+            syncStatus: 'syncing',
+            syncMessageKey: 'store.syncCachedRevalidating',
+            backgroundRefreshing: true,
+          });
+          this.setState(
+            {
+              savedOAuthUser: savedUser,
+              tokenRenewalUrl: prefs.tokenRenewalUrl,
+              rememberCredentials: true,
+            },
+            { type: 'ui-only' }
+          );
+          this._updateUrlHash(cleanFolderId, prefs.clientId);
+        }
+
+        const renewed = await renewOAuthSessionSilently(
+          prefs.clientId,
+          prefs.tokenRenewalUrl,
+          { remember: true }
+        );
+        if (reqSeq !== this.connectSeq) return false;
+        if (renewed?.accessToken) {
+          if (hasUsableCache) {
+            this.setState(
+              {
+                accessToken: renewed.accessToken,
+                currentUser: renewed.user,
+                savedOAuthUser: getSavedOAuthUser(prefs.clientId) || savedUser,
+                tokenRenewalUrl: prefs.tokenRenewalUrl,
+              },
+              { type: 'ui-only' }
+            );
+            this._scheduleSessionLifecycle(renewed.expiresAt);
+            await this._performIncrementalSync({ reqSeq, showToast: false });
+            return true;
+          }
+          return this.connectGoogleDrive({
+            clientId: prefs.clientId,
+            folderInput: prefs.folderId,
+            tokenRenewalUrl: prefs.tokenRenewalUrl,
+            reuseSession: true,
+            rememberCredentials: true,
+          });
+        }
+
+        return this._applyExpiredOAuthFallback({
+          cleanClientId: prefs.clientId,
+          cleanFolderId,
+          folderInput: prefs.folderId,
+          cleanRenewalUrl: prefs.tokenRenewalUrl,
+          savedUser,
+          cached,
         });
       }
 
       return this.restoreExpiredOAuthCacheOrPrompt({
         clientId: prefs.clientId,
         folderInput: prefs.folderId,
+        tokenRenewalUrl: prefs.tokenRenewalUrl,
       });
     }
 
@@ -1745,7 +2038,8 @@ export class Store {
 
   forgetSavedCredentials() {
     this.connectSeq += 1;
-    clearSession({ forgetUser: true });
+    this._clearSessionLifecycle();
+    clearSession({ forgetUser: true, clearRenewal: true });
     clearAllAlbumCaches().catch(() => {});
     clearImageCache().catch(() => {});
     try {
@@ -1771,6 +2065,7 @@ export class Store {
       apiKey: '',
       clientId: '',
       folderId: '',
+      tokenRenewalUrl: '',
       nickname: defaultNick,
       recentAlbums: [],
       savedOAuthUser: null,
@@ -1804,11 +2099,38 @@ export class Store {
       if (cachedSess?.accessToken) {
         accessToken = cachedSess.accessToken;
         this.setState({ accessToken }, { type: 'ui-only' });
-      } else if (showToast && this.state.clientId) {
+        this._scheduleSessionLifecycle(cachedSess.expiresAt);
+      } else if (
+        this.state.tokenRenewalUrl &&
+        this.state.clientId &&
+        hasStoredRenewalTicket(this.state.clientId, this.state.tokenRenewalUrl)
+      ) {
+        const renewed = await renewOAuthSessionSilently(
+          this.state.clientId,
+          this.state.tokenRenewalUrl,
+          { remember: this.state.rememberCredentials }
+        );
+        if (reqSeq !== this.connectSeq) return false;
+        if (renewed?.accessToken) {
+          accessToken = renewed.accessToken;
+          this.setState(
+            { accessToken, currentUser: renewed.user },
+            { type: 'ui-only' }
+          );
+          this._scheduleSessionLifecycle(renewed.expiresAt);
+        }
+      }
+    }
+
+    const usingApiKeyAssist = isOAuth && !accessToken && Boolean(this.state.apiKey);
+
+    if (isOAuth && !accessToken && !usingApiKeyAssist) {
+      if (showToast && this.state.clientId) {
         const sess = await authenticateGoogle(this.state.clientId, {
           prompt: '',
-          loginHint: this.state.savedOAuthUser?.email || '',
+          loginHint: this.state.savedOAuthUser?.email || this.state.currentUser?.email || '',
           remember: this.state.rememberCredentials,
+          tokenRenewalUrl: this.state.tokenRenewalUrl,
         });
         if (reqSeq !== this.connectSeq) return false;
         accessToken = sess.accessToken;
@@ -1816,11 +2138,13 @@ export class Store {
           { accessToken, currentUser: sess.user },
           { type: 'ui-only' }
         );
+        this._scheduleSessionLifecycle(sess.expiresAt);
       } else {
+        const hasPending = this._unsyncedPhotoIds.size > 0 || this._unsyncedSchemaDirty;
         this.setState(
           {
             backgroundRefreshing: false,
-            syncStatus: 'readonly',
+            syncStatus: hasPending ? 'error' : 'readonly',
             syncMessageKey: 'store.syncCachedSessionExpired',
             syncMessage: t('store.syncCachedSessionExpired'),
           },
@@ -1849,12 +2173,12 @@ export class Store {
         rootFolder: this.state.rootFolder,
         existingFolders: this.state.folders,
         existingFileIds: new Set(this._fileById.keys()),
-        auth: isOAuth ? { accessToken } : { apiKey: this.state.apiKey },
+        auth: isOAuth && accessToken ? { accessToken } : { apiKey: this.state.apiKey },
         startPageToken: this._startPageToken || '',
         syncWatermark: watermark,
         lastFullReconcileAt: this._lastFullReconcileAt || 0,
         forceFullReconcile: false,
-        captureMetaFolder: isOAuth,
+        captureMetaFolder: isOAuth && Boolean(accessToken),
       });
       if (reqSeq !== this.connectSeq) return false;
 
@@ -1881,7 +2205,7 @@ export class Store {
           let localMetaSupported = this.state.localMetaSupported;
           const myId = this.state.currentUser?.id;
 
-          if (isOAuth && fullAlbum.metaFolderId) {
+          if (isOAuth && accessToken && fullAlbum.metaFolderId) {
             const meta = await loadAlbumMetadata(fullAlbum.metaFolderId, accessToken);
             if (reqSeq !== this.connectSeq) return false;
             const merged = this._mergeFreshWithLocalEdits(
@@ -1929,13 +2253,21 @@ export class Store {
           });
           if (reqSeq !== this.connectSeq) return false;
 
-          const msgKey = isOAuth
-            ? fullAlbum.canWrite
-              ? 'store.syncOAuthSynced'
-              : 'store.syncReadonly'
-            : localMetaSupported
-              ? 'store.syncApiKeySynced'
-              : 'store.syncApiKeyLocal';
+          const hasPendingAfterFull =
+            isOAuth &&
+            fullAlbum.canWrite &&
+            (this._unsyncedPhotoIds.size > 0 || this._unsyncedSchemaDirty);
+          const msgKey = usingApiKeyAssist
+            ? hasPendingAfterFull
+              ? 'store.syncErrorAuth'
+              : 'store.syncCachedSessionExpired'
+            : isOAuth
+              ? fullAlbum.canWrite
+                ? 'store.syncOAuthSynced'
+                : 'store.syncReadonly'
+              : localMetaSupported
+                ? 'store.syncApiKeySynced'
+                : 'store.syncApiKeyLocal';
 
           this._commitLoadedAlbumState({
             authType,
@@ -1947,7 +2279,17 @@ export class Store {
             membersData,
             canWrite: fullAlbum.canWrite,
             localMetaSupported,
-            syncStatus: isOAuth ? (fullAlbum.canWrite ? 'synced' : 'readonly') : localMetaSupported ? 'synced' : 'readonly',
+            syncStatus: usingApiKeyAssist
+              ? hasPendingAfterFull
+                ? 'error'
+                : 'readonly'
+              : isOAuth
+                ? fullAlbum.canWrite
+                  ? 'synced'
+                  : 'readonly'
+                : localMetaSupported
+                  ? 'synced'
+                  : 'readonly',
             syncMessageKey: msgKey,
             recent: this.state.recentAlbums,
           });
@@ -2035,7 +2377,7 @@ export class Store {
       let metaChanged = false;
       const myId = this.state.currentUser?.id;
 
-      if (isOAuth && nextMetaFolderId) {
+      if (isOAuth && accessToken && nextMetaFolderId) {
         try {
           const meta = await loadAlbumMetadata(nextMetaFolderId, accessToken);
           if (reqSeq !== this.connectSeq) return false;
@@ -2140,30 +2482,38 @@ export class Store {
       const hasPendingWrite =
         ((isOAuth && this.state.canWrite) || (!isOAuth && localMetaSupported)) &&
         (this._unsyncedPhotoIds.size > 0 || this._unsyncedSchemaDirty);
-      const syncStatus = hasPendingWrite
-        ? this.memberSyncTimer || this.schemaSyncTimer
-          ? 'syncing'
-          : 'error'
-        : isOAuth
-          ? this.state.canWrite
-            ? 'synced'
-            : 'readonly'
-          : localMetaSupported
-            ? 'synced'
-            : 'readonly';
-      const syncMessageKey = hasPendingWrite
-        ? this.memberSyncTimer || this.schemaSyncTimer
-          ? 'store.syncSavingRatings'
+      const syncStatus = usingApiKeyAssist
+        ? hasPendingWrite
+          ? 'error'
+          : 'readonly'
+        : hasPendingWrite
+          ? this.memberSyncTimer || this.schemaSyncTimer
+            ? 'syncing'
+            : 'error'
           : isOAuth
-            ? 'store.syncErrorAuth'
-            : 'store.syncErrorLocal'
-        : isOAuth
-          ? this.state.canWrite
-            ? 'store.syncOAuthSynced'
-            : 'store.syncReadonly'
-          : localMetaSupported
-            ? 'store.syncApiKeySynced'
-            : 'store.syncApiKeyLocal';
+            ? this.state.canWrite
+              ? 'synced'
+              : 'readonly'
+            : localMetaSupported
+              ? 'synced'
+              : 'readonly';
+      const syncMessageKey = usingApiKeyAssist
+        ? hasPendingWrite
+          ? 'store.syncErrorAuth'
+          : 'store.syncCachedSessionExpired'
+        : hasPendingWrite
+          ? this.memberSyncTimer || this.schemaSyncTimer
+            ? 'store.syncSavingRatings'
+            : isOAuth
+              ? 'store.syncErrorAuth'
+              : 'store.syncErrorLocal'
+          : isOAuth
+            ? this.state.canWrite
+              ? 'store.syncOAuthSynced'
+              : 'store.syncReadonly'
+            : localMetaSupported
+              ? 'store.syncApiKeySynced'
+              : 'store.syncApiKeyLocal';
 
       const foldersChanged = nextFolders.length !== this.state.folders.length || nextFolders !== this.state.folders;
       const changeType = deltaCount > 0 || foldersChanged || metaChanged ? 'full' : 'ui-only';
@@ -2267,6 +2617,7 @@ export class Store {
 
   disconnectGoogleDrive() {
     this.connectSeq += 1;
+    this._clearSessionLifecycle();
     clearSession();
     this._startPageToken = '';
     this._syncWatermark = '';
@@ -2287,6 +2638,7 @@ export class Store {
       params.delete('folder');
       params.delete('client_id');
       params.delete('key');
+      params.delete('renewal_url');
       const rest = params.toString();
       const nextUrl = `${window.location.pathname}${window.location.search}${rest ? `#${rest}` : ''}`;
       window.history.replaceState(null, '', nextUrl);
@@ -3166,10 +3518,28 @@ export class Store {
       };
     }
 
-    const isWritableOAuthMissingToken =
-      s.authType === 'oauth' && s.canWrite && !s.accessToken;
+    const isOAuthMissingToken = s.authType === 'oauth' && !s.accessToken;
 
-    if (s.syncStatus === 'error' || (isWritableOAuthMissingToken && pendingCount > 0)) {
+    if (isOAuthMissingToken) {
+      if (pendingCount > 0) {
+        return {
+          level: 'danger',
+          badgeCount: pendingCount,
+          isSpinning: false,
+          title: t('header.syncExpiredUnsyncedTitle', { count: pendingCount }),
+          shortLabel: t('header.syncUnsyncedShort'),
+        };
+      }
+      return {
+        level: 'warn',
+        badgeCount: 1,
+        isSpinning: false,
+        title: t('header.syncSessionExpiredClick'),
+        shortLabel: t('header.syncReconnectShort'),
+      };
+    }
+
+    if (s.syncStatus === 'error') {
       const count = Math.max(1, pendingCount);
       return {
         level: 'danger',
@@ -3217,9 +3587,80 @@ export class Store {
     }
 
     if (this.state.authType === 'oauth' && !this.state.accessToken) {
-      this.openModal('connect');
-      this.toast(t('toast.reauthToSync'), 'info');
-      return false;
+      if (!this.state.clientId) {
+        this.openModal('connect');
+        this.toast(t('toast.reauthToSync'), 'info');
+        return false;
+      }
+
+      let session = null;
+      if (
+        this.state.tokenRenewalUrl &&
+        hasStoredRenewalTicket(this.state.clientId, this.state.tokenRenewalUrl)
+      ) {
+        session = await renewOAuthSessionSilently(
+          this.state.clientId,
+          this.state.tokenRenewalUrl,
+          { remember: this.state.rememberCredentials }
+        );
+      }
+
+      if (!session) {
+        try {
+          session = await authenticateGoogle(this.state.clientId, {
+            prompt: '',
+            loginHint:
+              this.state.savedOAuthUser?.email || this.state.currentUser?.email || '',
+            remember: this.state.rememberCredentials,
+            tokenRenewalUrl: this.state.tokenRenewalUrl,
+          });
+        } catch (err) {
+          this.openModal('connect');
+          this.toast(err?.message || t('toast.reauthToSync'), 'info');
+          return false;
+        }
+      }
+
+      const remember = this.state.rememberCredentials !== false;
+      const nextSavedUser = remember
+        ? getSavedOAuthUser(this.state.clientId) || {
+            clientId: this.state.clientId,
+            id: session.user.id,
+            email: session.user.email,
+            name: session.user.name,
+            picture: session.user.picture,
+            color: session.user.color,
+          }
+        : this.state.savedOAuthUser;
+
+      this.setState({
+        accessToken: session.accessToken,
+        currentUser: session.user,
+        savedOAuthUser: nextSavedUser,
+      });
+      this._scheduleSessionLifecycle(session.expiresAt);
+
+      const hadMemberTimer = Boolean(this.memberSyncTimer);
+      if (this.memberSyncTimer) {
+        clearTimeout(this.memberSyncTimer);
+        this.memberSyncTimer = null;
+      }
+      const hadSchemaTimer = Boolean(this.schemaSyncTimer);
+      if (this.schemaSyncTimer) {
+        clearTimeout(this.schemaSyncTimer);
+        this.schemaSyncTimer = null;
+      }
+
+      if (this.state.canWrite && (this._unsyncedPhotoIds.size > 0 || hadMemberTimer)) {
+        await this._flushMemberSync();
+      }
+      if (this.state.canWrite && (this._unsyncedSchemaDirty || hadSchemaTimer)) {
+        await this._flushSchemaSync();
+      }
+
+      await this.refreshAlbum({ fullRescan });
+      this.toast(t('toast.sessionRenewedSynced'), 'success');
+      return true;
     }
 
     let flushedAny = false;

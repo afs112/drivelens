@@ -69,7 +69,51 @@
 
 ---
 
-## 3. 快速自部署（1 分钟拥有专属域名或局域网版）
+## 3. 彻底解决 Google 1 小时登录过期（方案 A 纯静态零部署 vs. 方案 B 后台静默自动续期）
+
+### 为什么 Google OAuth 登录会在 1 小时后过期？
+
+纯前端网页通过 Google Identity Services（GIS）登录时，Google 只会下发有效期 **60 分钟** 的 `access_token`，而不会直接给前端下发 `refresh_token`（因为签发与刷新 `refresh_token` 必须由服务端保密的 `client_secret` 完成）。为此，DriveLens 内置了两种无需改代码的解决方式：
+
+### 方案 A — 纯静态页面（默认方案 · 零额外部署）
+
+只要将连接弹窗中的 **Token 续期接口（可选）** 留空，DriveLens 即默认启用方案 A：
+
+- **永不踢出相册**：即使 60 分钟令牌过期，已打开的相册与照片画面仍会保留在屏幕上；您继续打星、收藏、贴标签或写批注都会安全暂存在浏览器本地。
+- **一键 `0.5s` 闪连续期**：右上角同步指示器会变为 **点此续期（`!`）**（若有未同步修改则显示红色 **`!` 徽标**）。直接点一下该按钮，DriveLens 会携带您保存的账号提示以 `prompt: ''` 静默唤起授权（无需打开设置弹窗、也无需重新选账号，弹窗约 `0.5 秒` 自动闪闭并立刻把暂存评分全部上传至 `.drivelens/`！）。
+- **API Key 混合看图技巧**：如果您的文件夹开启了链接共享，同时在连接设置中填过一次 **API Key**，那么即使 OAuth 令牌已过期，浏览照片、缩略图自愈以及增量刷新新照片都会自动通过永不过期的 API Key 完成——只有写回云端评分时才需要点一下续期！
+
+### 方案 B — 后台永久静默自动续期（免费 Cloudflare Worker · 约 3 分钟配置 · GitHub 零凭据！）
+
+如果您希望像原生 App 一样**登录一次管几个月**，无论是刷新网页、切回休眠标签页还是重启 PWA 都不再弹窗：
+
+#### 第 1 步：在 Google Cloud Console 获取 Client Secret
+
+1. 打开 [Google Cloud Console](https://console.cloud.google.com/) → **API 和服务 → 凭据**，点开您的 Web OAuth 客户端，复制 **客户端密钥（Client Secret）**（`<YOUR_OAUTH_CLIENT_SECRET>` —— **请严格保密，绝对不要提交到 GitHub！**）。
+2. 确认 **已获授权的 JavaScript 来源** 中已填入您的站点 Origin（例如 `https://afs112.github.io` 或 `https://<您的用户名>.github.io`）。Google 的弹窗授权码流程会自动使用 `postmessage`，因此无需填写额外重定向 URI（**已获授权的重定向 URI** 可保持为空）。
+3. *（Google 重要避坑提示）*：在 **OAuth 同意屏幕 / 受众（Audience）** 页面中，如果发布状态是 **测试中（Testing）**，Google 会强制让 `refresh_token` 每 **7 天** 过期一次。将其点击 **发布应用（Publish App）** 设为生产状态即可免费解决（个人或小团队未过审应用只需在首次登录时点一次 *“高级 → 继续前往（不安全）”*，之后刷新令牌即可持续有效数月而不再受 7 天限制！）。
+
+#### 第 2 步：将 [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js) 部署到 Cloudflare Workers（免费版每日 10 万次请求）
+
+*网页控制台零命令行部署法*：
+
+1. 登录 [Cloudflare Dashboard](https://dash.cloudflare.com/) → **Compute (Workers & Pages) → Create → Create Worker**。
+2. 先点击 **Deploy** 创建 Worker，接着点击 **Edit Code（编辑代码）**，将本仓库 [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js) 的全部代码粘贴覆盖进去，再次点击 **Deploy**。
+3. 进入该 Worker 的 **Settings → Variables and Secrets → + Add**：
+   - 添加 **Secret（密钥）**：Name 填 `GOOGLE_CLIENT_SECRET`，Value 填 `<YOUR_OAUTH_CLIENT_SECRET>`（*类型务必选 **Secret** 以加密保存！*）。
+   - 添加 **Text Variable（文本变量）**：Name 填 `ALLOWED_ORIGINS`，Value 填 `https://afs112.github.io`（*如有多个域名或本地 `http://localhost:5173`，用英文逗号分隔*）。
+   - *（可选进阶加固）* 添加 **Secret（密钥）**：Name 填 `TICKET_ENC_KEY`，Value 填 `<ANY_RANDOM_32_CHAR_PASSPHRASE>`（*开启后 Worker 会用 `AES-256-GCM` 加密 Google 刷新令牌，浏览器仅保存密文 `refresh_ticket`，原始刷新令牌永不离开 Cloudflare！*）。
+   - *（可选）* 添加 **Text Variable**：Name 填 `ALLOWED_CLIENT_IDS`，Value 填 `<YOUR_CLIENT_ID>.apps.googleusercontent.com`。
+4. 在浏览器打开 `https://<your-worker>.<your-subdomain>.workers.dev/health` 自检，返回 `{"ok":true,"service":"drivelens-oauth-renewal",...}` 即部署成功。
+
+#### 第 3 步：在 DriveLens 中填入 Worker 地址
+
+1. 打开 DriveLens → **连接 Drive → OAuth 账号登录**，将 `https://<your-worker>.<your-subdomain>.workers.dev` 粘贴到 **Token 续期接口（可选）**，完成一次登录授权即可。
+2. 您的 Worker 地址**仅保存在当前浏览器的 `localStorage` 中**（不会写入 GitHub 仓库）。此后 DriveLens 会在令牌过期前 5 分钟（约每 55 分钟）、标签页唤醒时以及每次重新打开网页 / PWA 时于后台静默续期，全程零弹窗！（*也可在分享直达链接中附带 `&renewal_url=https://<your-worker>.<your-subdomain>.workers.dev` 参数。*）
+
+---
+
+## 4. 快速自部署（1 分钟拥有专属域名或局域网版）
 
 DriveLens 采用浏览器原生 ES Modules，**零构建步骤、无需安装 Node.js 或 npm**。
 
@@ -102,7 +146,7 @@ DriveLens 采用浏览器原生 ES Modules，**零构建步骤、无需安装 No
 
 ---
 
-## 4. 实用操作指南与快捷方式速查
+## 5. 实用操作指南与快捷方式速查
 
 ### 看图视图与多模态搜索
 
@@ -136,8 +180,8 @@ DriveLens 采用浏览器原生 ES Modules，**零构建步骤、无需安装 No
 
 ### 右上角同步状态指示器与刷新
 
-- **红色 `!` 徽标**：表示存在未同步成功的修改或云端同步失败——点击同步按钮即可立即重试同步。
-- **琥珀色 `!` 徽标**：表示当前为只读权限或静态站点 API Key 模式，您的评分和批注已安全保存在**当前浏览器本地**。
+- **红色 `!` 徽标**：表示存在未同步成功的修改或云端同步失败——点击同步按钮即可立即重试同步（若为 OAuth 过期，单击即可触发 `0.5s` 闪连续期并立即上传暂存修改）。
+- **琥珀色 `!` / `点此续期` 徽标**：表示当前为只读权限、静态站点 API Key 模式（评分已安全保存在本地），或 OAuth 会话已过期——单击 **点此续期** 即可无需打开设置弹窗一键 `0.5s` 重新授权。
 - **普通刷新 vs 强制全量扫描**：直接点击 **刷新** 会执行极速增量检查；**`Shift + 单击`** 刷新可强制执行全相册重新扫描。
 
 ### 2–4 张同屏对比（`C`）与导出精选
@@ -166,7 +210,7 @@ DriveLens 采用浏览器原生 ES Modules，**零构建步骤、无需安装 No
 
 ---
 
-## 5. 安装为桌面 / 手机独立 App（PWA）与零凭据安全保障
+## 6. 安装为桌面 / 手机独立 App（PWA）与零凭据安全保障
 
 ### 安装为独立应用（PWA）
 
@@ -178,13 +222,13 @@ DriveLens 采用浏览器原生 ES Modules，**零构建步骤、无需安装 No
 
 ### 记住凭据、自动重连与零秘密保证
 
-- **自动重连**：连接弹窗默认勾选 **记住登录凭据并自动重连**。刷新或重新打开 PWA 会自动恢复上次相册；OAuth 的 1 小时临时令牌过期后，仍会保留邮箱提示以便一键重新授权。
+- **自动重连**：连接弹窗默认勾选 **记住登录凭据并自动重连**。刷新或重新打开 PWA 会自动恢复上次相册；OAuth 1 小时临时令牌过期后，方案 A 会保留邮箱提示支持一键 `0.5s` 闪连续期，方案 B（可选 Cloudflare Worker）则通过加密刷新票据在后台静默自动续期。
 - **一键清除**：在连接弹窗随时点击 **清除已保存凭据** 即可抹除本地保存的 API Key、Client ID、Token 与最近相册记录；点击 **清除缓存** 可清空本地相册与缩略图缓存。
 - **零秘密仓库保证**：本仓库**不包含任何** API Key、OAuth Client ID、文件夹 ID、邮箱或本地密钥（[`src/constants.js`](src/constants.js) 仅含空字符串默认值，[`.gitignore`](.gitignore) 明确屏蔽 `config*.js`、`.env*`、`*credentials*`、`*secret*` 与 `.local-meta/`）。
 
 ---
 
-## 6. 设计灵感与独立性声明（Design Inspiration & Independence）
+## 7. 设计灵感与独立性声明（Design Inspiration & Independence）
 
 - **UX 灵感致敬**：DriveLens 的暗房级视觉配色、高效键盘打分流（`1–5`、`0`、`F`、`T`）以及多图并排对比交互体验灵感源自 [julyx10/lap](https://github.com/julyx10/lap)。
 - **完全独立项目**：DriveLens 从零独立设计与编写，是一款纯前端原生 Web 应用，专为 **Google Drive** 共享文件夹的零安装浏览器/PWA 看图与多人无冲突协同选片而打造。

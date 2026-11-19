@@ -25,7 +25,7 @@
 - **Document Shell Meta Tags ([`index.html`](index.html))**:
   - Includes `<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />`, `<meta name="theme-color" content="#0b0e14" />`, `<meta name="apple-mobile-web-app-capable" content="yes" />`, `<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />`, `<meta name="apple-mobile-web-app-title" content="DriveLens" />`, `<link rel="manifest" href="./manifest.webmanifest" />`, and `<link rel="apple-touch-icon" href="./icons/icon-192.png" />`.
 - **Service Worker ([`sw.js`](sw.js))**:
-  - Maintains `CACHE_NAME = 'drivelens-shell-v9'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
+  - Maintains `CACHE_NAME = 'drivelens-shell-v12'` and precaches `PRECACHE_ASSETS` (14 local shell paths: `./`, `./index.html`, `./manifest.webmanifest`, all 3 icons, all 4 CSS stylesheets, `src/main.js`, `src/constants.js`, `src/i18n.js`, and `src/storage/albumCache.js`) during `install`, calling `self.skipWaiting()`.
   - Deletes older `drivelens-*` cache buckets during `activate` and calls `self.clients.claim()`.
   - Intercepts only same-origin `GET` requests excluding `/api/` paths (so `serve.py` `/api/meta`, Google Drive API calls, GIS scripts, and `googleusercontent.com` thumbnails always bypass the Service Worker cache). Uses a **Network-First** strategy that refreshes cached `response.type === 'basic'` assets online and falls back to `caches.match()` or `./index.html` (for navigations) when offline.
 - **Install Prompt Lifecycle (`src/main.js`, `src/state/store.js`, `src/ui/renderHeader.js`)**:
@@ -44,15 +44,17 @@ Browser / Installed PWA Startup (src/main.js)
   │           ├── Remember + autoConnect (API Key) -> silent connectWithApiKey()
   │           ├── Remember + autoConnect (OAuth)
   │           │     ├── Unexpired token in drivelens_session_v1 -> silent connectGoogleDrive({ reuseSession: true })
-  │           │     └── Expired token -> open Connect modal with drivelens_oauth_user_v1 email hint + toast
+  │           │     ├── Expired token + tokenRenewalUrl -> hydrate cache + silent POST /refresh (0 popups)
+  │           │     └── Expired token (Solution A) -> hydrate cache + 1-click 0.5s prompt:'' reconnect / API-Key read fallback
   │           └── Otherwise -> stay in Offline Demo Album (src/demo/demoAlbum.js)
   ├── Mode 1 — API Key Direct Connect (Zero-OAuth):
   │     ├── Auth: Drive API Key (?key=AIzaSy...) + link-shared Drive folder + local nickname
   │     ├── Media: Drive API v3 -> thumbnailLink / drive.google.com/thumbnail / lh3 / alt=media + IndexedDB
   │     └── Sync: serve.py GET/POST /api/meta (.local-meta/<folder>.json) -> fallback localStorage
-  ├── Mode 2 — OAuth 2.0 Account Sign-In:
-  │     ├── Auth: Google Identity Services (GIS) -> Token Flow -> drivelens_session_v1 + drivelens_oauth_user_v1
-  │     ├── Media: Drive API v3 (Bearer Token, private/Shared Drives, authorized video stream)
+  ├── Mode 2 — OAuth 2.0 Account Sign-In (Dual-Mode Session Lifecycle):
+  │     ├── Auth (Solution A): GIS initTokenClient -> drivelens_session_v1 + drivelens_oauth_user_v1 + 1-click prompt:'' reconnect
+  │     ├── Auth (Solution B): GIS initCodeClient -> Worker /exchange -> AES-256-GCM drivelens_oauth_renewal_v1 -> silent /refresh
+  │     ├── Media: Drive API v3 (Bearer Token, private/Shared Drives, authorized video stream; API-Key read fallback if configured)
   │     └── Sync: Google Drive .drivelens/ (tags-schema.json + member-<key>.json) -> read-only localStorage
   └── Offline Demo Layer (src/demo/demoAlbum.js):
         └── Pure i18n.js-driven EN/ZH SVG dataset (5 folders, 16 media, 3 personas) + localStorage (drivelens_demo_state_v1)
@@ -68,7 +70,9 @@ Browser / Installed PWA Startup (src/main.js)
 drivelens/
 ├── index.html                   # Single-page shell (<html lang="en">, viewport-fit=cover), PWA meta links, 14 mount IDs
 ├── manifest.webmanifest         # Web App Manifest (relative ./ scope, standalone display, icon references)
-├── sw.js                        # Service Worker (drivelens-shell-v9 precache, Network-First same-origin shell cache)
+├── sw.js                        # Service Worker (drivelens-shell-v12 precache, Network-First same-origin shell cache)
+├── workers/
+│   └── oauth-renewal-worker.js  # Optional Cloudflare Worker (/health, /exchange, /refresh) with AES-256-GCM ticket sealing
 ├── icons/
 │   ├── icon.svg                 # Scalable vector app icon (any maskable)
 │   ├── icon-192.png             # 192x192 RGBA PNG app icon & apple-touch-icon
@@ -175,8 +179,9 @@ flowchart TD
 | `src/constants.js` | `APP_CONFIG` | Empty credential placeholders, `THUMBNAIL_CONCURRENCY` (`12`), `DRIVE_LIST_PAGE_SIZE` (`1000`), `DRIVE_MAX_RETRIES` (`4`), `DRIVE_MAX_BACKOFF_MS` (`32000`), `SYNC_DEBOUNCE_MS` (`800`) |
 | `src/i18n.js` | `SUPPORTED_LANGS`, `MESSAGES`, `getLang`, `setLangCode`, `getLocaleTag`, `t` | Strict `'en'`-default localization runtime, 444-key EN/ZH parity, `{param}` interpolation, sole CJK string store |
 | `serve.py` | `create_server`, `NoCacheStaticHandler`, `ReusableThreadingHTTPServer` | Static serving with strict MIME types (`.js`/`.mjs`, `.css`, `.webmanifest`, `.png`), `--open`/`--dry-run`, thread-safe `GET/POST /api/meta` |
-| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 14 core shell files (`drivelens-shell-v10`), Network-First same-origin cache, excludes cross-origin & `/api/` |
-| `src/api/gdrive.js` | `parseDriveFolderId`, `ensureGoogleIdentityLoaded`, `getCachedSession`, `getSavedOAuthUser`, `clearSession`, `authenticateGoogle`, `fetchWithDriveBackoff`, `fetchFreshThumbnailLink`, `fetchBatchThumbnailLinks`, `buildDriveWebViewLink`, `loadSharedAlbum`, `loadSharedAlbumWithApiKey`, `syncAlbumIncremental`, `downloadOriginalFile` | Truncated exponential backoff (`2^n + jitter`), grouped `25`-folder BFS crawler with binary-split fallback, OAuth `changes.list` & API Key watermark incremental sync, `parents+name` batch thumbnail repair, GIS OAuth & file download |
+| `sw.js` | `CACHE_NAME`, `PRECACHE_ASSETS` (worker scope) | Precaches 14 core shell files (`drivelens-shell-v12`), Network-First same-origin cache, excludes cross-origin & `/api/` |
+| `workers/oauth-renewal-worker.js` | `default` (`fetch` handler) | Optional zero-secret Cloudflare Worker (`/health`, `/exchange`, `/refresh`) exchanging GIS auth codes and sealing refresh tokens with `AES-256-GCM` (`TICKET_ENC_KEY`) |
+| `src/api/gdrive.js` | `parseDriveFolderId`, `ensureGoogleIdentityLoaded`, `getCachedSession`, `getSavedOAuthUser`, `clearSession`, `normalizeRenewalEndpoint`, `hasStoredRenewalTicket`, `renewOAuthSessionSilently`, `authenticateGoogle`, `fetchWithDriveBackoff`, `fetchFreshThumbnailLink`, `fetchBatchThumbnailLinks`, `buildDriveWebViewLink`, `loadSharedAlbum`, `loadSharedAlbumWithApiKey`, `syncAlbumIncremental`, `downloadOriginalFile` | Truncated exponential backoff (`2^n + jitter`), grouped `25`-folder BFS crawler with binary-split fallback, OAuth `changes.list` & API Key watermark incremental sync, `parents+name` batch thumbnail repair, Dual-Mode GIS OAuth (`initTokenClient` + `prompt: ''` fallback & `initCodeClient` + Worker `/exchange`/`/refresh`), and file download |
 | `src/api/metaSync.js` | `META_FOLDER_NAME`, `TAGS_SCHEMA_FILENAME`, `sanitizeMemberKey`, `ensureMetaFolder`, `mergeTagSchemas`, `loadAlbumMetadata`, `saveMemberMetadata`, `saveTagSchema`, `loadLocalServerMeta`, `saveLocalServerMeta` | Compact JSON `.drivelens/` cloud persistence, LWW tag schema merge, non-throwing `./api/meta` client |
 | `src/storage/albumCache.js` | `buildAlbumCacheKey`, `getCachedAlbum`, `setCachedAlbum`, `saveCachedAlbumMetaOnly`, `applyCachedAlbumDelta`, `patchCachedThumbnailLinks`, `removeCachedAlbum`, `clearAllAlbumCaches` | Split IndexedDB (`albumMeta` + 2,000-file `fileChunks`) with O(1) chunk index, <2ms meta-only writes, delta chunk patching, and `localStorage` fallback (`<=2000` files; excludes secrets) |
 | `src/storage/imageLoader.js` | `quantizeThumbSize`, `buildDriveThumbUrl`, `isPreviewQueueIdle`, `hasCachedHdSrc`, `isPhotoHdCached`, `loadHdPhoto`, `subscribeHdStatus`, `getSmartHdDebugState`, `updateSmartHdSchedule`, `getInstantCachedSrc`, `preloadPhoto`, `loadPhotoIntoElement`, `cancelElementPhotoLoad`, `setThumbnailLinkHealedCallback`, `fetchAuthorizedMediaBlobUrl`, `clearImageCache` | Virtualizer-aware priority queue (zero `getBoundingClientRect` reflow), coalesced 80ms `parents+name` thumbnail self-healing, grid-safe no-`alt=media` fallback, Lightbox `current + 3` & page Smart HD scheduler, bounded LRU blob cache |
@@ -225,26 +230,37 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 - Video playback in Lightbox uses `<iframe class="lightbox-video" src="https://drive.google.com/file/d/<id>/preview">` when `authType === 'apikey' && !accessToken`, avoiding unauthenticated CORS media stream blocks.
 - Original file downloads (`downloadOriginalFile`) try `?alt=media&supportsAllDrives=true&key=...` and fall back to opening `webContentLink` or `https://drive.google.com/uc?export=download&id=<id>`.
 
-### 4.2 Mode 2: OAuth 2.0 GIS Flow & Credential Persistence (`authenticateGoogle` & `loadSharedAlbum`)
+### 4.2 Mode 2: Dual-Mode OAuth 2.0 Session Lifecycle (`Solution A` vs `Solution B`)
 
-- Dynamically injects `https://accounts.google.com/gsi/client` (`ensureGoogleIdentityLoaded`, 10s timeout) only when OAuth sign-in is triggered.
-- Uses `initTokenClient` with `drive`, `userinfo.profile`, and `userinfo.email` scopes, and allows up to **100 Test Users** under External + Testing mode on Google Auth Platform at zero cost and without Google app verification.
+Because pure-frontend Google Identity Services (GIS) `initTokenClient` issues 60-minute `access_token` values without a `refresh_token` (Google requires a confidential server-side `client_secret` for refresh tokens), DriveLens implements a **Dual-Mode OAuth Session Lifecycle** in [`src/api/gdrive.js`](src/api/gdrive.js), [`src/state/store.js`](src/state/store.js), and optional [`workers/oauth-renewal-worker.js`](workers/oauth-renewal-worker.js):
+
+- **Dynamic GIS Loader & Allowlist**: Dynamically injects `https://accounts.google.com/gsi/client` (`ensureGoogleIdentityLoaded`, 10s timeout) only when OAuth sign-in is triggered, requesting `drive`, `userinfo.profile`, and `userinfo.email` scopes.
 - **Persistent vs Ephemeral Session Storage (`remember` flag)**:
   - When `remember !== false` (default), `authenticateGoogle` stores `{ clientId, accessToken, expiresAt, user }` in `localStorage` under `drivelens_session_v1` (removing any stale copy in `sessionStorage`) and persists the user hint profile (`{ clientId, id, email, name, picture, color }`) in `localStorage` under `drivelens_oauth_user_v1`.
-  - When `remember === false`, `authenticateGoogle` calls `clearSession({ forgetUser: true })`, wipes saved credentials in `drivelens_connect_prefs_v1`, and stores the active session strictly inside ephemeral `sessionStorage` (`drivelens_session_v1`).
+  - When `remember === false`, `authenticateGoogle` calls `clearSession({ forgetUser: true, clearRenewal: true })`, wipes saved credentials in `drivelens_connect_prefs_v1`, and stores the active session strictly inside ephemeral `sessionStorage` (`drivelens_session_v1`).
   - `getCachedSession(clientId)` checks `localStorage` first and `sessionStorage` second, accepting sessions with more than 60 seconds left (`expiresAt > Date.now() + 60 * 1000`).
-  - `authenticateGoogle(clientId, { prompt, loginHint, remember })` resolves `hintVal` from `loginHint || getSavedOAuthUser(trimmedClientId)?.email` and forwards `hint: hintVal` to both `initTokenClient(...)` and `client.requestAccessToken(...)` to skip manual account typing on re-authentication.
+- **Solution A — Pure Static Page (Default when `tokenRenewalUrl` is empty)**:
+  - Uses `window.google.accounts.oauth2.initTokenClient` with `hint: hintVal` (`loginHint || getSavedOAuthUser(trimmedClientId)?.email`).
+  - **Proactive Expiry Without Kicking the User Out**: `Store._scheduleSessionLifecycle(expiresAt)` sets a timer 5 minutes prior to expiry (`_sessionExpiresAt - 5 * 60 * 1000`) and also checks on `visibilitychange`. Once within 30s of expiry (`!tokenRenewalUrl`), `Store` clears `accessToken` cleanly BEFORE API calls fail with `401`, preserving the loaded gallery, photos, and any buffered local ratings/tags (`syncStatus: 'error'` if unsynced edits exist, `'readonly'` otherwise) and updating the header sync pill to **Reconnect (`!`)**.
+  - **1-Click `0.5s` Flash Reconnect (`retryOrSyncNow`)**: Clicking `[data-header="sync-now"]` directly invokes `authenticateGoogle(clientId, { prompt: '', loginHint, remember, tokenRenewalUrl })` inside the user's click gesture—bypassing the Connect modal and account picker so Google's popup auto-closes in `~0.5s`, restores `accessToken`, flushes `_unsyncedPhotoIds` and `_unsyncedSchemaDirty`, and refreshes the album. If Google returns `interaction_required` / `consent_required` / `login_required` / `account_selection_required` on `prompt: ''`, `authenticateGoogle` automatically falls back once to `prompt: 'select_account'`.
+  - **Hybrid API-Key Read Fallback**: If `state.apiKey` is also saved alongside OAuth (`saveConnectPrefs` preserves `apiKey` unless explicitly cleared), read-only `syncAlbumIncremental` (watermark path) and thumbnail healing in `imageLoader.js` fall back to `state.apiKey` while `accessToken` is expired, so photo browsing and incremental new-photo discovery never expire.
+- **Solution B — Silent Background Auto-Renewal (`tokenRenewalUrl` configured + Cloudflare Worker)**:
+  - `normalizeRenewalEndpoint(rawUrl)` accepts `https://...` (or `http://localhost` / `http://127.0.0.1`), stripping trailing slashes and `/exchange` or `/refresh` suffixes.
+  - **Code Exchange (`initCodeClient` -> `POST /exchange`)**: When `cleanRenewalUrl` is non-empty, `authenticateGoogle` invokes `window.google.accounts.oauth2.initCodeClient({ client_id, scope, ux_mode: 'popup', select_account, hint })` (with mock fallback to `initTokenClient` if `initCodeClient` is absent) and posts `{ code, client_id }` to `${cleanRenewalUrl}/exchange`.
+  - **AES-256-GCM Encrypted Refresh Tickets (`workers/oauth-renewal-worker.js`)**: The standalone Cloudflare Worker holds `env.GOOGLE_CLIENT_SECRET`, enforces `env.ALLOWED_ORIGINS` (403 on unlisted `Origin`) and optional `env.ALLOWED_CLIENT_IDS`, exchanges the code with `https://oauth2.googleapis.com/token` (`redirect_uri: 'postmessage'`), and seals `refresh_token` with `AES-256-GCM` (`env.TICKET_ENC_KEY`, SHA-256 derived 256-bit key + 12-byte random IV -> `'enc:v1:' + base64url(iv + ciphertext)`) so the raw Google `refresh_token` never leaves the Worker.
+  - **Browser Ticket Storage & Silent `POST /refresh`**: The client stores `{ clientId, renewalUrl, refreshTicket, updatedAt }` in `drivelens_oauth_renewal_v1`. Before expiry (`~55 min` timer), on `visibilitychange`, or on startup when `getCachedSession` is expired, `renewOAuthSessionSilently` (deduplicated via `inFlightRenewalPromise`) posts `{ client_id, refresh_ticket }` to `${cleanUrl}/refresh`, updates `drivelens_session_v1` and any rotated `refreshTicket`, and keeps transient network/`5xx` failures non-destructive while clearing `drivelens_oauth_renewal_v1` only on `400`/`401`/`403` (`invalid_grant` / revoked).
 
 ### 4.3 Startup Auto-Reconnect & Credential Reset Lifecycle
 
-- **Startup Dispatch (`handleInitialUrlHash` in `src/main.js`)**: When the URL hash has no `#folder=...` parameter (including clean launches or `#lang=zh` language-only hashes), `main.js` invokes `store.restoreSavedSession()`.
-- **`store.restoreSavedSession()` (`src/state/store.js`)**: Reads `loadConnectPrefs()` from `drivelens_connect_prefs_v1`. If `rememberCredentials && autoConnect && folderId` are true:
+- **Startup Dispatch (`handleInitialUrlHash` in `src/main.js`)**: When the URL hash has no `#folder=...` parameter (including clean launches or `#lang=zh` language-only hashes), `main.js` invokes `store.restoreSavedSession()`. Optional `#renewal_url=...` in hash links forwards `tokenRenewalUrl` to `store.connectGoogleDrive(...)`.
+- **`store.restoreSavedSession()` (`src/state/store.js`)**: Reads `loadConnectPrefs()` from `drivelens_connect_prefs_v1` (including `tokenRenewalUrl` and preserved `apiKey`). If `rememberCredentials && autoConnect && folderId` are true:
   - **API Key mode (`authType === 'apikey' && apiKey`)**: Silently invokes `connectWithApiKey(...)`.
   - **OAuth mode (`authType === 'oauth' && clientId`)**:
-    - If `getCachedSession(clientId)` returns a valid unexpired token, silently calls `connectGoogleDrive({ ..., reuseSession: true })`.
-    - If the 1-hour OAuth token has expired, loads `savedUser = getSavedOAuthUser(clientId)`, restores `authType`, `clientId`, `folderId`, and `savedOAuthUser` into state, opens the Connect modal (`openModal('connect')`), displays the saved account badge (`modal.savedAccountBadge`), and emits `store.sessionExpiredReconnect` so the user can re-consent in one click.
+    - If `getCachedSession(clientId)` returns a valid unexpired token, silently calls `connectGoogleDrive({ ..., reuseSession: true })` and arms `_scheduleSessionLifecycle(session.expiresAt)`.
+    - If the 1-hour OAuth token has expired and `prefs.tokenRenewalUrl` is set, hydrates the cached album immediately (`<50ms`), calls `renewOAuthSessionSilently(prefs.clientId, prefs.tokenRenewalUrl, { remember: true })` with zero popups, and runs silent incremental sync (`_performIncrementalSync`).
+    - If no `tokenRenewalUrl` is set (Solution A) or silent renewal returns `null`, `restoreExpiredOAuthCacheOrPrompt` keeps the cached album open (with API-Key read fallback if available) or prompts for 1-click reconnect.
 - **Pausing Auto-Reconnect**: Switching back via `loadDemoMode(true, true)` (**Back to Demo**) or `disconnectGoogleDrive()` clears the active token and writes `autoConnect: false` to `drivelens_connect_prefs_v1` so refreshing stays in Demo Mode until the user reconnects.
-- **Wiping Saved Credentials (`forgetSavedCredentials`)**: Triggered by clicking `[data-action="forget-creds"]` in `renderModals.js`. Calls `clearSession({ forgetUser: true })`, removes `drivelens_connect_prefs_v1` and `drivelens_recent_v1`, clears in-memory credentials/recent albums/saved OAuth profile, returns to Demo Mode if currently connected, and displays `store.credsClearedToast`.
+- **Wiping Saved Credentials (`forgetSavedCredentials`)**: Triggered by clicking `[data-action="forget-creds"]` in `renderModals.js`. Calls `clearSession({ forgetUser: true, clearRenewal: true })`, removes `drivelens_connect_prefs_v1`, `drivelens_recent_v1`, and `drivelens_oauth_renewal_v1`, resets `tokenRenewalUrl: ''` and in-memory credentials/recent albums/saved OAuth profile, returns to Demo Mode if currently connected, and displays `store.credsClearedToast`.
 
 ### 4.4 Grouped BFS Crawler & Incremental Sync (`crawlAlbumTree`, `syncAlbumIncremental`)
 
@@ -285,7 +301,8 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 | --- | --- | --- |
 | `localStorage` / `sessionStorage` | `drivelens_session_v1` | OAuth `clientId`, `accessToken`, `expiresAt`, and Google `user` profile (`localStorage` when Remember is enabled; `sessionStorage` otherwise) |
 | `localStorage` | `drivelens_oauth_user_v1` | Persistent OAuth account profile & email hint (`clientId`, `id`, `email`, `name`, `picture`, `color`) for one-click re-consent |
-| `localStorage` | `drivelens_connect_prefs_v1` | Saved `authType`, `apiKey`, `clientId`, `folderId`, `nickname`, `rememberCredentials`, `autoConnect` |
+| `localStorage` / `sessionStorage` | `drivelens_oauth_renewal_v1` | Optional Solution B Worker renewal ticket (`clientId`, `renewalUrl`, `AES-256-GCM` `refreshTicket`, `updatedAt`) |
+| `localStorage` | `drivelens_connect_prefs_v1` | Saved `authType`, `apiKey`, `clientId`, `folderId`, `tokenRenewalUrl`, `nickname`, `rememberCredentials`, `autoConnect` |
 | `localStorage` | `drivelens_lang_v1` | Explicit UI language preference (`'en'` or `'zh'`) |
 | `localStorage` | `drivelens_theme` | UI theme (`'dark'` or `'light'`) |
 | `localStorage` | `drivelens_recent_v1` | Up to 6 recently opened albums |
@@ -294,7 +311,7 @@ Calling `store.setLanguage(nextLang)` (via the header `#langSelect` dropdown or 
 | `localStorage` | `drivelens_readonly_<folderId>_<myId>` | Local fallback for OAuth Viewer-only folders |
 | `IndexedDB` | `drivelens-album-cache` v2 (`albumMeta`, `fileChunks`) | Split album cache: `albumMeta` (sync tokens, folders, `membersData`, `tagSchema`) + 2,000-file `fileChunks` (max 12 albums; excludes secrets) |
 | `IndexedDB` | `drivelens-img-cache` (`blobs`) | Cached `alt=media` image/video Blobs (max 400 entries) |
-| `Cache Storage` | `drivelens-shell-v10` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
+| `Cache Storage` | `drivelens-shell-v12` | Precached & Network-First PWA app shell managed by [`sw.js`](sw.js) |
 
 ---
 
@@ -343,4 +360,4 @@ Run `python verify_project.py` (Python 3 stdlib only) to execute all 10 automate
 - **`[g]` Credential & Secret Hygiene (`verify_no_credentials_or_secrets`)**: Ensures zero credential config files (`config.js`, `.env*`, etc.) and zero API keys, Client IDs, personal emails, or local user paths appear anywhere in the repository.
 - **`[h]` i18n Integrity (`verify_i18n`)**: Validates `<html lang="en">`, strict `'en'` default, 100% key parity between `MESSAGES.en` and `MESSAGES.zh`, existence of all literal `t(...)` keys, and zero CJK characters in non-`i18n.js` repository files (including documentation, CSS, HTML, and source modules).
 - **`[i]` PWA Integrity (`verify_pwa`)**: Validates `manifest.webmanifest` (`display: 'standalone'`, `start_url: './'`), binary PNG dimensions (`192x192` and `512x512`) + SVG icon existence, `sw.js` syntax + `PRECACHE_ASSETS` disk resolution, and live `serve.py` MIME headers for `.webmanifest`, `sw.js`, and `.png`.
-- **`[j]` Mobile & Touch UX (`verify_mobile_ux`)**: Verifies `viewport-fit=cover` and `<nav id="mobileNavBar"` in `index.html`, safe-area CSS tokens and mobile/input rules across all 4 stylesheets, `touchstart`/`touchmove`/`touchend` handlers in `renderGallery.js`/`renderLightbox.js`/`renderCompare.js`, `'drivelens-shell-v8'` in `sw.js`, gallery exports, and preservation of the `README.md` `## Design Inspiration & Independence` section.
+- **`[j]` Mobile & Touch UX (`verify_mobile_ux`)**: Verifies `viewport-fit=cover` and `<nav id="mobileNavBar"` in `index.html`, safe-area CSS tokens and mobile/input rules across all 4 stylesheets, `touchstart`/`touchmove`/`touchend` handlers in `renderGallery.js`/`renderLightbox.js`/`renderCompare.js`, `'drivelens-shell-v12'` in `sw.js`, `workers/oauth-renewal-worker.js` syntax & `default` `fetch` handler export, gallery exports, and preservation of the `README.md` `## Design Inspiration & Independence` section.

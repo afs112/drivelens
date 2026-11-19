@@ -204,6 +204,7 @@ function handleInitialUrlHash() {
   const prefs = loadConnectPrefs();
   const keyParam = (params.get('key') || '').trim();
   const clientIdParam = (params.get('client_id') || '').trim();
+  const renewalUrlParam = (params.get('renewal_url') || '').trim();
   const nickname =
     (params.get('nick') || params.get('nickname') || '').trim() ||
     store.state.nickname ||
@@ -217,6 +218,8 @@ function handleInitialUrlHash() {
 
   const apiKey = keyParam || store.state.apiKey || prefs.apiKey || '';
   const clientId = clientIdParam || store.state.clientId || prefs.clientId || '';
+  const tokenRenewalUrl =
+    renewalUrlParam || store.state.tokenRenewalUrl || prefs.tokenRenewalUrl || '';
 
   if (authType === 'apikey' && apiKey) {
     store.setState({
@@ -237,6 +240,7 @@ function handleInitialUrlHash() {
     clientId,
     apiKey,
     authType,
+    tokenRenewalUrl,
   });
 
   const cached = clientId ? getCachedSession(clientId) : null;
@@ -244,12 +248,14 @@ function handleInitialUrlHash() {
     store.connectGoogleDrive({
       clientId,
       folderInput,
+      tokenRenewalUrl,
       reuseSession: true,
     });
   } else {
     store.restoreExpiredOAuthCacheOrPrompt({
       clientId,
       folderInput,
+      tokenRenewalUrl,
     });
   }
 }
