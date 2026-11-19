@@ -1,4 +1,4 @@
-const CACHE_NAME = 'drivelens-shell-v17';
+const CACHE_NAME = 'drivelens-shell-v18';
 const PRECACHE_ASSETS = [
   './',
   './index.html',
@@ -115,7 +115,7 @@ self.addEventListener('fetch', (event) => {
   if (url.pathname.includes('/api/')) return;
 
   event.respondWith(
-    fetch(req)
+    fetch(req, { cache: 'no-cache' })
       .then((resp) => {
         if (resp && resp.ok && resp.type === 'basic') {
           const copy = resp.clone();

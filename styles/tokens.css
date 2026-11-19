@@ -174,9 +174,18 @@ html.has-darkroom-overlay.is-darkroom-settled:not(.is-darkroom-swiping)
   html.is-ios-device,
   html.is-ios-device body {
     height: 100%;
+    height: 100lvh;
     min-height: 100lvh;
     background: var(--bg-canvas);
   }
+}
+
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]),
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) body {
+  height: 100%;
+  height: 100lvh;
+  min-height: 100lvh;
+  background: var(--bg-canvas);
 }
 
 button,

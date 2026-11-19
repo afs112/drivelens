@@ -2487,6 +2487,11 @@ kbd {
 }
 
 @media (display-mode: standalone) {
+  .lightbox {
+    height: 100lvh;
+    min-height: 100lvh;
+  }
+
   .lightbox-bottom {
     padding-bottom: max(14px, calc(var(--safe-bottom) - 12px));
   }
@@ -2494,8 +2499,13 @@ kbd {
 
 @media (display-mode: standalone) and (max-width: 860px) {
   .gallery-month-pill {
-    bottom: calc(var(--mobile-nav-height) + max(18px, calc(var(--safe-bottom) - 12px)));
+    bottom: calc(var(--mobile-nav-height) + max(22px, calc(var(--safe-bottom) - 8px)));
   }
+}
+
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .lightbox {
+  height: 100lvh;
+  min-height: 100lvh;
 }
 
 html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .lightbox-bottom {
@@ -2504,6 +2514,6 @@ html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"
 
 @media (max-width: 860px) {
   html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .gallery-month-pill {
-    bottom: calc(var(--mobile-nav-height) + max(18px, calc(var(--safe-bottom) - 12px)));
+    bottom: calc(var(--mobile-nav-height) + max(22px, calc(var(--safe-bottom) - 8px)));
   }
 }

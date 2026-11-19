@@ -1,5 +1,6 @@
 /* App Shell Layout */
 .app-shell {
+  position: relative;
   display: flex;
   flex-direction: column;
   height: 100dvh;
@@ -1520,6 +1521,7 @@
   }
 
   .app-shell {
+    height: 100lvh;
     min-height: 100lvh;
   }
 
@@ -1534,11 +1536,11 @@
   }
 
   .mobile-nav-bar {
-    bottom: max(12px, calc(var(--safe-bottom) - 18px));
+    bottom: max(14px, calc(var(--safe-bottom) - 16px));
   }
 
   .batch-bar {
-    bottom: calc(var(--mobile-nav-height) + max(20px, calc(var(--safe-bottom) - 10px)));
+    bottom: calc(var(--mobile-nav-height) + max(22px, calc(var(--safe-bottom) - 8px)));
   }
 }
 
@@ -1548,28 +1550,29 @@
   }
 
   html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .mobile-nav-bar {
-    bottom: max(12px, calc(var(--safe-bottom) - 18px));
+    bottom: max(14px, calc(var(--safe-bottom) - 16px));
   }
 
   html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .batch-bar {
-    bottom: calc(var(--mobile-nav-height) + max(20px, calc(var(--safe-bottom) - 10px)));
+    bottom: calc(var(--mobile-nav-height) + max(22px, calc(var(--safe-bottom) - 8px)));
   }
 }
 
-html.is-ios-device:not(.ios-safari-doc-scroll) .app-shell,
-html.is-ios-device:not(.ios-safari-doc-scroll) .workspace,
-html.is-ios-device:not(.ios-safari-doc-scroll) .gallery-stage,
-html.is-ios-device:not(.ios-safari-doc-scroll) .gallery-scroll {
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .app-shell,
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .workspace,
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .gallery-stage,
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .gallery-scroll {
   top: 0;
   margin-top: 0;
   padding-top: 0;
 }
 
-html.is-ios-device:not(.ios-safari-doc-scroll) .app-shell {
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .app-shell {
+  height: 100lvh;
   min-height: 100lvh;
 }
 
-html.is-ios-device:not(.ios-safari-doc-scroll) .top-header {
+html.is-ios-device:not(.ios-safari-doc-scroll):not([data-force-doc-scroll="true"]) .top-header {
   top: calc(max(var(--safe-top), 12px) + 8px);
 }
 
